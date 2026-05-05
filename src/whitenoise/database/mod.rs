@@ -616,6 +616,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_encrypted_database_reopen_cleans_completed_migration_sidecars() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("encrypted-clean-sidecars.db");
+        let service_id = unique_service_id();
+        let temp_path = PathBuf::from(format!("{}.encrypted.tmp", db_path.display()));
+        let backup_path = PathBuf::from(format!("{}.plaintext.backup", db_path.display()));
+
+        let db = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to create encrypted database");
+        drop(db);
+        fs::write(&temp_path, "completed migration temp").unwrap();
+        fs::write(&backup_path, "completed migration backup").unwrap();
+
+        let reopened = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to reopen encrypted database");
+        drop(reopened);
+
+        assert!(db_path.exists());
+        assert!(!temp_path.exists());
+        assert!(!backup_path.exists());
+    }
+
+    #[tokio::test]
     async fn test_plaintext_database_migrates_to_encrypted_without_data_loss() {
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -752,6 +778,60 @@ mod tests {
         );
         assert_ne!(read_db_header(&db_path), *SQLITE_HEADER);
         assert!(encryption::is_sqlcipher_database(&db_path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_migration_restores_valid_encrypted_temp_when_database_missing() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("recover-encrypted-temp.db");
+        let temp_path = PathBuf::from(format!("{}.encrypted.tmp", db_path.display()));
+        let service_id = unique_service_id();
+        let pubkey = "cd".repeat(32);
+
+        let db = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to create encrypted database");
+        setup_account(&db, &pubkey).await;
+        drop(db);
+        fs::rename(&db_path, &temp_path).expect("Failed to move encrypted database to temp");
+
+        let recovered = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to recover encrypted temp database");
+        let account_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&recovered.pool)
+            .await
+            .expect("Failed to count recovered accounts");
+
+        assert_eq!(account_count.0, 1);
+        assert!(db_path.exists());
+        assert!(!temp_path.exists());
+        assert!(encryption::is_sqlcipher_database(&db_path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_migration_rejects_invalid_encrypted_temp_without_backup() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("recover-invalid-temp.db");
+        let temp_path = PathBuf::from(format!("{}.encrypted.tmp", db_path.display()));
+        let service_id = unique_service_id();
+
+        keyring::get_or_create_db_key(&service_id, encryption::WHITENOISE_DB_KEY_ID)
+            .expect("Failed to create database key");
+        fs::write(&temp_path, "not a valid encrypted database").unwrap();
+
+        let err = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect_err("Invalid encrypted temp without backup should fail recovery");
+
+        assert!(matches!(
+            err,
+            DatabaseError::Sqlx(_) | DatabaseError::EncryptionMigration(_)
+        ));
+        assert!(!db_path.exists());
+        assert!(temp_path.exists());
     }
 
     #[tokio::test]

@@ -472,3 +472,63 @@ impl Drop for MigrationLock {
         let _ = fs::remove_file(&self.path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_database_file_state_treats_short_non_empty_file_as_encrypted() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("short.db");
+
+        fs::write(&db_path, "short").unwrap();
+
+        assert_eq!(
+            database_file_state(&db_path).unwrap(),
+            DatabaseFileState::Encrypted
+        );
+    }
+
+    #[test]
+    fn test_migration_lock_rejects_active_lock_file() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let lock_path = temp_dir.path().join("database.sqlite.encryption.lock");
+
+        File::create(&lock_path).unwrap();
+        let err = match MigrationLock::acquire(&lock_path) {
+            Ok(_) => panic!("Active migration lock should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, DatabaseError::EncryptionMigration(_)));
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn test_migration_lock_replaces_stale_lock_file() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let lock_path = temp_dir.path().join("database.sqlite.encryption.lock");
+
+        let stale_file = File::create(&lock_path).unwrap();
+        stale_file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        drop(stale_file);
+
+        let lock = MigrationLock::acquire(&lock_path).unwrap();
+
+        assert!(lock_path.exists());
+        drop(lock);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn test_sql_string_literal_escapes_single_quotes() {
+        assert_eq!(sql_string_literal("plain"), "'plain'");
+        assert_eq!(
+            sql_string_literal("/tmp/white'noise.sqlite"),
+            "'/tmp/white''noise.sqlite'"
+        );
+    }
+}
