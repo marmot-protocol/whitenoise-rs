@@ -326,7 +326,7 @@ impl Whitenoise {
 
         let last_message_summary = AggregatedMessage::find_last_by_group_ids(
             std::slice::from_ref(group_id),
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?
         .into_iter()
@@ -367,7 +367,7 @@ impl Whitenoise {
         let unread_count = AggregatedMessage::count_unread_for_group(
             group_id,
             account_group.last_read_message_id.as_ref(),
-            &self.shared.database,
+            &session.account_db.inner,
             cleared_ms,
         )
         .await?;
@@ -918,11 +918,12 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         AggregatedMessage::insert_message(
             &msg1,
             &group1.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -946,7 +947,7 @@ mod tests {
             &msg2,
             &group2.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1111,11 +1112,12 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         AggregatedMessage::insert_message(
             &msg,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1178,11 +1180,12 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         AggregatedMessage::insert_message(
             &msg,
             &group1.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1272,11 +1275,12 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         AggregatedMessage::insert_message(
             &msg,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1553,6 +1557,7 @@ mod tests {
 
         // Add messages with identical timestamps to all groups
         let same_timestamp = Timestamp::from(5000);
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         for group in &groups {
             let msg = ChatMessage {
                 id: format!("{:0>64}", hex::encode(group.mls_group_id.as_slice())),
@@ -1573,7 +1578,7 @@ mod tests {
                 &msg,
                 &group.mls_group_id,
                 &creator.pubkey,
-                &whitenoise.shared.database,
+                &session.account_db.inner,
             )
             .await
             .unwrap();

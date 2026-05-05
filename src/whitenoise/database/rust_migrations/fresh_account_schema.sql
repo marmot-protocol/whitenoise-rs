@@ -165,3 +165,50 @@ CREATE INDEX IF NOT EXISTS idx_accounts_groups_group
 CREATE INDEX IF NOT EXISTS idx_accounts_groups_dm_peer
     ON accounts_groups(dm_peer_pubkey)
     WHERE dm_peer_pubkey IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS aggregated_messages (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id            TEXT NOT NULL
+        CHECK (length(message_id) = 64 AND message_id GLOB '[0-9a-fA-F]*'),
+    mls_group_id          BLOB NOT NULL,
+    author                TEXT NOT NULL
+        CHECK (length(author) = 64 AND author GLOB '[0-9a-fA-F]*'),
+    created_at            INTEGER NOT NULL,
+    kind                  INTEGER NOT NULL,
+    content               TEXT NOT NULL DEFAULT '',
+    tags                  JSONB NOT NULL,
+    reply_to_id           TEXT
+        CHECK (reply_to_id IS NULL OR
+               (length(reply_to_id) = 64 AND reply_to_id GLOB '[0-9a-fA-F]*')),
+    deletion_event_id     TEXT
+        CHECK (deletion_event_id IS NULL OR
+               (length(deletion_event_id) = 64 AND deletion_event_id GLOB '[0-9a-fA-F]*')),
+    content_tokens        JSONB NOT NULL,
+    reactions             JSONB NOT NULL,
+    media_attachments     JSONB NOT NULL,
+    content_normalized    TEXT NOT NULL DEFAULT '',
+    UNIQUE(message_id, mls_group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_aggregated_messages_message_id
+    ON aggregated_messages(message_id);
+
+CREATE INDEX IF NOT EXISTS idx_aggregated_messages_group
+    ON aggregated_messages(mls_group_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_aggregated_messages_kind_group
+    ON aggregated_messages(kind, mls_group_id, created_at DESC, message_id DESC);
+
+CREATE TABLE IF NOT EXISTS message_delivery_status (
+    message_id      TEXT NOT NULL,
+    mls_group_id    BLOB NOT NULL,
+    account_pubkey  TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    PRIMARY KEY (message_id, mls_group_id, account_pubkey),
+    FOREIGN KEY (message_id, mls_group_id)
+        REFERENCES aggregated_messages(message_id, mls_group_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mds_group_account_status
+    ON message_delivery_status (mls_group_id, account_pubkey, status);

@@ -1588,13 +1588,14 @@ mod tests {
         group_id: &GroupId,
         message_id: &EventId,
     ) {
+        let session = whitenoise.session(account_pubkey).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let message = AggregatedMessage::find_by_id(
                     &message_id.to_string(),
                     group_id,
                     account_pubkey,
-                    &whitenoise.shared.database,
+                    &session.account_db.inner,
                 )
                 .await
                 .unwrap()
@@ -2436,11 +2437,12 @@ mod tests {
         .await
         .unwrap();
 
+        let creator_session = whitenoise.session(&creator.pubkey).unwrap();
         let cached_message = AggregatedMessage::find_by_id(
             &send_result.message.id.to_string(),
             &group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()

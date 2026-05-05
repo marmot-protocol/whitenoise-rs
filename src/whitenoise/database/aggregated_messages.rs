@@ -1702,19 +1702,7 @@ mod tests {
     use nostr_sdk::Keys;
 
     use super::*;
-    use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::test_utils::create_mock_whitenoise;
-
-    async fn setup_group(group_id: &GroupId, database: &Database) {
-        // Create group_information record (required for foreign key constraint)
-        GroupInformation::find_or_create_by_mls_group_id(
-            group_id,
-            Some(GroupType::Group),
-            database,
-        )
-        .await
-        .unwrap();
-    }
 
     fn create_test_chat_message(seed: u8, author: PublicKey) -> ChatMessage {
         // Create a valid 64-character hex string by repeating a pattern
@@ -1740,9 +1728,12 @@ mod tests {
     #[tokio::test]
     async fn test_count_by_group_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+        let count = AggregatedMessage::count_by_group(&group_id, db)
             .await
             .unwrap();
         assert_eq!(count, 0);
@@ -1751,66 +1742,59 @@ mod tests {
     #[tokio::test]
     async fn test_get_all_event_ids_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        let ids =
-            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let ids = AggregatedMessage::get_all_event_ids_by_group(&group_id, db)
+            .await
+            .unwrap();
         assert!(ids.is_empty());
     }
 
     #[tokio::test]
     async fn test_find_messages_by_group_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[1; 32]);
-        let author = Keys::generate().public_key();
 
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert!(messages.is_empty());
     }
 
     #[tokio::test]
     async fn test_insert_message() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[1; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let message = create_test_chat_message(1, author);
 
         // Insert message
-        let result = AggregatedMessage::insert_message(
-            &message,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await;
+        let result =
+            AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db).await;
         assert!(result.is_ok());
 
         // Verify it was inserted
-        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+        let count = AggregatedMessage::count_by_group(&group_id, db)
             .await
             .unwrap();
         assert_eq!(count, 1);
 
         // Verify we can retrieve it
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, message.id);
         assert_eq!(messages[0].content, message.content);
@@ -1819,8 +1803,10 @@ mod tests {
     #[tokio::test]
     async fn test_insert_multiple_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[2; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
@@ -1829,38 +1815,28 @@ mod tests {
         for i in 1..=3 {
             let message = create_test_chat_message(i, author);
             message_ids.push(message.id.clone());
-            AggregatedMessage::insert_message(
-                &message,
-                &group_id,
-                &author,
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
+            AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
         }
 
         // Verify count
-        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+        let count = AggregatedMessage::count_by_group(&group_id, db)
             .await
             .unwrap();
         assert_eq!(count, 3);
 
         // Verify we can retrieve all messages
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 3);
 
         // Verify event IDs
-        let event_ids =
-            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let event_ids = AggregatedMessage::get_all_event_ids_by_group(&group_id, db)
+            .await
+            .unwrap();
         assert_eq!(event_ids.len(), 3);
         for id in &message_ids {
             assert!(event_ids.contains(id));
@@ -1870,54 +1846,41 @@ mod tests {
     #[tokio::test]
     async fn test_mark_deleted_does_not_decrease_count() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[3; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a message
         let message = create_test_chat_message(10, author);
-        AggregatedMessage::insert_message(
-            &message,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
-        let count_before =
-            AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let count_before = AggregatedMessage::count_by_group(&group_id, db)
+            .await
+            .unwrap();
         assert_eq!(count_before, 1);
 
         // Mark as deleted - need a valid 64-char hex ID
         let deletion_event_id = format!("{:0>64}", "abc123");
-        AggregatedMessage::mark_deleted(
-            &message.id,
-            &group_id,
-            &deletion_event_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::mark_deleted(&message.id, &group_id, &deletion_event_id, db)
+            .await
+            .unwrap();
 
         // Count should remain the same - mark_deleted doesn't remove the row
-        let count_after = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+        let count_after = AggregatedMessage::count_by_group(&group_id, db)
             .await
             .unwrap();
         assert_eq!(count_after, 1);
 
         // But the message should have deletion_event_id set
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].is_deleted);
     }
@@ -1925,124 +1888,96 @@ mod tests {
     #[tokio::test]
     async fn test_delete_by_group_removes_all_events() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[4; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert multiple messages
         let message1 = create_test_chat_message(20, author);
-        AggregatedMessage::insert_message(
-            &message1,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message1, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         let message2 = create_test_chat_message(21, author);
-        AggregatedMessage::insert_message(
-            &message2,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message2, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         let message3 = create_test_chat_message(22, author);
-        AggregatedMessage::insert_message(
-            &message3,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message3, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Verify count before deletion
-        let count_before =
-            AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let count_before = AggregatedMessage::count_by_group(&group_id, db)
+            .await
+            .unwrap();
         assert_eq!(count_before, 3);
 
         // Delete all events for the group
-        AggregatedMessage::delete_by_group(&group_id, &whitenoise.shared.database)
+        AggregatedMessage::delete_by_group(&group_id, db)
             .await
             .unwrap();
 
         // Count should now be zero
-        let count_after = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+        let count_after = AggregatedMessage::count_by_group(&group_id, db)
             .await
             .unwrap();
         assert_eq!(count_after, 0);
 
         // No messages should be found
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert!(messages.is_empty());
 
         // No event IDs should be found
-        let event_ids =
-            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let event_ids = AggregatedMessage::get_all_event_ids_by_group(&group_id, db)
+            .await
+            .unwrap();
         assert!(event_ids.is_empty());
     }
 
     #[tokio::test]
     async fn test_delete_by_group_is_group_specific() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id_1 = GroupId::from_slice(&[5; 32]);
         let group_id_2 = GroupId::from_slice(&[6; 32]);
-        setup_group(&group_id_1, &whitenoise.shared.database).await;
-        setup_group(&group_id_2, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert message in group 1
         let message1 = create_test_chat_message(30, author);
-        AggregatedMessage::insert_message(
-            &message1,
-            &group_id_1,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message1, &group_id_1, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Insert message in group 2
         let message2 = create_test_chat_message(31, author);
-        AggregatedMessage::insert_message(
-            &message2,
-            &group_id_2,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message2, &group_id_2, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Delete group 1
-        AggregatedMessage::delete_by_group(&group_id_1, &whitenoise.shared.database)
+        AggregatedMessage::delete_by_group(&group_id_1, db)
             .await
             .unwrap();
 
         // Group 1 should be empty
-        let count_1 = AggregatedMessage::count_by_group(&group_id_1, &whitenoise.shared.database)
+        let count_1 = AggregatedMessage::count_by_group(&group_id_1, db)
             .await
             .unwrap();
         assert_eq!(count_1, 0);
 
         // Group 2 should still have its message
-        let count_2 = AggregatedMessage::count_by_group(&group_id_2, &whitenoise.shared.database)
+        let count_2 = AggregatedMessage::count_by_group(&group_id_2, db)
             .await
             .unwrap();
         assert_eq!(count_2, 1);
@@ -2051,21 +1986,18 @@ mod tests {
     #[tokio::test]
     async fn test_update_reactions() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[7; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a message with empty reactions
         let message = create_test_chat_message(40, author);
-        AggregatedMessage::insert_message(
-            &message,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Update with reactions
         let mut reactions = ReactionSummary::default();
@@ -2078,24 +2010,15 @@ mod tests {
             },
         );
 
-        AggregatedMessage::update_reactions(
-            &message.id,
-            &group_id,
-            &reactions,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::update_reactions(&message.id, &group_id, &reactions, db)
+            .await
+            .unwrap();
 
         // Verify reactions were updated
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].reactions.by_emoji.len(), 1);
         assert!(messages[0].reactions.by_emoji.contains_key("👍"));
@@ -2104,8 +2027,11 @@ mod tests {
     #[tokio::test]
     async fn test_find_last_by_group_ids_empty_input() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
 
-        let result = AggregatedMessage::find_last_by_group_ids(&[], &whitenoise.shared.database)
+        let result = AggregatedMessage::find_last_by_group_ids(&[], db)
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -2114,6 +2040,9 @@ mod tests {
     #[tokio::test]
     async fn test_find_last_by_group_ids_comprehensive() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
 
         // Setup groups with different scenarios
         let group_with_media = GroupId::from_slice(&[50; 32]);
@@ -2121,16 +2050,6 @@ mod tests {
         let group_with_deletion = GroupId::from_slice(&[52; 32]);
         let group_empty = GroupId::from_slice(&[53; 32]);
         let group_multiple_messages = GroupId::from_slice(&[54; 32]);
-
-        for group_id in [
-            &group_with_media,
-            &group_no_media,
-            &group_with_deletion,
-            &group_empty,
-            &group_multiple_messages,
-        ] {
-            setup_group(group_id, &whitenoise.shared.database).await;
-        }
 
         let author = Keys::generate().public_key();
 
@@ -2171,56 +2090,36 @@ mod tests {
                 created_at: chrono::Utc::now(),
             },
         ];
-        AggregatedMessage::insert_message(
-            &msg_with_media,
-            &group_with_media,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_with_media, &group_with_media, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Group 2: Message without media
         let mut msg_no_media = create_test_chat_message(51, author);
         msg_no_media.content = "Message without media".to_string();
-        AggregatedMessage::insert_message(
-            &msg_no_media,
-            &group_no_media,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_no_media, &group_no_media, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Group 3: Has deleted newest message, should return older one
         let mut msg_older = create_test_chat_message(52, author);
         msg_older.content = "Older non-deleted".to_string();
         msg_older.created_at = Timestamp::from(1000);
-        AggregatedMessage::insert_message(
-            &msg_older,
-            &group_with_deletion,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_older, &group_with_deletion, &account.pubkey, db)
+            .await
+            .unwrap();
 
         let mut msg_deleted = create_test_chat_message(53, author);
         msg_deleted.content = "Deleted message".to_string();
         msg_deleted.created_at = Timestamp::from(2000);
-        AggregatedMessage::insert_message(
-            &msg_deleted,
-            &group_with_deletion,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_deleted, &group_with_deletion, &account.pubkey, db)
+            .await
+            .unwrap();
         AggregatedMessage::mark_deleted(
             &msg_deleted.id,
             &group_with_deletion,
             &format!("{:0>64}", "del"),
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
@@ -2234,8 +2133,8 @@ mod tests {
         AggregatedMessage::insert_message(
             &msg_first,
             &group_multiple_messages,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
         )
         .await
         .unwrap();
@@ -2243,14 +2142,9 @@ mod tests {
         let mut msg_last = create_test_chat_message(55, author);
         msg_last.content = "Last message".to_string();
         msg_last.created_at = Timestamp::from(2000);
-        AggregatedMessage::insert_message(
-            &msg_last,
-            &group_multiple_messages,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_last, &group_multiple_messages, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Query all groups
         let result = AggregatedMessage::find_last_by_group_ids(
@@ -2261,7 +2155,7 @@ mod tests {
                 group_empty.clone(),
                 group_multiple_messages.clone(),
             ],
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
@@ -2299,22 +2193,19 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_message_id_returns_message() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[70; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let message = create_test_chat_message(70, author);
-        AggregatedMessage::insert_message(
-            &message,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         let event_id = EventId::from_hex(&message.id).unwrap();
-        let found = AggregatedMessage::find_by_message_id(&event_id, &whitenoise.shared.database)
+        let found = AggregatedMessage::find_by_message_id(&event_id, db)
             .await
             .unwrap();
 
@@ -2327,9 +2218,12 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_message_id_returns_none_for_nonexistent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let fake_id = EventId::all_zeros();
 
-        let found = AggregatedMessage::find_by_message_id(&fake_id, &whitenoise.shared.database)
+        let found = AggregatedMessage::find_by_message_id(&fake_id, db)
             .await
             .unwrap();
 
@@ -2339,30 +2233,22 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_group_no_read_marker_returns_all() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[80; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         for i in 1..=3 {
             let msg = create_test_chat_message(80 + i, author);
-            AggregatedMessage::insert_message(
-                &msg,
-                &group_id,
-                &author,
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
+            AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
         }
 
-        let count = AggregatedMessage::count_unread_for_group(
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-            None,
-        )
-        .await
-        .unwrap();
+        let count = AggregatedMessage::count_unread_for_group(&group_id, None, db, None)
+            .await
+            .unwrap();
 
         assert_eq!(count, 3);
     }
@@ -2370,35 +2256,28 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_group_with_read_marker() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[90; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let mut messages = Vec::new();
         for i in 1..=5u8 {
             let mut msg = create_test_chat_message(90 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(
-                &msg,
-                &group_id,
-                &author,
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
+            AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
             messages.push(msg);
         }
 
         // Read marker at message 2 -> 3 unread (messages 3, 4, 5)
         let read_marker_id = EventId::from_hex(&messages[1].id).unwrap();
-        let count = AggregatedMessage::count_unread_for_group(
-            &group_id,
-            Some(&read_marker_id),
-            &whitenoise.shared.database,
-            None,
-        )
-        .await
-        .unwrap();
+        let count =
+            AggregatedMessage::count_unread_for_group(&group_id, Some(&read_marker_id), db, None)
+                .await
+                .unwrap();
 
         assert_eq!(count, 3);
     }
@@ -2406,37 +2285,29 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_group_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[100; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(100, author);
         let msg2 = create_test_chat_message(101, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg1, &group_id, &account.pubkey, db)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg2, &group_id, &account.pubkey, db)
             .await
             .unwrap();
 
         // Delete msg2
-        AggregatedMessage::mark_deleted(
-            &msg2.id,
-            &group_id,
-            &format!("{:0>64}", "del"),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &format!("{:0>64}", "del"), db)
+            .await
+            .unwrap();
 
-        let count = AggregatedMessage::count_unread_for_group(
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-            None,
-        )
-        .await
-        .unwrap();
+        let count = AggregatedMessage::count_unread_for_group(&group_id, None, db, None)
+            .await
+            .unwrap();
 
         assert_eq!(count, 1); // Only msg1 counted
     }
@@ -2444,8 +2315,11 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_groups_empty_input() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
 
-        let result = AggregatedMessage::count_unread_for_groups(&[], &whitenoise.shared.database)
+        let result = AggregatedMessage::count_unread_for_groups(&[], db)
             .await
             .unwrap();
 
@@ -2455,21 +2329,20 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_groups_no_markers() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
 
         let group1 = GroupId::from_slice(&[110; 32]);
         let group2 = GroupId::from_slice(&[111; 32]);
         let group3 = GroupId::from_slice(&[112; 32]); // Empty group
-
-        for group_id in [&group1, &group2, &group3] {
-            setup_group(group_id, &whitenoise.shared.database).await;
-        }
 
         let author = Keys::generate().public_key();
 
         // Group 1: 3 messages
         for i in 1..=3 {
             let msg = create_test_chat_message(110 + i, author);
-            AggregatedMessage::insert_message(&msg, &group1, &author, &whitenoise.shared.database)
+            AggregatedMessage::insert_message(&msg, &group1, &account.pubkey, db)
                 .await
                 .unwrap();
         }
@@ -2477,7 +2350,7 @@ mod tests {
         // Group 2: 5 messages
         for i in 1..=5 {
             let msg = create_test_chat_message(120 + i, author);
-            AggregatedMessage::insert_message(&msg, &group2, &author, &whitenoise.shared.database)
+            AggregatedMessage::insert_message(&msg, &group2, &account.pubkey, db)
                 .await
                 .unwrap();
         }
@@ -2490,10 +2363,9 @@ mod tests {
             (group3.clone(), None, None),
         ];
 
-        let result =
-            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let result = AggregatedMessage::count_unread_for_groups(&input, db)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[&group1], 3);
@@ -2504,13 +2376,12 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_groups_with_markers() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
 
         let group1 = GroupId::from_slice(&[130; 32]);
         let group2 = GroupId::from_slice(&[131; 32]);
-
-        for group_id in [&group1, &group2] {
-            setup_group(group_id, &whitenoise.shared.database).await;
-        }
 
         let author = Keys::generate().public_key();
 
@@ -2519,7 +2390,7 @@ mod tests {
         for i in 1..=5u8 {
             let mut msg = create_test_chat_message(130 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group1, &author, &whitenoise.shared.database)
+            AggregatedMessage::insert_message(&msg, &group1, &account.pubkey, db)
                 .await
                 .unwrap();
             group1_messages.push(msg);
@@ -2531,7 +2402,7 @@ mod tests {
         for i in 1..=4u8 {
             let mut msg = create_test_chat_message(140 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group2, &author, &whitenoise.shared.database)
+            AggregatedMessage::insert_message(&msg, &group2, &account.pubkey, db)
                 .await
                 .unwrap();
             group2_messages.push(msg);
@@ -2543,10 +2414,9 @@ mod tests {
             (group2.clone(), Some(marker2), None),
         ];
 
-        let result =
-            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let result = AggregatedMessage::count_unread_for_groups(&input, db)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[&group1], 3); // Messages 3, 4, 5 unread
@@ -2556,14 +2426,13 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_groups_mixed_markers() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
 
         let group_with_marker = GroupId::from_slice(&[150; 32]);
         let group_without_marker = GroupId::from_slice(&[151; 32]);
         let group_empty = GroupId::from_slice(&[152; 32]);
-
-        for group_id in [&group_with_marker, &group_without_marker, &group_empty] {
-            setup_group(group_id, &whitenoise.shared.database).await;
-        }
 
         let author = Keys::generate().public_key();
 
@@ -2572,14 +2441,9 @@ mod tests {
         for i in 1..=4u8 {
             let mut msg = create_test_chat_message(150 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(
-                &msg,
-                &group_with_marker,
-                &author,
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
+            AggregatedMessage::insert_message(&msg, &group_with_marker, &account.pubkey, db)
+                .await
+                .unwrap();
             messages.push(msg);
         }
         let marker = EventId::from_hex(&messages[1].id).unwrap();
@@ -2587,14 +2451,9 @@ mod tests {
         // Group without marker: 3 messages
         for i in 1..=3 {
             let msg = create_test_chat_message(160 + i, author);
-            AggregatedMessage::insert_message(
-                &msg,
-                &group_without_marker,
-                &author,
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
+            AggregatedMessage::insert_message(&msg, &group_without_marker, &account.pubkey, db)
+                .await
+                .unwrap();
         }
 
         let input = vec![
@@ -2603,10 +2462,9 @@ mod tests {
             (group_empty.clone(), None, None),
         ];
 
-        let result =
-            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let result = AggregatedMessage::count_unread_for_groups(&input, db)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[&group_with_marker], 2); // Messages 3, 4 unread
@@ -2617,66 +2475,53 @@ mod tests {
     #[tokio::test]
     async fn test_update_delivery_status_and_find_by_id() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[200; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a message with Sending status
         let mut message = create_test_chat_message(200, author);
         message.delivery_status = Some(DeliveryStatus::Sending);
-        AggregatedMessage::insert_message(
-            &message,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Verify initial Sending status via find_by_id
-        let found = AggregatedMessage::find_by_id(
-            &message.id,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
 
         // Update to Sent(3) — returned message should have the updated status
         let updated = AggregatedMessage::update_delivery_status(
             &message.id,
             &group_id,
-            &author,
+            &account.pubkey,
             &DeliveryStatus::Sent(3),
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
         assert_eq!(updated.delivery_status, Some(DeliveryStatus::Sent(3)));
 
         // Verify via find_by_id as well
-        let found = AggregatedMessage::find_by_id(
-            &message.id,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(3)));
 
         // Update to Failed
         let updated = AggregatedMessage::update_delivery_status(
             &message.id,
             &group_id,
-            &author,
+            &account.pubkey,
             &DeliveryStatus::Failed("timeout".to_string()),
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
@@ -2689,91 +2534,68 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_id_returns_none_for_nonexistent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[201; 32]);
-        let author = Keys::generate().public_key();
 
-        let found = AggregatedMessage::find_by_id(
-            "nonexistent",
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let found = AggregatedMessage::find_by_id("nonexistent", &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
         assert!(found.is_none());
     }
 
     #[tokio::test]
     async fn test_insert_message_with_no_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[202; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let message = create_test_chat_message(202, author);
         // delivery_status is None (incoming message)
         assert!(message.delivery_status.is_none());
 
-        AggregatedMessage::insert_message(
-            &message,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
-        let found = AggregatedMessage::find_by_id(
-            &message.id,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.delivery_status, None);
     }
 
     #[tokio::test]
     async fn test_find_messages_by_group_preserves_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[203; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert incoming message (no delivery status)
         let msg_incoming = create_test_chat_message(203, author);
-        AggregatedMessage::insert_message(
-            &msg_incoming,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_incoming, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Insert outgoing message with Sent status
         let mut msg_outgoing = create_test_chat_message(204, author);
         msg_outgoing.delivery_status = Some(DeliveryStatus::Sent(2));
-        AggregatedMessage::insert_message(
-            &msg_outgoing,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_outgoing, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 2);
 
         let statuses: Vec<_> = messages.iter().map(|m| &m.delivery_status).collect();
@@ -2784,17 +2606,18 @@ mod tests {
     #[tokio::test]
     async fn test_update_delivery_status_returns_error_for_nonexistent_message() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[205; 32]);
-        let author = Keys::generate().public_key();
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         // Try to update delivery status for a message that doesn't exist
         let result = AggregatedMessage::update_delivery_status(
             &format!("{:0>64}", "ff"),
             &group_id,
-            &author,
+            &account.pubkey,
             &DeliveryStatus::Sent(1),
-            &whitenoise.shared.database,
+            db,
         )
         .await;
 
@@ -2813,54 +2636,37 @@ mod tests {
     #[tokio::test]
     async fn test_find_messages_by_group_excludes_retried() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[206; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a normal message
         let msg_normal = create_test_chat_message(206, author);
-        AggregatedMessage::insert_message(
-            &msg_normal,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_normal, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Insert a message with Retried status (simulating a retried failed message)
         let mut msg_retried = create_test_chat_message(207, author);
         msg_retried.delivery_status = Some(DeliveryStatus::Retried);
-        AggregatedMessage::insert_message(
-            &msg_retried,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_retried, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         // Insert a message with Failed status (should still be visible)
         let mut msg_failed = create_test_chat_message(208, author);
         msg_failed.delivery_status = Some(DeliveryStatus::Failed("error".to_string()));
-        AggregatedMessage::insert_message(
-            &msg_failed,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_failed, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
 
         // Only normal and failed messages should appear, not retried
         assert_eq!(messages.len(), 2);
@@ -2873,9 +2679,11 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_for_groups_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
 
         let group_id = GroupId::from_slice(&[170; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(170, author);
@@ -2883,26 +2691,20 @@ mod tests {
         let msg3 = create_test_chat_message(172, author);
 
         for msg in [&msg1, &msg2, &msg3] {
-            AggregatedMessage::insert_message(msg, &group_id, &author, &whitenoise.shared.database)
+            AggregatedMessage::insert_message(msg, &group_id, &account.pubkey, db)
                 .await
                 .unwrap();
         }
 
         // Delete msg2
-        AggregatedMessage::mark_deleted(
-            &msg2.id,
-            &group_id,
-            &format!("{:0>64}", "del"),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &format!("{:0>64}", "del"), db)
+            .await
+            .unwrap();
 
         let input = vec![(group_id.clone(), None, None)];
-        let result =
-            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let result = AggregatedMessage::count_unread_for_groups(&input, db)
+            .await
+            .unwrap();
 
         assert_eq!(result[&group_id], 2); // msg1 and msg3, excluding deleted msg2
     }
@@ -2910,66 +2712,59 @@ mod tests {
     #[tokio::test]
     async fn test_insert_delivery_status_and_has_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[180; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg = create_test_chat_message(180, author);
-        AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
             .await
             .unwrap();
 
         // Before inserting, has_delivery_status should return false
-        let has = AggregatedMessage::has_delivery_status(
-            &msg.id,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
         assert!(!has, "No delivery status should exist yet");
 
         // Insert delivery status
         AggregatedMessage::insert_delivery_status(
             &msg.id,
             &group_id,
-            &author,
+            &account.pubkey,
             &DeliveryStatus::Sending,
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
 
         // Now has_delivery_status should return true
-        let has = AggregatedMessage::has_delivery_status(
-            &msg.id,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
         assert!(has, "Delivery status should exist after insert");
 
         // Verify it shows up in find_by_id
-        let found =
-            AggregatedMessage::find_by_id(&msg.id, &group_id, &author, &whitenoise.shared.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
     }
 
     #[tokio::test]
     async fn test_insert_delivery_status_upsert() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[181; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg = create_test_chat_message(181, author);
-        AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
             .await
             .unwrap();
 
@@ -2977,9 +2772,9 @@ mod tests {
         AggregatedMessage::insert_delivery_status(
             &msg.id,
             &group_id,
-            &author,
+            &account.pubkey,
             &DeliveryStatus::Sending,
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
@@ -2988,74 +2783,67 @@ mod tests {
         AggregatedMessage::insert_delivery_status(
             &msg.id,
             &group_id,
-            &author,
+            &account.pubkey,
             &DeliveryStatus::Sent(2),
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
 
-        let found =
-            AggregatedMessage::find_by_id(&msg.id, &group_id, &author, &whitenoise.shared.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(2)));
     }
 
     #[tokio::test]
     async fn test_unmark_deleted_reverses_deletion() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[182; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(182, author);
         let msg2 = create_test_chat_message(183, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg1, &group_id, &account.pubkey, db)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg2, &group_id, &account.pubkey, db)
             .await
             .unwrap();
 
         let del_id = format!("{:0>64x}", 0xde1182u64);
 
         // Mark both as deleted by the same deletion event
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, &whitenoise.shared.database)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, db)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, &whitenoise.shared.database)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, db)
             .await
             .unwrap();
 
         // Both should have is_deleted=true
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert!(
             messages.iter().all(|m| m.is_deleted),
             "All messages should be marked as deleted"
         );
 
         // Unmark — both should revert to not deleted
-        AggregatedMessage::unmark_deleted(&del_id, &group_id, &whitenoise.shared.database)
+        AggregatedMessage::unmark_deleted(&del_id, &group_id, db)
             .await
             .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 2, "Both messages should still be present");
         assert!(
             messages.iter().all(|m| !m.is_deleted),
@@ -3066,42 +2854,40 @@ mod tests {
     #[tokio::test]
     async fn test_unmark_deleted_only_affects_matching_deletion() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[184; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(184, author);
         let msg2 = create_test_chat_message(185, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg1, &group_id, &account.pubkey, db)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg2, &group_id, &account.pubkey, db)
             .await
             .unwrap();
 
         let del_a = format!("{:0>64x}", 0xde1au64);
         let del_b = format!("{:0>64x}", 0xde1bu64);
 
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, &whitenoise.shared.database)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, db)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, &whitenoise.shared.database)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, db)
             .await
             .unwrap();
 
         // Unmark only del_a — msg1 should revert to not-deleted, msg2 stays deleted
-        AggregatedMessage::unmark_deleted(&del_a, &group_id, &whitenoise.shared.database)
+        AggregatedMessage::unmark_deleted(&del_a, &group_id, db)
             .await
             .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group_id,
-            &author,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
         let not_deleted: Vec<_> = messages.iter().filter(|m| !m.is_deleted).collect();
         assert_eq!(not_deleted.len(), 1, "Only msg1 should be un-deleted");
         assert_eq!(not_deleted[0].id, msg1.id);
@@ -3110,8 +2896,10 @@ mod tests {
     #[tokio::test]
     async fn test_find_orphaned_reactions_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[186; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         // Use valid hex IDs (find_orphaned_reactions parses message_id as EventId)
@@ -3139,56 +2927,41 @@ mod tests {
         .bind(&empty_tokens)
         .bind(&empty_reactions)
         .bind(&empty_media)
-        .execute(&whitenoise.shared.database.pool)
+        .execute(&db.pool)
         .await
         .unwrap();
 
         // The reaction should appear as orphaned
-        let orphans = AggregatedMessage::find_orphaned_reactions(
-            &parent_id,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let orphans = AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, db)
+            .await
+            .unwrap();
         assert_eq!(orphans.len(), 1, "Non-deleted reaction should be found");
 
         // Now mark the reaction as deleted
         let del_id = format!("{:0>64x}", 0xde1186u64);
-        AggregatedMessage::mark_deleted(
-            &reaction_id,
-            &group_id,
-            &del_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, db)
+            .await
+            .unwrap();
 
         // Deleted reaction should NOT appear as orphaned
-        let orphans = AggregatedMessage::find_orphaned_reactions(
-            &parent_id,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let orphans = AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, db)
+            .await
+            .unwrap();
         assert_eq!(orphans.len(), 0, "Deleted reaction should be excluded");
     }
 
     #[tokio::test]
     async fn test_has_delivery_status_returns_false_for_nonexistent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[188; 32]);
-        let author = Keys::generate().public_key();
 
-        let has = AggregatedMessage::has_delivery_status(
-            "nonexistent",
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let has =
+            AggregatedMessage::has_delivery_status("nonexistent", &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
         assert!(!has);
     }
 
@@ -3227,13 +3000,15 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_empty_group_returns_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[200; 32]);
-        let author = Keys::generate().public_key();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -3246,29 +3021,24 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_default_returns_up_to_50_newest() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[201; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
 
         // Insert 60 messages with ascending timestamps
         for i in 1u8..=60 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Default (no cursor) should return the 50 newest
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -3302,22 +3072,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_before_cursor_excludes_on_or_after() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[202; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_100_000;
 
         // Insert 5 messages: ts+1, ts+2, ts+3, ts+4, ts+5
         for i in 1u8..=5 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Cursor at ts+3 (seed 3): should return only messages with created_at < ts+3 → ts+1, ts+2.
@@ -3326,8 +3091,8 @@ mod tests {
         let cursor_id = format!("{:0>64}", format!("{:x}", 3u8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(cursor_ts),
                 before_message_id: Some(cursor_id.clone()),
@@ -3351,27 +3116,22 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_limit_is_respected() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[203; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_200_000;
 
         for i in 1u8..=10 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             Some(3),
             None,
@@ -3393,8 +3153,10 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_limit_capped_at_200() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[204; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_300_000;
@@ -3403,21 +3165,14 @@ mod tests {
         for i in 0u8..=209 {
             // Use two bytes for the seed to stay within u8 — spread across different IDs
             let id_seed = i;
-            insert_message_at(
-                id_seed,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(id_seed, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Requesting u32::MAX should be capped to 200
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             Some(u32::MAX),
             None,
@@ -3431,29 +3186,24 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_pages_are_contiguous_without_overlap_or_gap() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[205; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_400_000;
 
         // Insert 10 messages with distinct timestamps
         for i in 1u8..=10 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Page 1: newest 5 (seeds 6–10)
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             Some(5),
             None,
@@ -3467,8 +3217,8 @@ mod tests {
         let cursor_id = page1[0].id.as_str();
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(cursor_ts),
                 before_message_id: Some(cursor_id.to_string()),
@@ -3496,8 +3246,8 @@ mod tests {
         let cursor_id2 = page2[0].id.as_str();
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(cursor_ts2),
                 before_message_id: Some(cursor_id2.to_string()),
@@ -3518,8 +3268,10 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_tied_timestamps_no_skip_or_duplicate_across_pages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[206; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
@@ -3529,32 +3281,18 @@ mod tests {
 
         // Seeds 1–6: all at `tie_ts` (identical created_at seconds)
         // Seeds 7–8: flanking timestamps to confirm ordering is correct
-        insert_message_at(
-            7,
-            author,
-            tie_ts - 1,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await; // earlier
+        insert_message_at(7, author, tie_ts - 1, &group_id, db).await; // earlier
         for i in 1u8..=6 {
-            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.shared.database).await;
+            insert_message_at(i, author, tie_ts, &group_id, db).await;
         }
-        insert_message_at(
-            8,
-            author,
-            tie_ts + 1,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await; // later
+        insert_message_at(8, author, tie_ts + 1, &group_id, db).await; // later
 
         // Total 8 messages. Page size 3 — three pages needed.
         // Page 1: newest 3
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             Some(3),
             None,
@@ -3568,8 +3306,8 @@ mod tests {
         let c1_id = page1[0].id.clone();
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(c1_ts),
                 before_message_id: Some(c1_id.clone()),
@@ -3587,8 +3325,8 @@ mod tests {
         let c2_id = page2[0].id.clone();
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(c2_ts),
                 before_message_id: Some(c2_id.clone()),
@@ -3610,8 +3348,8 @@ mod tests {
         let c3_id = page3[0].id.clone();
         let page4 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(c3_ts),
                 before_message_id: Some(c3_id.clone()),
@@ -3655,15 +3393,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_half_specified_cursor_is_rejected() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[207; 32]);
-        let author = Keys::generate().public_key();
         let ts = Timestamp::from(1_700_000_000u64);
 
         // before=Some, before_message_id=None → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(ts),
                 ..Default::default()
@@ -3681,8 +3421,8 @@ mod tests {
         // before=None, before_message_id=Some → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before_message_id: Some(
                     "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
@@ -3703,15 +3443,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_invalid_before_message_id_is_rejected() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[208; 32]);
-        let author = Keys::generate().public_key();
         let ts = Timestamp::from(1_700_000_000u64);
 
         // Non-hex string → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(ts),
                 before_message_id: Some("not-valid-hex-at-all".to_string()),
@@ -3730,8 +3472,8 @@ mod tests {
         // Valid hex but wrong length (32 chars instead of 64) → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(ts),
                 before_message_id: Some("00000000000000000000000000000001".to_string()),
@@ -3753,22 +3495,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_after_cursor_returns_only_newer_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[220; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_710_000_000;
 
         // Insert 5 messages: ts+1 … ts+5
         for i in 1u8..=5 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Cursor at ts+2 (seed 2): should return only messages with created_at > ts+2 → ts+3, ts+4, ts+5.
@@ -3776,8 +3513,8 @@ mod tests {
         let cursor_id = format!("{:0>64}", format!("{:x}", 2u8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -3802,21 +3539,16 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_after_cursor_returns_oldest_first() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[221; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_710_100_000;
 
         for i in 1u8..=10 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Cursor at ts+3: should return ts+4 … ts+10 in ascending order
@@ -3824,8 +3556,8 @@ mod tests {
         let cursor_id = format!("{:0>64}", format!("{:x}", 3u8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -3851,32 +3583,20 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_after_cursor_tied_timestamps() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[222; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let tie_ts: u64 = 1_710_200_000;
 
         // Insert one message before the tie, six at tie_ts, one after
-        insert_message_at(
-            7,
-            author,
-            tie_ts - 1,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await;
+        insert_message_at(7, author, tie_ts - 1, &group_id, db).await;
         for i in 1u8..=6 {
-            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.shared.database).await;
+            insert_message_at(i, author, tie_ts, &group_id, db).await;
         }
-        insert_message_at(
-            8,
-            author,
-            tie_ts + 1,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await;
+        insert_message_at(8, author, tie_ts + 1, &group_id, db).await;
 
         // Use the earliest message (seed 7, ts-1) as the after cursor
         let cursor_ts = Timestamp::from(tie_ts - 1);
@@ -3885,8 +3605,8 @@ mod tests {
         // Page through with limit 3
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -3903,8 +3623,8 @@ mod tests {
         let c1_id = page1.last().unwrap().id.clone();
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after: Some(c1_ts),
                 after_message_id: Some(c1_id.clone()),
@@ -3921,8 +3641,8 @@ mod tests {
         let c2_id = page2.last().unwrap().id.clone();
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after: Some(c2_ts),
                 after_message_id: Some(c2_id.clone()),
@@ -3964,15 +3684,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_both_before_and_after_is_rejected() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[223; 32]);
-        let author = Keys::generate().public_key();
         let ts = Timestamp::from(1_710_300_000u64);
         let id = "0000000000000000000000000000000000000000000000000000000000000001";
 
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(ts),
                 before_message_id: Some(id.to_string()),
@@ -3993,15 +3715,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_half_specified_after_cursor_is_rejected() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[224; 32]);
-        let author = Keys::generate().public_key();
         let ts = Timestamp::from(1_710_400_000u64);
 
         // after=Some, after_message_id=None → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after: Some(ts),
                 ..Default::default()
@@ -4019,8 +3743,8 @@ mod tests {
         // after=None, after_message_id=Some → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after_message_id: Some(
                     "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
@@ -4041,21 +3765,16 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_after_cursor_past_newest_returns_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[225; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_710_500_000;
 
         for i in 1u8..=3 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Cursor beyond all messages
@@ -4063,8 +3782,8 @@ mod tests {
         let cursor_id = format!("{:0>64}", format!("{:x}", 0xffu8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -4088,40 +3807,27 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_group_isolation() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_a = GroupId::from_slice(&[210; 32]);
         let group_b = GroupId::from_slice(&[211; 32]);
-        setup_group(&group_a, &whitenoise.shared.database).await;
-        setup_group(&group_b, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_701_000_000;
 
         // 3 messages in group A, 2 messages in group B
         for i in 1u8..=3 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_a,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_a, db).await;
         }
         for i in 10u8..=11 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_b,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_b, db).await;
         }
 
         let results_a = AggregatedMessage::find_messages_by_group_paginated(
             &group_a,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4130,8 +3836,8 @@ mod tests {
         .unwrap();
         let results_b = AggregatedMessage::find_messages_by_group_paginated(
             &group_b,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4156,40 +3862,30 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_deleted_messages_are_included_as_tombstones() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[212; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_702_000_000;
 
         // Insert 3 messages: seeds 1, 2, 3
         for i in 1u8..=3 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(
-            &msg2_id,
-            &group_id,
-            &deletion_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, db)
+            .await
+            .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4220,44 +3916,34 @@ mod tests {
     #[tokio::test]
     async fn test_unread_minimum_deleted_messages_are_included_as_tombstones() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[214; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_702_000_000;
 
         // Insert 3 messages: seeds 1, 2, 3
         for i in 1u8..=3 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(
-            &msg2_id,
-            &group_id,
-            &deletion_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, db)
+            .await
+            .unwrap();
 
         // No read marker → all non-deleted messages are unread (cnt=2), minimum=3
         // LIMIT = MAX(2, 3) = 3, so all 3 rows (including the tombstone) are returned.
         let messages = AggregatedMessage::find_messages_with_unread_minimum(
             &group_id,
-            &author,
+            &account.pubkey,
             None,
             3,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4284,21 +3970,16 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_non_kind9_messages_are_excluded() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[213; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_703_000_000;
 
         // Insert one kind-9 message via the normal helper
-        insert_message_at(
-            1,
-            author,
-            base_ts + 1,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await;
+        insert_message_at(1, author, base_ts + 1, &group_id, db).await;
 
         // Insert a kind-7 reaction row directly with raw SQL (insert_message always writes kind=9)
         let reaction_id = format!("{:0>64}", format!("{:x}", 200u8));
@@ -4320,14 +4001,14 @@ mod tests {
         .bind(&empty_tokens)
         .bind(&empty_reactions)
         .bind(&empty_media)
-        .execute(&whitenoise.shared.database.pool)
+        .execute(&db.pool)
         .await
         .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4354,22 +4035,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_uppercase_cursor_id_is_canonicalized() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[214; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_704_000_000;
 
         // Insert 5 messages
         for i in 1u8..=5 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Build cursor from seed 3 (ts+3) but pass the message ID in uppercase
@@ -4379,8 +4055,8 @@ mod tests {
         // Should not error — uppercase is valid hex and gets canonicalized internally
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(Timestamp::from(base_ts + 3)),
                 before_message_id: Some(uppercase_id.clone()),
@@ -4407,18 +4083,20 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_single_message_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[215; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let ts: u64 = 1_705_000_000;
 
-        let msg = insert_message_at(1, author, ts, &group_id, &whitenoise.shared.database).await;
+        let msg = insert_message_at(1, author, ts, &group_id, db).await;
 
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4435,8 +4113,8 @@ mod tests {
         // Cursor from the only message → next page is empty
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(page1[0].created_at),
                 before_message_id: Some(page1[0].id.clone()),
@@ -4458,27 +4136,22 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_exactly_default_limit_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[216; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_706_000_000;
 
         for i in 1u8..=50 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4494,8 +4167,8 @@ mod tests {
         // Cursor from the oldest (page1[0]) → no older messages exist
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(page1[0].created_at),
                 before_message_id: Some(page1[0].id.clone()),
@@ -4517,22 +4190,17 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_limit_one_traverses_all_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[217; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_707_000_000;
         let total: u8 = 5;
 
         for i in 1u8..=total {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         let mut all_seen: Vec<String> = Vec::new();
@@ -4550,8 +4218,8 @@ mod tests {
 
             let page = AggregatedMessage::find_messages_by_group_paginated(
                 &group_id,
-                &author,
-                &whitenoise.shared.database,
+                &account.pubkey,
+                db,
                 &opts,
                 Some(1),
                 None,
@@ -4590,29 +4258,24 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_cursor_at_oldest_message_yields_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[218; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_708_000_000;
 
         // Insert 3 messages; seed 1 is the oldest
         for i in 1u8..=3 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // Full first page
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4625,8 +4288,8 @@ mod tests {
         let oldest = &page1[0];
         let next_page = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions {
                 before: Some(oldest.created_at),
                 before_message_id: Some(oldest.id.clone()),
@@ -4650,21 +4313,16 @@ mod tests {
     #[tokio::test]
     async fn test_paginated_retried_messages_are_excluded() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[219; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_709_000_000;
 
         // Insert a normal message (seed 1) and a retried message (seed 2)
-        insert_message_at(
-            1,
-            author,
-            base_ts + 1,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await;
+        insert_message_at(1, author, base_ts + 1, &group_id, db).await;
 
         let retried_msg = ChatMessage {
             id: format!("{:0>64}", format!("{:x}", 2u8)),
@@ -4681,19 +4339,14 @@ mod tests {
             media_attachments: vec![],
             delivery_status: Some(DeliveryStatus::Retried),
         };
-        AggregatedMessage::insert_message(
-            &retried_msg,
-            &group_id,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&retried_msg, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             None,
@@ -4739,8 +4392,10 @@ mod tests {
     #[tokio::test]
     async fn test_search_messages_in_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[42; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
@@ -4758,7 +4413,7 @@ mod tests {
         ];
 
         for msg in &messages {
-            AggregatedMessage::insert_message(msg, &group_id, &author, &whitenoise.shared.database)
+            AggregatedMessage::insert_message(msg, &group_id, &account.pubkey, db)
                 .await
                 .unwrap();
         }
@@ -4766,10 +4421,10 @@ mod tests {
         // Basic single-word search
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "hello",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4782,10 +4437,10 @@ mod tests {
         // Forward-order multi-word search
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "big plans",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4801,10 +4456,10 @@ mod tests {
         // Substring matching ("big" matches "bigger")
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "big",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4814,10 +4469,10 @@ mod tests {
         // Case insensitive
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "MARMOT",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4828,10 +4483,10 @@ mod tests {
         // CJK search
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "日本語",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4842,10 +4497,10 @@ mod tests {
         // Cyrillic search
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "привет",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4855,10 +4510,10 @@ mod tests {
         // Devanagari search (with combining marks)
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "नमस्ते",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4869,10 +4524,10 @@ mod tests {
         // No match
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "nonexistent",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4882,10 +4537,10 @@ mod tests {
         // Empty query matches all — positions are sequential newest-first
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4897,10 +4552,10 @@ mod tests {
         // Limit is respected
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "",
             2,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4913,8 +4568,10 @@ mod tests {
     #[tokio::test]
     async fn test_search_same_timestamp_deterministic_ordering() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[99; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let same_ts = Timestamp::from(1_700_000_000u64);
@@ -4944,23 +4601,18 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            AggregatedMessage::insert_message(
-                &msg,
-                &group_id,
-                &author,
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
+            AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
         }
 
         // Search for all three: "same-ts" matches every message
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "same-ts",
             50,
-            &whitenoise.shared.database,
+            db,
             None,
         )
         .await
@@ -4989,15 +4641,13 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let pubkey = account.pubkey;
+        let session = whitenoise.session(&pubkey).unwrap();
+        let db = &session.account_db.inner;
 
         // Set up three groups with messages
         let group_a = GroupId::from_slice(&[10; 32]);
         let group_b = GroupId::from_slice(&[11; 32]);
         let group_declined = GroupId::from_slice(&[12; 32]);
-
-        for gid in [&group_a, &group_b, &group_declined] {
-            setup_group(gid, &whitenoise.shared.database).await;
-        }
 
         // Link account to groups: A = accepted, B = pending (null), C = declined
         let now = Utc::now();
@@ -5031,29 +4681,24 @@ mod tests {
 
         // Insert messages: "marmot" in all three groups
         let msg_a = create_test_chat_message_with_content(1, author, "marmot in group A");
-        AggregatedMessage::insert_message(&msg_a, &group_a, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg_a, &group_a, &author, db)
             .await
             .unwrap();
 
         let msg_b = create_test_chat_message_with_content(2, author, "marmot in group B");
-        AggregatedMessage::insert_message(&msg_b, &group_b, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg_b, &group_b, &author, db)
             .await
             .unwrap();
 
         let msg_declined =
             create_test_chat_message_with_content(3, author, "marmot in declined group");
-        AggregatedMessage::insert_message(
-            &msg_declined,
-            &group_declined,
-            &author,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        AggregatedMessage::insert_message(&msg_declined, &group_declined, &author, db)
+            .await
+            .unwrap();
 
         // Also add a second message in group A to verify per-group positions
         let msg_a2 = create_test_chat_message_with_content(4, author, "another marmot in group A");
-        AggregatedMessage::insert_message(&msg_a2, &group_a, &author, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg_a2, &group_a, &author, db)
             .await
             .unwrap();
 
@@ -5069,15 +4714,10 @@ mod tests {
             .collect();
 
         // Cross-group search for "marmot"
-        let results = AggregatedMessage::search_messages(
-            &pubkey,
-            "marmot",
-            50,
-            &visible_group_ids,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let results =
+            AggregatedMessage::search_messages(&pubkey, "marmot", 50, &visible_group_ids, db)
+                .await
+                .unwrap();
 
         // Should find 3 results (groups A and B), NOT the declined group
         assert_eq!(
@@ -5126,15 +4766,10 @@ mod tests {
         assert_eq!(group_b_result.position, 0);
 
         // Empty query returns all non-declined messages
-        let all_results = AggregatedMessage::search_messages(
-            &pubkey,
-            "",
-            50,
-            &visible_group_ids,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let all_results =
+            AggregatedMessage::search_messages(&pubkey, "", 50, &visible_group_ids, db)
+                .await
+                .unwrap();
         assert_eq!(
             all_results.len(),
             3,
@@ -5142,27 +4777,17 @@ mod tests {
         );
 
         // Limit is respected
-        let limited = AggregatedMessage::search_messages(
-            &pubkey,
-            "marmot",
-            1,
-            &visible_group_ids,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let limited =
+            AggregatedMessage::search_messages(&pubkey, "marmot", 1, &visible_group_ids, db)
+                .await
+                .unwrap();
         assert_eq!(limited.len(), 1, "limit should cap results");
 
         // No match returns empty
-        let no_match = AggregatedMessage::search_messages(
-            &pubkey,
-            "nonexistent",
-            50,
-            &visible_group_ids,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let no_match =
+            AggregatedMessage::search_messages(&pubkey, "nonexistent", 50, &visible_group_ids, db)
+                .await
+                .unwrap();
         assert!(no_match.is_empty(), "no match should return empty");
     }
 
@@ -5171,22 +4796,17 @@ mod tests {
     #[tokio::test]
     async fn test_find_messages_respects_chat_cleared_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[240; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
 
         // Insert 5 messages at known timestamps (seconds)
         for i in 1u8..=5 {
-            insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
         }
 
         // cleared_at = message 3's timestamp in millis → messages 4, 5 survive
@@ -5195,9 +4815,9 @@ mod tests {
         // find_messages_by_group
         let messages = AggregatedMessage::find_messages_by_group(
             &group_id,
-            &author,
+            &account.pubkey,
             Some(cleared_at_ms),
-            &whitenoise.shared.database,
+            db,
         )
         .await
         .unwrap();
@@ -5208,8 +4828,8 @@ mod tests {
         // find_messages_by_group_paginated
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
-            &author,
-            &whitenoise.shared.database,
+            &account.pubkey,
+            db,
             &PaginationOptions::default(),
             None,
             Some(cleared_at_ms),
@@ -5221,10 +4841,10 @@ mod tests {
         // find_messages_with_unread_minimum
         let messages = AggregatedMessage::find_messages_with_unread_minimum(
             &group_id,
-            &author,
+            &account.pubkey,
             None,
             50,
-            &whitenoise.shared.database,
+            db,
             Some(cleared_at_ms),
         )
         .await
@@ -5235,22 +4855,17 @@ mod tests {
     #[tokio::test]
     async fn test_count_unread_respects_chat_cleared_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[241; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
 
         let mut messages = Vec::new();
         for i in 1u8..=5 {
-            let msg = insert_message_at(
-                i,
-                author,
-                base_ts + u64::from(i),
-                &group_id,
-                &whitenoise.shared.database,
-            )
-            .await;
+            let msg = insert_message_at(i, author, base_ts + u64::from(i), &group_id, db).await;
             messages.push(msg);
         }
 
@@ -5258,14 +4873,10 @@ mod tests {
         let cleared_at_ms = (base_ts + 2) as i64 * 1000;
 
         // count_unread_for_group with no read marker: 3 visible messages
-        let count = AggregatedMessage::count_unread_for_group(
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-            Some(cleared_at_ms),
-        )
-        .await
-        .unwrap();
+        let count =
+            AggregatedMessage::count_unread_for_group(&group_id, None, db, Some(cleared_at_ms))
+                .await
+                .unwrap();
         assert_eq!(count, 3);
 
         // count_unread_for_group with read marker at msg 3: messages 4, 5 unread
@@ -5273,7 +4884,7 @@ mod tests {
         let count = AggregatedMessage::count_unread_for_group(
             &group_id,
             Some(&marker),
-            &whitenoise.shared.database,
+            db,
             Some(cleared_at_ms),
         )
         .await
@@ -5282,18 +4893,19 @@ mod tests {
 
         // count_unread_for_groups batch API
         let input = vec![(group_id.clone(), None, Some(cleared_at_ms))];
-        let result =
-            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let result = AggregatedMessage::count_unread_for_groups(&input, db)
+            .await
+            .unwrap();
         assert_eq!(result[&group_id], 3);
     }
 
     #[tokio::test]
     async fn test_search_respects_chat_cleared_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[242; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
@@ -5316,14 +4928,9 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            AggregatedMessage::insert_message(
-                &msg,
-                &group_id,
-                &author,
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
+            AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
         }
 
         // cleared_at = message 2's timestamp → messages 3, 4 visible
@@ -5331,10 +4938,10 @@ mod tests {
 
         let results = AggregatedMessage::search_messages_in_group(
             &group_id,
-            &author,
+            &account.pubkey,
             "hello",
             50,
-            &whitenoise.shared.database,
+            db,
             Some(cleared_at_ms),
         )
         .await
@@ -5355,8 +4962,10 @@ mod tests {
     #[tokio::test]
     async fn test_delivery_status_isolated_between_accounts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
         let group_id = GroupId::from_slice(&[42; 32]);
-        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let account_a = Keys::generate().public_key();
         let account_b = Keys::generate().public_key();
@@ -5364,20 +4973,15 @@ mod tests {
         // Account A sends a message with delivery status
         let mut msg = create_test_chat_message(1, account_a);
         msg.delivery_status = Some(DeliveryStatus::Sending);
-        AggregatedMessage::insert_message(&msg, &group_id, &account_a, &whitenoise.shared.database)
+        AggregatedMessage::insert_message(&msg, &group_id, &account_a, db)
             .await
             .unwrap();
 
         // Account A sees delivery status on their own message
-        let fetched_by_a = AggregatedMessage::find_by_id(
-            &msg.id,
-            &group_id,
-            &account_a,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .expect("message should exist");
+        let fetched_by_a = AggregatedMessage::find_by_id(&msg.id, &group_id, &account_a, db)
+            .await
+            .unwrap()
+            .expect("message should exist");
         assert_eq!(
             fetched_by_a.delivery_status,
             Some(DeliveryStatus::Sending),
@@ -5385,15 +4989,10 @@ mod tests {
         );
 
         // Account B queries the same message — must NOT see A's delivery status
-        let fetched_by_b = AggregatedMessage::find_by_id(
-            &msg.id,
-            &group_id,
-            &account_b,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .expect("message should exist for any account");
+        let fetched_by_b = AggregatedMessage::find_by_id(&msg.id, &group_id, &account_b, db)
+            .await
+            .unwrap()
+            .expect("message should exist for any account");
         assert_eq!(
             fetched_by_b.delivery_status, None,
             "other account must not see sender's delivery status (issue #739)"

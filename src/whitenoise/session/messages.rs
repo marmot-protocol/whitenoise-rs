@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
@@ -61,8 +59,8 @@ impl<'a> MessageOps<'a> {
         &self.session.account_pubkey
     }
 
-    fn db(&self) -> &Arc<Database> {
-        &self.session.shared.database
+    fn db(&self) -> &Database {
+        &self.session.account_db.inner
     }
 }
 
@@ -77,8 +75,8 @@ impl<'a> MessageOpsForGroup<'a> {
         &self.session.account_pubkey
     }
 
-    fn db(&self) -> &Arc<Database> {
-        &self.session.shared.database
+    fn db(&self) -> &Database {
+        &self.session.account_db.inner
     }
 
     fn pool(&self) -> &sqlx::SqlitePool {
@@ -336,7 +334,7 @@ impl<'a> MessageOpsForGroup<'a> {
                     &group_relays,
                     &event_id_str,
                     &group_id,
-                    &shared.database,
+                    &account_db.inner,
                     &shared.message_stream_manager,
                 )
                 .await
@@ -370,7 +368,7 @@ impl<'a> MessageOpsForGroup<'a> {
                     &author,
                     &content,
                     &group_id,
-                    &shared.database,
+                    &account_db.inner,
                     &shared.message_stream_manager,
                 )
                 .await;

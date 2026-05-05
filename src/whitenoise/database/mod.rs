@@ -280,26 +280,22 @@ impl Database {
         Ok(())
     }
 
-    /// Deletes aggregated messages that all accounts have cleared.
+    /// Delete aggregated messages whose `created_at <= threshold`.
     ///
-    /// Only deletes messages whose `created_at` is at or before the minimum
-    /// `chat_cleared_at` across all accounts in the group, and only when
-    /// every account has set a `chat_cleared_at` value.
+    /// Intended for the per-account cleanup path: after `clear_chat` advances
+    /// this account's `chat_cleared_at`, the caller passes that timestamp here
+    /// to drop the now-invisible message rows from this account's per-account
+    /// DB. Cross-account coordination is irrelevant because each account owns
+    /// its own copy of `aggregated_messages` post-phase-18e.
     ///
-    /// Returns the number of rows deleted.
-    /// Delete aggregated messages older than the given threshold.
-    ///
-    /// `min_cleared_at` is the minimum `chat_cleared_at` across all accounts
-    /// that have this group, but only if **every** account has set a
-    /// `chat_cleared_at` value (i.e. all accounts have cleared). If any
-    /// account has `chat_cleared_at = NULL`, pass `None` and no cleanup
-    /// occurs.
+    /// Pass `None` to make the call a no-op. Returns the number of rows
+    /// deleted.
     pub(crate) async fn try_cleanup_cleared_messages(
         &self,
         mls_group_id: &mdk_core::prelude::GroupId,
-        min_cleared_at: Option<i64>,
+        cleared_at_ms: Option<i64>,
     ) -> Result<u64, DatabaseError> {
-        let Some(threshold) = min_cleared_at else {
+        let Some(threshold) = cleared_at_ms else {
             return Ok(0);
         };
         retry_on_lock(|| self.try_cleanup_cleared_messages_inner(mls_group_id, threshold)).await
@@ -322,19 +318,13 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Delete all data for an account's association with a group.
-    ///
-    /// Removes the per-account row and data (accounts_groups, push tokens,
-    /// media files). If no other accounts reference this group after the deletion,
-    /// also removes shared data (group_information, which cascades to
-    /// aggregated_messages). Per-account drafts (Phase 18c) live in each
-    /// account's per-account DB file and are dropped with that file at full
-    /// account deletion.
+    /// Delete shared-DB data for a group when the last account leaves it.
     ///
     /// All per-account data (accounts_groups, drafts, group_push_tokens,
-    /// media_references) has been moved to per-account DBs; the caller
-    /// deletes those. This method only handles shared data cleanup when
-    /// `is_last_account` is true.
+    /// media_references, aggregated_messages, message_delivery_status) lives
+    /// in per-account DBs and is removed by the caller. This method only
+    /// removes the shared `group_information` row (and anything still
+    /// cascading off it inside the shared DB).
     pub(crate) async fn delete_shared_group_data(
         &self,
         mls_group_id: &mdk_core::prelude::GroupId,
@@ -351,7 +341,6 @@ impl Database {
         &self,
         mls_group_id: &mdk_core::prelude::GroupId,
     ) -> Result<(), DatabaseError> {
-        // group_information cascades to aggregated_messages via FK
         sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
             .bind(mls_group_id.as_slice())
             .execute(&self.pool)
@@ -856,6 +845,35 @@ mod tests {
         .unwrap();
     }
 
+    /// Creates the per-account-shape `aggregated_messages` table on a generic
+    /// test DB. Phase 18e moved this table out of the shared schema, so tests
+    /// that exercise per-account-DB methods (`try_cleanup_cleared_messages`)
+    /// must materialise the table themselves.
+    async fn setup_aggregated_messages_table(db: &Database) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS aggregated_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL,
+                mls_group_id BLOB NOT NULL,
+                author TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                tags JSONB NOT NULL,
+                reply_to_id TEXT,
+                deletion_event_id TEXT,
+                content_tokens JSONB NOT NULL,
+                reactions JSONB NOT NULL,
+                media_attachments JSONB NOT NULL,
+                content_normalized TEXT NOT NULL DEFAULT '',
+                UNIQUE(message_id, mls_group_id)
+            )",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
     /// Inserts a minimal aggregated_messages row.
     async fn setup_message(
         db: &Database,
@@ -896,6 +914,7 @@ mod tests {
         let group_id = mdk_core::prelude::GroupId::from_slice(&[1; 32]);
 
         setup_group(&db, &group_id).await;
+        setup_aggregated_messages_table(&db).await;
 
         // Insert messages at times 100 and 200
         setup_message(&db, &group_id, &format!("{:0>64}", "1"), 100).await;
@@ -916,6 +935,7 @@ mod tests {
         let group_id = mdk_core::prelude::GroupId::from_slice(&[2; 32]);
 
         setup_group(&db, &group_id).await;
+        setup_aggregated_messages_table(&db).await;
 
         // Messages at 100, 200, 300
         setup_message(&db, &group_id, &format!("{:0>64}", "a"), 100).await;
@@ -938,6 +958,7 @@ mod tests {
         let group_id = mdk_core::prelude::GroupId::from_slice(&[3; 32]);
 
         setup_group(&db, &group_id).await;
+        setup_aggregated_messages_table(&db).await;
         setup_message(&db, &group_id, &format!("{:0>64}", "d"), 100).await;
 
         // Not all accounts cleared — caller passes None
@@ -958,12 +979,13 @@ mod tests {
         let group_id = mdk_core::prelude::GroupId::from_slice(&[4; 32]);
 
         setup_group(&db, &group_id).await;
-        setup_message(&db, &group_id, &format!("{:0>64}", "e"), 100).await;
 
-        // Delete shared data as last account
+        // Delete shared data as last account.
         db.delete_shared_group_data(&group_id, true).await.unwrap();
 
-        // Verify group_information is gone
+        // Verify group_information is gone. Per-account aggregated_messages
+        // cleanup is the caller's responsibility (delete_chat) post phase 18e —
+        // this method only owns the shared-DB row.
         let (gi_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
                 .bind(group_id.as_slice())
@@ -971,9 +993,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(gi_count, 0);
-
-        // Messages cascade from group_information delete
-        assert_eq!(message_count(&db, &group_id).await, 0);
     }
 
     #[tokio::test]
@@ -982,12 +1001,11 @@ mod tests {
         let group_id = mdk_core::prelude::GroupId::from_slice(&[5; 32]);
 
         setup_group(&db, &group_id).await;
-        setup_message(&db, &group_id, &format!("{:0>64}", "f"), 100).await;
 
         // Delete shared data as non-last account -- should be a no-op
         db.delete_shared_group_data(&group_id, false).await.unwrap();
 
-        // Shared data preserved
+        // Shared row preserved
         let (gi_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
                 .bind(group_id.as_slice())
@@ -995,9 +1013,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(gi_count, 1);
-        assert_eq!(message_count(&db, &group_id).await, 1);
 
-        // Now delete as last account -- everything should be gone
+        // Now delete as last account -- shared row should be gone
         db.delete_shared_group_data(&group_id, true).await.unwrap();
 
         let (gi_count,): (i64,) =
@@ -1007,6 +1024,5 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(gi_count, 0);
-        assert_eq!(message_count(&db, &group_id).await, 0);
     }
 }

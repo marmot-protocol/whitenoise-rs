@@ -177,7 +177,7 @@ impl Whitenoise {
                 let mdk_messages = mdk.get_messages(&group_info.mls_group_id, None)?;
 
                 if self
-                    .cache_needs_sync(&group_info.mls_group_id, &mdk_messages)
+                    .cache_needs_sync(&account.pubkey, &group_info.mls_group_id, &mdk_messages)
                     .await?
                 {
                     tracing::info!(
@@ -211,13 +211,19 @@ impl Whitenoise {
     }
 
     #[perf_instrument("messages")]
-    async fn cache_needs_sync(&self, group_id: &GroupId, mdk_messages: &[Message]) -> Result<bool> {
+    async fn cache_needs_sync(
+        &self,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+        mdk_messages: &[Message],
+    ) -> Result<bool> {
         if mdk_messages.is_empty() {
             return Ok(false);
         }
 
+        let session = self.require_session(account_pubkey)?;
         let cached_count =
-            AggregatedMessage::count_by_group(group_id, &self.shared.database).await?;
+            AggregatedMessage::count_by_group(group_id, &session.account_db.inner).await?;
 
         if mdk_messages.len() != cached_count {
             tracing::debug!(
@@ -247,8 +253,14 @@ impl Whitenoise {
             return Ok(());
         }
 
+        let session = self
+            .account_manager
+            .get_session(pubkey)
+            .ok_or_else(|| crate::whitenoise::error::WhitenoiseError::AccountNotFound)?;
+
         let cached_ids =
-            AggregatedMessage::get_all_event_ids_by_group(group_id, &self.shared.database).await?;
+            AggregatedMessage::get_all_event_ids_by_group(group_id, &session.account_db.inner)
+                .await?;
 
         let new_events: Vec<Message> = mdk_messages
             .into_iter()
@@ -273,10 +285,6 @@ impl Whitenoise {
             hex::encode(group_id.as_slice())
         );
 
-        let session = self
-            .account_manager
-            .get_session(pubkey)
-            .ok_or_else(|| crate::whitenoise::error::WhitenoiseError::AccountNotFound)?;
         let media_files = MediaFile::find_by_group(
             &session.account_db.inner.pool,
             &self.shared.database,
@@ -301,7 +309,7 @@ impl Whitenoise {
             new_events,
             processed_messages,
             group_id,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?;
 
@@ -582,10 +590,15 @@ mod tests {
     #[tokio::test]
     async fn test_cache_needs_sync_empty_mdk() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        // Empty MDK messages should not need sync
-        let needs_sync = whitenoise.cache_needs_sync(&group_id, &[]).await.unwrap();
+        // Empty MDK messages should not need sync — short-circuits before
+        // touching the account DB, so the missing group is irrelevant.
+        let needs_sync = whitenoise
+            .cache_needs_sync(&account.pubkey, &group_id, &[])
+            .await
+            .unwrap();
         assert!(!needs_sync);
     }
 
@@ -666,8 +679,9 @@ mod tests {
         // But MDK also has kind 7/5 events (MLS protocol), so cache_needs_sync
         // compares total event count (MDK) vs cache count.
         // Cache only has kind 9 from proactive caching, sync fills in the rest.
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(
@@ -683,7 +697,7 @@ mod tests {
 
         // Cache should not need sync anymore
         let needs_sync = whitenoise
-            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
+            .cache_needs_sync(&creator.pubkey, &group.mls_group_id, &mdk_messages)
             .await
             .unwrap();
         assert!(!needs_sync, "Cache should not need sync after syncing");
@@ -693,7 +707,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -733,8 +747,9 @@ mod tests {
             .unwrap();
 
         // Verify 2 messages already in cache (proactive caching)
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 2);
@@ -755,7 +770,7 @@ mod tests {
 
         // Verify 3 messages in cache
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 3);
@@ -765,7 +780,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -810,8 +825,9 @@ mod tests {
         }
 
         // Cache already has 5 messages from proactive caching
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 5);
@@ -821,7 +837,7 @@ mod tests {
 
         // Cache should still have 5 messages
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 5);
@@ -831,7 +847,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -850,7 +866,7 @@ mod tests {
         whitenoise.sync_message_cache_on_startup().await.unwrap();
 
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 5);
@@ -1019,8 +1035,9 @@ mod tests {
             .unwrap();
 
         // Verify kind 9 was cached
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 1, "kind 9 message should be cached");
@@ -1050,7 +1067,7 @@ mod tests {
 
         // Cache count should be 2 (kind 9 + kind 7)
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(
@@ -1063,7 +1080,7 @@ mod tests {
             &chat_result.message.id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1106,11 +1123,12 @@ mod tests {
         let event_id = result.message.id;
 
         // Verify status is Sending
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let msg = AggregatedMessage::find_by_id(
             &event_id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1207,12 +1225,13 @@ mod tests {
 
         // Manually mark the message as Failed (simulating exhausted retries).
         // Done after the sleep so background publish_with_retries doesn't overwrite it.
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         AggregatedMessage::update_delivery_status(
             &original_event_id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
             &DeliveryStatus::Failed("simulated failure".to_string()),
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1222,7 +1241,7 @@ mod tests {
             &original_event_id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1254,7 +1273,7 @@ mod tests {
             &original_event_id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1272,7 +1291,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1343,11 +1362,12 @@ mod tests {
         let event_id = result.message.id.to_string();
 
         // Verify initial status is Sending
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let msg = AggregatedMessage::find_by_id(
             &event_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1387,7 +1407,7 @@ mod tests {
                 &unreachable_relays,
                 &event_id,
                 &group.mls_group_id,
-                &whitenoise.shared.database,
+                &session.account_db.inner,
                 &whitenoise.shared.message_stream_manager,
             )
             .await;
@@ -1397,7 +1417,7 @@ mod tests {
             &event_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1413,12 +1433,13 @@ mod tests {
     #[tokio::test]
     async fn test_cache_needs_sync_empty_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
 
         let group_id = GroupId::from_slice(&[42u8; 32]);
         let empty_messages: Vec<Message> = vec![];
 
         let needs_sync = whitenoise
-            .cache_needs_sync(&group_id, &empty_messages)
+            .cache_needs_sync(&account.pubkey, &group_id, &empty_messages)
             .await
             .unwrap();
         assert!(!needs_sync, "Empty MDK messages should not need sync");
@@ -1460,7 +1481,7 @@ mod tests {
 
         // Cache is in sync — should return false
         let needs_sync = whitenoise
-            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
+            .cache_needs_sync(&creator.pubkey, &group.mls_group_id, &mdk_messages)
             .await
             .unwrap();
         assert!(
@@ -1469,13 +1490,14 @@ mod tests {
         );
 
         // Delete the cache to simulate stale state
-        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.shared.database)
+        let creator_session = whitenoise.session(&creator.pubkey).unwrap();
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &creator_session.account_db.inner)
             .await
             .unwrap();
 
         // Now cache count (0) != MDK count (3) — should return true
         let needs_sync = whitenoise
-            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
+            .cache_needs_sync(&creator.pubkey, &group.mls_group_id, &mdk_messages)
             .await
             .unwrap();
         assert!(needs_sync, "Cache should need sync after deletion");
@@ -1521,11 +1543,12 @@ mod tests {
         assert!(!mdk_messages.is_empty());
 
         // Clear the cache entirely
-        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.shared.database)
+        let session = whitenoise.session(&creator.pubkey).unwrap();
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &session.account_db.inner)
             .await
             .unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 0, "Cache should be empty after deletion");
@@ -1541,7 +1564,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1574,10 +1597,10 @@ mod tests {
             .await
             .unwrap();
 
-        let cached_count =
-            AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let session = whitenoise.session(&creator.pubkey).unwrap();
+        let cached_count = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
+            .await
+            .unwrap();
         assert_eq!(cached_count, 0);
     }
 
@@ -1616,18 +1639,19 @@ mod tests {
         }
 
         // Verify proactive cache has 4 messages
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 4);
 
         // Clear the cache to simulate a stale/corrupt state
-        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.shared.database)
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &session.account_db.inner)
             .await
             .unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 0, "Cache should be empty");
@@ -1640,7 +1664,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1709,11 +1733,12 @@ mod tests {
         );
 
         // find_by_id should return the message but with is_deleted=true
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let target = AggregatedMessage::find_by_id(
             &target_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1725,7 +1750,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1741,7 +1766,7 @@ mod tests {
             &del_event_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1793,11 +1818,12 @@ mod tests {
             .unwrap();
 
         // Verify reaction was applied to parent
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let parent = AggregatedMessage::find_by_id(
             &target_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1819,7 +1845,7 @@ mod tests {
             &creator.pubkey,
             "+",
             &group.mls_group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;
@@ -1829,7 +1855,7 @@ mod tests {
             &target_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1886,11 +1912,12 @@ mod tests {
             .unwrap();
 
         // Verify message is marked as deleted
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1909,7 +1936,7 @@ mod tests {
             &creator.pubkey,
             "",
             &group.mls_group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;
@@ -1919,7 +1946,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -2017,6 +2044,7 @@ mod tests {
         let del_event_id = del_result.message.id.to_string();
         let tags = Tags::from_list(vec![Tag::parse(vec!["e", &reaction_id]).unwrap()]);
         let stream_manager = MessageStreamManager::new();
+        let session = whitenoise.session(&creator.pubkey).unwrap();
 
         cascade_delivery_failure(
             5,
@@ -2025,7 +2053,7 @@ mod tests {
             &creator.pubkey,
             "",
             &group.mls_group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;
@@ -2047,6 +2075,8 @@ mod tests {
     async fn test_cascade_kind9_is_noop() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[199; 32]);
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         let author = Keys::generate().public_key();
         let stream_manager = MessageStreamManager::new();
 
@@ -2058,7 +2088,7 @@ mod tests {
             &author,
             "",
             &group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;
@@ -2104,6 +2134,8 @@ mod tests {
     async fn test_cascade_reaction_failure_parent_not_found() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[200; 32]);
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         let author = Keys::generate().public_key();
         let stream_manager = MessageStreamManager::new();
 
@@ -2119,7 +2151,7 @@ mod tests {
             &author,
             "+",
             &group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;
@@ -2131,6 +2163,8 @@ mod tests {
     async fn test_cascade_reaction_failure_missing_etag() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[201; 32]);
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         let author = Keys::generate().public_key();
         let stream_manager = MessageStreamManager::new();
 
@@ -2142,7 +2176,7 @@ mod tests {
             &author,
             "+",
             &group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;
@@ -2208,11 +2242,12 @@ mod tests {
         assert!(del_result.is_ok(), "Deletion should succeed");
 
         // The second message should be marked deleted
+        let session = whitenoise.session(&creator.pubkey).unwrap();
         let msg = AggregatedMessage::find_by_id(
             &last_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap()
@@ -2225,13 +2260,15 @@ mod tests {
     async fn test_cascade_reaction_failure_handles_db_error() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[202; 32]);
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         let author = Keys::generate().public_key();
         let target_id = format!("{:0>64x}", 0xabc123u64);
         let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
         let stream_manager = MessageStreamManager::new();
 
         // Close the pool to force DB errors on find_by_id
-        whitenoise.shared.database.pool.close().await;
+        session.account_db.inner.pool.close().await;
 
         cascade_delivery_failure(
             7,
@@ -2240,7 +2277,7 @@ mod tests {
             &author,
             "+",
             &group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;
@@ -2253,12 +2290,14 @@ mod tests {
     async fn test_cascade_deletion_failure_handles_db_error() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[203; 32]);
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         let target_id = format!("{:0>64x}", 0xdef456u64);
         let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
         let stream_manager = MessageStreamManager::new();
 
         // Close the pool to force DB errors on unmark_deleted
-        whitenoise.shared.database.pool.close().await;
+        session.account_db.inner.pool.close().await;
 
         cascade_delivery_failure(
             5,
@@ -2267,7 +2306,7 @@ mod tests {
             &Keys::generate().public_key(),
             "",
             &group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
             &stream_manager,
         )
         .await;

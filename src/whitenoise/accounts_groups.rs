@@ -651,6 +651,16 @@ impl Whitenoise {
         // 4. Delete per-account accounts_groups row
         AccountGroup::delete_for_group(group_id, &session.account_db.inner.pool).await?;
 
+        // Delete per-account aggregated_messages for this group. Order doesn't
+        // matter relative to the steps below: there's no FK between
+        // accounts_groups and aggregated_messages, and message_delivery_status
+        // cascades via the intra-DB FK on aggregated_messages.
+        crate::whitenoise::aggregated_message::AggregatedMessage::delete_by_group(
+            group_id,
+            &session.account_db.inner,
+        )
+        .await?;
+
         // 4a. Check if any other account still has this group.
         // We can only inspect active sessions, not every persisted account.
         // If inactive accounts exist, conservatively keep shared data — the
@@ -1307,12 +1317,13 @@ mod tests {
         let older_msg_id = EventId::from_hex(&format!("{:0>64}", "aaa")).unwrap();
         let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "bbb")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             older_msg_id,
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1322,7 +1333,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1369,12 +1380,13 @@ mod tests {
         let older_msg_id = EventId::from_hex(&format!("{:0>64}", "ccc")).unwrap();
         let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "ddd")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             older_msg_id,
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1384,7 +1396,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1430,12 +1442,13 @@ mod tests {
         let first_msg_id = EventId::from_hex(&format!("{:0>64}", "eee")).unwrap();
         let second_msg_id = EventId::from_hex(&format!("{:0>64}", "fff")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             first_msg_id,
             group_id.clone(),
             account.pubkey,
             same_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1445,7 +1458,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             same_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -2550,12 +2563,13 @@ mod tests {
 
         // Create a message and mark it as read
         let msg_id = EventId::from_hex(&format!("{:0>64}", "aab")).unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             msg_id,
             group_id.clone(),
             account.pubkey,
             Utc::now(),
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -2588,6 +2602,58 @@ mod tests {
         assert!(
             ag.last_read_message_id.is_none(),
             "last_read_message_id must be None after clear_chat"
+        );
+    }
+
+    /// Regression: post-phase-18e, `clear_chat` must drop this account's old
+    /// `aggregated_messages` rows immediately. The pre-18e logic gated cleanup
+    /// on a min-across-accounts `chat_cleared_at`, which after the per-account
+    /// split silently turned the cleanup into a no-op whenever any other
+    /// account in the group hadn't cleared its (totally separate) DB.
+    #[tokio::test]
+    async fn test_clear_chat_deletes_per_account_aggregated_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[145; 32]);
+        let session = whitenoise.session(&account.pubkey).unwrap();
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Seed two old messages directly in this account's per-account DB.
+        let old = Utc::now() - chrono::Duration::seconds(10);
+        for tag in &["e1", "e2"] {
+            let id = EventId::from_hex(&format!("{:0>64}", tag)).unwrap();
+            AggregatedMessage::create_for_test(
+                id,
+                group_id.clone(),
+                account.pubkey,
+                old,
+                &session.account_db.inner,
+            )
+            .await
+            .unwrap();
+        }
+        let before = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
+            .await
+            .unwrap();
+        assert_eq!(before, 2);
+
+        session
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
+            .unwrap();
+
+        let after = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "clear_chat must drop this account's seeded messages even when no other account has cleared"
         );
     }
 

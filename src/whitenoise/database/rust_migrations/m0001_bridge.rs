@@ -331,17 +331,19 @@ mod tests {
             );
         }
 
-        // Verify m0011 actually ran (message_delivery_status has account_pubkey).
-        let has_account_pubkey: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_table_info('message_delivery_status') \
-             WHERE name = 'account_pubkey'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            has_account_pubkey, 1,
-            "m0011 should have added account_pubkey to message_delivery_status"
+        // Verify m0011 actually executed (i.e. wasn't auto-stamped). Checking
+        // the table schema would be misleading: phase 18e (m0040/m0041) drops
+        // shared message_delivery_status entirely. Inspect the tracking row
+        // directly instead — its description distinguishes a real run from an
+        // auto-stamp marker.
+        let (m0011_desc,): (String,) =
+            sqlx::query_as("SELECT description FROM _rust_migrations WHERE version = 11")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !m0011_desc.contains("Auto-stamped"),
+            "m0011 should have executed, not been auto-stamped; got: {m0011_desc}"
         );
     }
 
