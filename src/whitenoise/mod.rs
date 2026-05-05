@@ -154,6 +154,10 @@ pub struct WhitenoiseConfig {
 }
 
 impl WhitenoiseConfig {
+    fn normalize_keyring_service_id(&mut self) {
+        self.keyring_service_id = self.keyring_service_id.trim().to_string();
+    }
+
     pub fn new(data_dir: &Path, logs_dir: &Path, keyring_service_id: &str) -> Self {
         let env_suffix = if cfg!(debug_assertions) {
             "dev"
@@ -214,6 +218,7 @@ impl WhitenoiseConfig {
 
 pub struct Whitenoise {
     pub config: WhitenoiseConfig,
+    keyring_service_id: String,
     database: Arc<Database>,
     event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
     content_parser: crate::nostr_manager::parser::ContentParser,
@@ -286,6 +291,7 @@ impl std::fmt::Debug for Whitenoise {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Whitenoise")
             .field("config", &self.config)
+            .field("keyring_service_id", &self.keyring_service_id)
             .field("database", &"<REDACTED>")
             .field("event_tracker", &"<REDACTED>")
             .field("content_parser", &"<REDACTED>")
@@ -313,10 +319,12 @@ impl std::fmt::Debug for Whitenoise {
 
 impl Whitenoise {
     fn from_components(
-        config: WhitenoiseConfig,
+        mut config: WhitenoiseConfig,
         database: Arc<Database>,
         components: WhitenoiseComponents,
     ) -> Self {
+        config.normalize_keyring_service_id();
+        let keyring_service_id = config.keyring_service_id.clone();
         let mut session_salt = [0u8; 16];
         ::rand::rng().fill_bytes(&mut session_salt);
         let relay_control = Arc::new(RelayControlPlane::new(
@@ -328,6 +336,7 @@ impl Whitenoise {
 
         Self {
             config,
+            keyring_service_id,
             database,
             event_tracker: components.event_tracker,
             content_parser: crate::nostr_manager::parser::ContentParser::new(),
@@ -634,11 +643,7 @@ impl Whitenoise {
         &self,
         pubkey: PublicKey,
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
-        Account::create_mdk(
-            pubkey,
-            &self.config.data_dir,
-            &self.config.keyring_service_id,
-        )
+        Account::create_mdk(pubkey, &self.config.data_dir, self.keyring_service_id())
     }
 
     /// Initializes the Whitenoise application with the provided configuration.
@@ -651,16 +656,17 @@ impl Whitenoise {
     ///
     /// * `config` - A [`WhitenoiseConfig`] struct specifying the data and log directories.
     #[perf_instrument("whitenoise")]
-    pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
+    pub async fn initialize_whitenoise(mut config: WhitenoiseConfig) -> Result<()> {
         init_timing::start();
 
         // Validate keyring_service_id is not empty or whitespace
-        let keyring_service_id = config.keyring_service_id.trim().to_string();
-        if keyring_service_id.is_empty() {
+        config.normalize_keyring_service_id();
+        if config.keyring_service_id.is_empty() {
             return Err(WhitenoiseError::Configuration(
                 "keyring_service_id cannot be empty or whitespace".to_string(),
             ));
         }
+        let keyring_service_id = config.keyring_service_id.clone();
 
         // Ensure keyring-core has a credential store before any MDK or
         // SecretsStore operations attempt to create or read keyring entries.
@@ -961,8 +967,7 @@ impl Whitenoise {
         let accounts = Account::all(&self.database).await?;
         let database_key_id = self.database_key_id().to_string();
         let close_result = self.database.close_and_delete_files().await;
-        let key_delete_result =
-            keyring::delete_db_key(&self.config.keyring_service_id, &database_key_id);
+        let key_delete_result = keyring::delete_db_key(self.keyring_service_id(), &database_key_id);
 
         match (close_result, key_delete_result) {
             (Ok(()), Ok(())) => {}
@@ -1128,8 +1133,12 @@ impl Whitenoise {
 
     fn delete_mdk_database_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
         let db_key_id = Account::mdk_db_key_id(pubkey);
-        keyring::delete_db_key(&self.config.keyring_service_id, &db_key_id)?;
+        keyring::delete_db_key(self.keyring_service_id(), &db_key_id)?;
         Ok(())
+    }
+
+    pub(crate) fn keyring_service_id(&self) -> &str {
+        &self.keyring_service_id
     }
 
     fn database_key_id(&self) -> &str {
@@ -2149,6 +2158,26 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "App wipe should attempt key deletion even when database file deletion fails"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_all_data_uses_normalized_keyring_service_id_for_key_delete() {
+            let (mut whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let keyring_service_id = whitenoise.keyring_service_id().to_string();
+            let database_key_id = whitenoise.database_key_id().to_string();
+
+            whitenoise.config.keyring_service_id = format!("  {keyring_service_id}  ");
+            keyring::get_or_create_db_key(&keyring_service_id, &database_key_id)
+                .expect("Failed to create app database key");
+
+            whitenoise.delete_all_data().await.unwrap();
+
+            assert!(
+                keyring::get_db_key(&keyring_service_id, &database_key_id)
+                    .unwrap()
+                    .is_none(),
+                "App wipe should use the normalized keyring service id for key deletion"
             );
         }
 

@@ -842,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_logout_removes_mdk_storage_and_key() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (mut whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = create_test_account(&whitenoise).await;
         account.save(&whitenoise.database).await.unwrap();
         whitenoise.secrets_store.store_private_key(&keys).unwrap();
@@ -854,15 +854,17 @@ mod tests {
             .await
             .unwrap();
 
+        let keyring_service_id = whitenoise.keyring_service_id().to_string();
+        whitenoise.config.keyring_service_id = format!("  {keyring_service_id}  ");
         let db_key_id = Account::mdk_db_key_id(&account.pubkey);
-        keyring::get_or_create_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
+        keyring::get_or_create_db_key(&keyring_service_id, &db_key_id)
             .expect("Failed to create MDK database key");
 
         whitenoise.logout(&account.pubkey).await.unwrap();
 
         assert!(!mls_storage_dir.exists());
         assert!(
-            keyring::get_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
+            keyring::get_db_key(&keyring_service_id, &db_key_id)
                 .unwrap()
                 .is_none(),
             "Account logout should remove the account-scoped MDK database key"

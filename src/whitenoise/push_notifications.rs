@@ -170,6 +170,7 @@ const PUSH_GROUP_MESSAGE_KINDS: [u16; 3] = [
 #[derive(Clone)]
 struct PendingTokenResponseContext {
     config: WhitenoiseConfig,
+    keyring_service_id: String,
     database: Arc<Database>,
     pending_push_token_responses: Arc<dashmap::DashMap<(PublicKey, GroupId, EventId), ()>>,
     relay_control: Arc<RelayControlPlane>,
@@ -215,7 +216,7 @@ impl PendingTokenResponseContext {
         let mdk = Account::create_mdk(
             account.pubkey,
             &self.config.data_dir,
-            &self.config.keyring_service_id,
+            &self.keyring_service_id,
         )?;
         respond_to_token_request_with(
             &mdk,
@@ -1021,6 +1022,7 @@ impl Whitenoise {
 
         let context = PendingTokenResponseContext {
             config: self.config.clone(),
+            keyring_service_id: self.keyring_service_id().to_string(),
             database: Arc::clone(&self.database),
             pending_push_token_responses: Arc::clone(&self.pending_push_token_responses),
             relay_control: Arc::clone(&self.relay_control),
