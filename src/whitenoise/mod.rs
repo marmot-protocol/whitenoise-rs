@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1026,7 +1027,7 @@ impl Whitenoise {
                     target: "whitenoise::accounts",
                     account_pubkey = %pubkey,
                     path = ?mls_storage_path,
-                    "Unable to remove MDK storage because a path component is not a directory"
+                    reason = "path component is not a directory",
                 );
             }
             Err(e) => return Err(e.into()),
@@ -1043,14 +1044,24 @@ impl Whitenoise {
     }
 
     fn delete_mdk_database_keys_for_pubkeys(&self, pubkeys: &[PublicKey]) -> Result<()> {
+        Self::delete_mdk_database_keys(pubkeys, |pubkey| {
+            self.delete_mdk_database_key_for_pubkey(pubkey)
+        })
+    }
+
+    fn delete_mdk_database_keys<F>(pubkeys: &[PublicKey], mut delete: F) -> Result<()>
+    where
+        F: FnMut(&PublicKey) -> Result<()>,
+    {
         let mut first_error = None;
 
         for pubkey in pubkeys {
-            if let Err(e) = self.delete_mdk_database_key_for_pubkey(pubkey) {
+            if let Err(e) = delete(pubkey) {
                 tracing::warn!(
                     target: "whitenoise::delete_all_data",
                     account_pubkey = %pubkey,
-                    "Failed to delete MDK database key: {e}"
+                    error = %e,
+                    reason = "failed to delete MDK database key",
                 );
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1062,6 +1073,28 @@ impl Whitenoise {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    fn mdk_storage_pubkey_from_entry_name(file_name: &OsStr, path: &Path) -> Option<PublicKey> {
+        let Some(file_name) = file_name.to_str() else {
+            tracing::warn!(
+                target: "whitenoise::delete_all_data",
+                path = ?path,
+                reason = "non-UTF-8 MLS storage filename",
+            );
+            return None;
+        };
+
+        let Ok(pubkey) = file_name.parse::<PublicKey>() else {
+            tracing::debug!(
+                target: "whitenoise::delete_all_data",
+                path = ?path,
+                reason = "non-account MLS storage entry",
+            );
+            return None;
+        };
+
+        Some(pubkey)
     }
 
     async fn collect_orphaned_mdk_storage_pubkeys(
@@ -1078,21 +1111,8 @@ impl Whitenoise {
 
         while let Some(entry) = entries.next_entry().await? {
             let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                tracing::warn!(
-                    target: "whitenoise::delete_all_data",
-                    path = ?entry.path(),
-                    "Skipping MLS storage entry with non-UTF-8 filename"
-                );
-                continue;
-            };
-
-            let Ok(pubkey) = file_name.parse::<PublicKey>() else {
-                tracing::debug!(
-                    target: "whitenoise::delete_all_data",
-                    path = ?entry.path(),
-                    "Skipping non-account MLS storage entry while collecting MDK database keys"
-                );
+            let Some(pubkey) = Self::mdk_storage_pubkey_from_entry_name(&file_name, &entry.path())
+            else {
                 continue;
             };
 
@@ -1710,6 +1730,12 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use keyring_core::api::CredentialStoreApi;
@@ -2177,10 +2203,146 @@ mod tests {
             assert!(
                 keyring::get_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
                     .unwrap()
-                    .is_none(),
-                "App wipe should remove orphaned MDK database keys discovered from storage dirs"
+                    .is_none()
             );
             assert!(!orphan_storage_dir.exists());
+        }
+
+        #[tokio::test]
+        async fn test_collect_orphaned_mdk_storage_pubkeys_handles_missing_and_invalid_entries() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let account_pubkey = create_test_keys().public_key();
+            let orphan_pubkey = create_test_keys().public_key();
+            let mls_dir = whitenoise.config.data_dir.join("scan_mls");
+            let missing_dir = whitenoise.config.data_dir.join("missing_mls");
+            let not_a_dir = whitenoise.config.data_dir.join("mls-file");
+            let accounts = vec![
+                Account::new_external(&whitenoise, account_pubkey)
+                    .await
+                    .unwrap(),
+            ];
+
+            let missing = whitenoise
+                .collect_orphaned_mdk_storage_pubkeys(&accounts, &missing_dir)
+                .await
+                .unwrap();
+            assert!(missing.is_empty());
+
+            tokio::fs::write(&not_a_dir, "not a directory")
+                .await
+                .unwrap();
+            assert!(
+                whitenoise
+                    .collect_orphaned_mdk_storage_pubkeys(&accounts, &not_a_dir)
+                    .await
+                    .is_err()
+            );
+
+            tokio::fs::create_dir_all(mls_dir.join(account_pubkey.to_string()))
+                .await
+                .unwrap();
+            tokio::fs::create_dir_all(mls_dir.join(orphan_pubkey.to_string()))
+                .await
+                .unwrap();
+            tokio::fs::write(mls_dir.join("not-a-pubkey"), "ignored")
+                .await
+                .unwrap();
+
+            let found = whitenoise
+                .collect_orphaned_mdk_storage_pubkeys(&accounts, &mls_dir)
+                .await
+                .unwrap();
+
+            assert_eq!(found, vec![orphan_pubkey]);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_mdk_storage_pubkey_from_entry_name_skips_non_utf8_and_invalid_names() {
+            let orphan_pubkey = create_test_keys().public_key();
+            let non_utf8_name = OsString::from_vec(vec![0xff, b'm', b'd', b'k']);
+
+            assert_eq!(
+                Whitenoise::mdk_storage_pubkey_from_entry_name(
+                    non_utf8_name.as_os_str(),
+                    Path::new("non-utf8")
+                ),
+                None
+            );
+            assert_eq!(
+                Whitenoise::mdk_storage_pubkey_from_entry_name(
+                    OsStr::new("not-a-pubkey"),
+                    Path::new("invalid")
+                ),
+                None
+            );
+            assert_eq!(
+                Whitenoise::mdk_storage_pubkey_from_entry_name(
+                    OsStr::new(&orphan_pubkey.to_string()),
+                    Path::new("valid")
+                ),
+                Some(orphan_pubkey)
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_mdk_storage_for_account_treats_not_a_directory_as_cleanup_complete() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = create_test_keys().public_key();
+            let mls_dir = whitenoise.config.data_dir.join("mls");
+            let db_key_id = Account::mdk_db_key_id(&pubkey);
+
+            let _ = tokio::fs::remove_dir_all(&mls_dir).await;
+            tokio::fs::write(&mls_dir, "not a directory").await.unwrap();
+            keyring::get_or_create_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
+                .expect("Failed to create MDK database key");
+
+            whitenoise
+                .delete_mdk_storage_for_account(&pubkey)
+                .await
+                .unwrap();
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_delete_mdk_storage_for_account_propagates_unexpected_metadata_errors() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = create_test_keys().public_key();
+            let mls_dir = whitenoise.config.data_dir.join("mls");
+
+            tokio::fs::create_dir_all(&mls_dir).await.unwrap();
+            std::fs::set_permissions(&mls_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let result = whitenoise.delete_mdk_storage_for_account(&pubkey).await;
+
+            std::fs::set_permissions(&mls_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_delete_mdk_database_keys_continues_after_delete_error() {
+            let first_pubkey = create_test_keys().public_key();
+            let second_pubkey = create_test_keys().public_key();
+            let pubkeys = vec![first_pubkey, second_pubkey];
+            let mut attempted_pubkeys = Vec::new();
+
+            let result = Whitenoise::delete_mdk_database_keys(&pubkeys, |pubkey| {
+                attempted_pubkeys.push(*pubkey);
+                if *pubkey == first_pubkey {
+                    return Err(WhitenoiseError::Internal("delete failed".to_string()));
+                }
+
+                Ok(())
+            });
+
+            assert!(result.is_err());
+            assert_eq!(attempted_pubkeys, pubkeys);
         }
     }
 
