@@ -1988,6 +1988,17 @@ mod tests {
             );
         }
 
+        #[test]
+        fn test_keyring_service_id_normalization_trims_whitespace() {
+            let data_dir = std::path::Path::new("/test/data");
+            let logs_dir = std::path::Path::new("/test/logs");
+            let mut config = WhitenoiseConfig::new(data_dir, logs_dir, "  com.test.app  ");
+
+            config.normalize_keyring_service_id();
+
+            assert_eq!(config.keyring_service_id, "com.test.app");
+        }
+
         #[tokio::test]
         async fn test_initialize_whitenoise_rejects_empty_keyring_service_id() {
             use tempfile::TempDir;
