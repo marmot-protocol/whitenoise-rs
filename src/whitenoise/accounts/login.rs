@@ -847,17 +847,14 @@ mod tests {
         account.save(&whitenoise.database).await.unwrap();
         whitenoise.secrets_store.store_private_key(&keys).unwrap();
 
-        let mls_storage_dir = whitenoise
-            .config
-            .data_dir
-            .join("mls")
-            .join(account.pubkey.to_hex());
+        let mls_storage_dir =
+            Account::mdk_storage_path(&account.pubkey, &whitenoise.config.data_dir);
         tokio::fs::create_dir_all(&mls_storage_dir).await.unwrap();
         tokio::fs::write(mls_storage_dir.join("storage.sqlite"), b"test")
             .await
             .unwrap();
 
-        let db_key_id = format!("mdk.db.key.{}", account.pubkey.to_hex());
+        let db_key_id = Account::mdk_db_key_id(&account.pubkey);
         keyring::get_or_create_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
             .expect("Failed to create MDK database key");
 

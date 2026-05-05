@@ -70,6 +70,8 @@ pub(super) fn delete_database_files(db_path: &Path) -> Result<(), DatabaseError>
     remove_sqlite_sidecars(db_path)?;
     remove_file_if_exists(&sidecar_path(db_path, ".encrypted.tmp"))?;
     remove_file_if_exists(&sidecar_path(db_path, ".plaintext.backup"))?;
+    // Usually removed by MigrationLock::drop; delete it here too so a full
+    // wipe clears crashed-migration residue.
     remove_file_if_exists(&sidecar_path(db_path, ".encryption.lock"))?;
     Ok(())
 }
@@ -325,11 +327,19 @@ fn create_fresh_key(
     keyring_service_id: &str,
     key_id: &str,
 ) -> Result<EncryptionConfig, DatabaseError> {
+    // This only protects the Whitenoise app database key lifecycle. Test and
+    // benchmark builds may override the key id for isolation, but those calls
+    // are still app database opens rather than a general key rotation API.
     let lock = APP_DB_KEY_ROTATION_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().map_err(|e| {
         DatabaseError::EncryptionKey(format!("Failed to acquire app DB key rotation lock: {e}"))
     })?;
 
+    tracing::debug!(
+        target: "whitenoise::database",
+        key_id,
+        "Rotating stale database keyring entry before fresh database setup"
+    );
     keyring::delete_db_key(keyring_service_id, key_id)
         .map_err(|e| DatabaseError::EncryptionKey(e.to_string()))?;
     keyring::get_or_create_db_key(keyring_service_id, key_id)

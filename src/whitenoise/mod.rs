@@ -996,7 +996,7 @@ impl Whitenoise {
     }
 
     async fn delete_mdk_storage_for_account(&self, pubkey: &PublicKey) -> Result<()> {
-        let mls_storage_path = self.config.data_dir.join("mls").join(pubkey.to_hex());
+        let mls_storage_path = Account::mdk_storage_path(pubkey, &self.config.data_dir);
         match tokio::fs::metadata(&mls_storage_path).await {
             Ok(metadata) if metadata.is_dir() => {
                 tokio::fs::remove_dir_all(mls_storage_path).await?;
@@ -1004,27 +1004,52 @@ impl Whitenoise {
             Ok(_) => {
                 tokio::fs::remove_file(mls_storage_path).await?;
             }
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if e.kind() == ErrorKind::NotADirectory => {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    account_pubkey = %pubkey,
+                    path = ?mls_storage_path,
+                    "Unable to remove MDK storage because a path component is not a directory"
+                );
+            }
             Err(e) => return Err(e.into()),
         }
         self.delete_mdk_database_key_for_pubkey(pubkey)
     }
 
     fn delete_mdk_database_keys_for_accounts(&self, accounts: &[Account]) -> Result<()> {
+        let mut first_error = None;
+
         for account in accounts {
-            self.delete_mdk_database_key_for_pubkey(&account.pubkey)?;
+            if let Err(e) = self.delete_mdk_database_key_for_pubkey(&account.pubkey) {
+                tracing::warn!(
+                    target: "whitenoise::delete_all_data",
+                    account_pubkey = %account.pubkey,
+                    "Failed to delete MDK database key: {e}"
+                );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
         }
 
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn delete_mdk_database_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
-        let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
+        let db_key_id = Account::mdk_db_key_id(pubkey);
         keyring::delete_db_key(&self.config.keyring_service_id, &db_key_id)?;
         Ok(())
     }
 
     fn database_key_id(&self) -> &str {
+        // The database_key_id override field only exists in test,
+        // integration-test, and benchmark builds; production always uses the
+        // stable app database key id.
         #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
         {
             self.config
@@ -1091,6 +1116,10 @@ impl Whitenoise {
     #[cfg(feature = "integration-tests")]
     #[perf_instrument("whitenoise")]
     pub async fn wipe_database(&self) -> Result<()> {
+        // Integration scenarios use this row-level reset while keeping the
+        // same Whitenoise instance, pool, and database key alive. Full app
+        // wipes must use delete_all_data so database files and keyring entries
+        // are removed together.
         self.database.delete_all_data().await?;
         Ok(())
     }
@@ -2011,7 +2040,7 @@ mod tests {
             let (account, _keys) = create_test_account(&whitenoise).await;
             account.save(&whitenoise.database).await.unwrap();
 
-            let db_key_id = format!("mdk.db.key.{}", account.pubkey.to_hex());
+            let db_key_id = Account::mdk_db_key_id(&account.pubkey);
             keyring::get_or_create_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
                 .expect("Failed to create MDK database key");
 
