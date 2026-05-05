@@ -55,7 +55,10 @@ pub use whitenoise::app_settings::{AppSettings, Language, ThemeMode};
 // Groups and relays
 pub use whitenoise::accounts_groups::{AccountGroup, MuteDuration};
 pub use whitenoise::group_information::{GroupInformation, GroupType};
-pub use whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership, RequiredProposal};
+pub use whitenoise::groups::{
+    GroupCapabilityUpgradeStatus, GroupWithInfoAndMembership, GroupWithMembership,
+    RequiredProposal, RequiredProposalUpgradability, RequiredProposalUpgradeStatus,
+};
 pub use whitenoise::relays::{Relay, RelayType};
 
 // Drafts

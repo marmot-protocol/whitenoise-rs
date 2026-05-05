@@ -52,7 +52,8 @@ impl SecretsStore {
     /// * The Entry creation fails
     /// * Setting the password in the keyring fails
     pub fn store_private_key(&self, keys: &Keys) -> Result<(), SecretsStoreError> {
-        let entry = Entry::new(&self.service_name, keys.public_key().to_hex().as_str())
+        let entry = self
+            .entry_for_user(keys.public_key().to_hex().as_str())
             .map_err(map_keyring_error)?;
         entry
             .set_password(keys.secret_key().to_secret_hex().as_str())
@@ -84,8 +85,9 @@ impl SecretsStore {
     /// * Parsing the private key into a `Keys` object fails
     pub fn get_nostr_keys_for_pubkey(&self, pubkey: &PublicKey) -> Result<Keys, SecretsStoreError> {
         let hex_pubkey = pubkey.to_hex();
-        let entry =
-            Entry::new(&self.service_name, hex_pubkey.as_str()).map_err(map_keyring_error)?;
+        let entry = self
+            .entry_for_user(hex_pubkey.as_str())
+            .map_err(map_keyring_error)?;
 
         match entry.get_password() {
             Ok(private_key) => Keys::parse(&private_key).map_err(SecretsStoreError::KeyError),
@@ -118,8 +120,9 @@ impl SecretsStore {
         pubkey: &PublicKey,
     ) -> Result<(), SecretsStoreError> {
         let hex_pubkey = pubkey.to_hex();
-        let entry =
-            Entry::new(&self.service_name, hex_pubkey.as_str()).map_err(map_keyring_error)?;
+        let entry = self
+            .entry_for_user(hex_pubkey.as_str())
+            .map_err(map_keyring_error)?;
 
         match entry.delete_credential() {
             Ok(()) => Ok(()),
@@ -127,6 +130,14 @@ impl SecretsStore {
             Err(e) => Err(map_keyring_error(e)),
         }
     }
+
+    fn entry_for_user(&self, user: &str) -> keyring_core::Result<Entry> {
+        keyring_entry_for_user(&self.service_name, user)
+    }
+}
+
+fn keyring_entry_for_user(service: &str, user: &str) -> keyring_core::Result<Entry> {
+    Entry::new(service, user)
 }
 
 /// Maps a `keyring_core::Error` to a `SecretsStoreError`, distinguishing
@@ -144,19 +155,32 @@ fn map_keyring_error(e: KeyringError) -> SecretsStoreError {
 /// Produces a user-friendly message for `NoStorageAccess` errors, with
 /// platform-specific remediation hints.
 fn format_storage_access_error(inner: &dyn std::error::Error) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
     {
         format!(
-            "Platform keyring is not available. On Linux, White Noise uses the kernel \
-             keyutils subsystem (keyctl) to store secret keys. This error typically \
-             occurs on headless systems, in SSH sessions, or in containers where no \
-             session keyring is active. Try running `keyctl session` before starting \
-             the daemon, or ensure your init system provides a session keyring. \
+            "Platform keyring is not available. On Linux and supported BSD targets, \
+             White Noise uses the D-Bus Secret Service to store secret keys. This \
+             error typically occurs on headless systems, in SSH sessions, in \
+             containers, or when no Secret Service implementation such as GNOME \
+             Keyring or KWallet is running and unlocked. Start and unlock a Secret \
+             Service provider before starting White Noise. \
              (Original error: {inner})"
         )
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
     {
         format!(
             "Platform keyring is not available: {inner}. \
@@ -240,6 +264,50 @@ mod tests {
     }
 
     #[test]
+    fn test_get_private_key_maps_keyring_read_errors() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let entry = keyring_entry_for_user(
+            secrets_store.service_name.as_str(),
+            pubkey.to_hex().as_str(),
+        )
+        .unwrap();
+        entry.set_secret(&[0xff]).unwrap();
+
+        let result = secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+
+        assert!(matches!(result, Err(SecretsStoreError::KeyringError(_))));
+    }
+
+    #[test]
+    fn test_remove_private_key_maps_keyring_delete_errors() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let entry = keyring_entry_for_user(
+            secrets_store.service_name.as_str(),
+            pubkey.to_hex().as_str(),
+        )
+        .unwrap();
+        entry
+            .set_password(keys.secret_key().to_secret_hex().as_str())
+            .unwrap();
+        let mock = entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap();
+        mock.set_error(KeyringError::Invalid(
+            "delete".to_string(),
+            "failed".to_string(),
+        ));
+
+        let result = secrets_store.remove_private_key_for_pubkey(&pubkey);
+
+        assert!(matches!(result, Err(SecretsStoreError::KeyringError(_))));
+    }
+
+    #[test]
     fn test_store_multiple_keys() {
         let secrets_store = create_test_secrets_store();
 
@@ -271,41 +339,23 @@ mod tests {
     #[test]
     fn test_map_keyring_error_no_default_store() {
         let err = map_keyring_error(KeyringError::NoDefaultStore);
-        assert!(
-            matches!(err, SecretsStoreError::KeyringNotInitialized(_)),
-            "Expected KeyringNotInitialized, got: {:?}",
-            err
-        );
+        assert!(matches!(err, SecretsStoreError::KeyringNotInitialized(_)));
     }
 
     #[test]
     fn test_map_keyring_error_no_storage_access() {
         let inner = std::io::Error::other("KeyRevoked");
         let err = map_keyring_error(KeyringError::NoStorageAccess(Box::new(inner)));
-        assert!(
-            matches!(err, SecretsStoreError::KeyringUnavailable(_)),
-            "Expected KeyringUnavailable, got: {:?}",
-            err
-        );
+        assert!(matches!(err, SecretsStoreError::KeyringUnavailable(_)));
         let msg = err.to_string();
-        assert!(
-            msg.contains("Platform keyring is not available"),
-            "Expected actionable guidance, got: {msg}"
-        );
-        assert!(
-            msg.contains("KeyRevoked"),
-            "Expected original error in message, got: {msg}"
-        );
+        assert!(msg.contains("Platform keyring is not available"));
+        assert!(msg.contains("KeyRevoked"));
     }
 
     #[test]
     fn test_map_keyring_error_other() {
         let err = map_keyring_error(KeyringError::NoEntry);
-        assert!(
-            matches!(err, SecretsStoreError::KeyringError(_)),
-            "Expected KeyringError, got: {:?}",
-            err
-        );
+        assert!(matches!(err, SecretsStoreError::KeyringError(_)));
     }
 
     #[test]

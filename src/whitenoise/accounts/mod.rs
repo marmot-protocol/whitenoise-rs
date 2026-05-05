@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+
+use std::sync::{Arc, LazyLock, Mutex};
 use thiserror::Error;
 
 use crate::RelayType;
@@ -28,6 +29,8 @@ use crate::whitenoise::shared::SharedServices;
 use crate::whitenoise::user_streaming::{UserUpdate, UserUpdateTrigger};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
+
+static MDK_STORAGE_INIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// The type of account authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -560,7 +563,12 @@ impl Account {
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
         let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
         let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
-        let storage = MdkSqliteStorage::new(mls_storage_dir, keyring_service_id, &db_key_id)?;
+        let storage = {
+            let _storage_init_guard = MDK_STORAGE_INIT_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            MdkSqliteStorage::new(mls_storage_dir, keyring_service_id, &db_key_id)?
+        };
         Ok(MDK::new(storage))
     }
 }
@@ -591,6 +599,8 @@ mod tests {
     use crate::whitenoise::user_streaming::UserUpdateTrigger;
     use nostr_sdk::prelude::*;
     use nostr_sdk::{Metadata, RelayUrl};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_effective_inbox_relays_returns_inbox_when_present() {
@@ -1257,6 +1267,36 @@ mod tests {
         let pubkey = nostr_sdk::Keys::generate().public_key();
         let result = Account::create_mdk(pubkey, temp_dir.path(), "com.whitenoise.test");
         assert!(result.is_ok(), "create_mdk failed: {:?}", result.err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_create_mdk_for_multiple_accounts_does_not_deadlock() {
+        crate::whitenoise::Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let data_dir = Arc::new(temp_dir.path().to_path_buf());
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let data_dir = Arc::clone(&data_dir);
+            let pubkey = nostr_sdk::Keys::generate().public_key();
+            handles.push(tokio::task::spawn_blocking(move || {
+                Account::create_mdk(pubkey, data_dir.as_path(), "com.whitenoise.test.concurrent")
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            }));
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "concurrent create_mdk calls timed out; possible deadlock"
+        );
     }
 
     #[test]

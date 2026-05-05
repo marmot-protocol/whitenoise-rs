@@ -191,6 +191,9 @@ impl PublishedKeyPackage {
     }
 
     /// Marks all rows sharing a key package hash as deleted.
+    ///
+    /// Dual-published kind:30443/kind:443 events point at the same local MLS
+    /// key material, so cleanup must update the whole hash group together.
     #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn mark_key_material_deleted_by_hash_ref(
         db: &AccountDatabase,
@@ -221,6 +224,35 @@ impl PublishedKeyPackage {
             .bind(id)
             .execute(&db.inner.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Backdates the `consumed_at` timestamp for a published key package group.
+    ///
+    /// Test-only helper that shifts `consumed_at` into the past so the
+    /// maintenance task considers it eligible for cleanup without waiting the
+    /// full quiet period.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn backdate_consumed_at(
+        db: &AccountDatabase,
+        event_id: &str,
+        age_secs: i64,
+    ) -> Result<(), DatabaseError> {
+        let Some(package) = Self::find_by_event_id(db, event_id).await? else {
+            return Err(DatabaseError::NotFound(format!(
+                "Published key package not found: {event_id}"
+            )));
+        };
+
+        sqlx::query(
+            "UPDATE published_key_packages SET consumed_at = unixepoch() - ?
+             WHERE key_package_hash_ref = ?",
+        )
+        .bind(age_secs)
+        .bind(&package.key_package_hash_ref)
+        .execute(&db.inner.pool)
+        .await?;
+
         Ok(())
     }
 }

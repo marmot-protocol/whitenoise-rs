@@ -22,7 +22,7 @@ use crate::{
         event_tracker::EventTracker,
         key_packages::{
             MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, REQUIRED_MLS_CIPHERSUITE_TAG,
-            is_key_package_kind, validate_marmot_key_package_tags,
+            is_key_package_kind, validate_marmot_key_package_baseline,
         },
         message_aggregator::DeliveryStatus,
         message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
@@ -822,7 +822,7 @@ impl EphemeralPlane {
     }
 
     fn is_key_package_event_semantically_valid(event: &Event) -> bool {
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok()
+        validate_marmot_key_package_baseline(event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok()
     }
 
     pub(crate) fn key_package_lookup_from_events(events: Events) -> KeyPackageLookup {
@@ -835,7 +835,7 @@ impl EphemeralPlane {
             .filter(|event| is_key_package_kind(event.kind))
             .filter(is_event_timestamp_valid)
         {
-            match validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG) {
+            match validate_marmot_key_package_baseline(&event, REQUIRED_MLS_CIPHERSUITE_TAG) {
                 Ok(()) if event.kind == MLS_KEY_PACKAGE_KIND => valid_current.push(event),
                 Ok(()) if event.kind == MLS_KEY_PACKAGE_KIND_LEGACY => valid_legacy.push(event),
                 Ok(()) => {}
@@ -1574,6 +1574,13 @@ mod tests {
 
     #[test]
     fn test_key_package_lookup_ignores_newer_invalid_current() {
+        // A newer KP that genuinely fails the baseline validator (here:
+        // missing the `encoding=base64` tag) must not shadow an older valid
+        // current-kind KP. Note that under the consumer-side baseline a KP
+        // merely missing the SelfRemove proposal advertisement is no longer
+        // "invalid" — it's a legacy KP and is `Found`. To exercise the
+        // newer-shadowing-by-invalid path we now use a hard-fail signal
+        // (missing encoding tag).
         let keys = Keys::generate();
         let now = Timestamp::now();
         let older = Timestamp::from(now.as_secs() - 60);
@@ -1585,7 +1592,13 @@ mod tests {
             true,
             &REQUIRED_MLS_PROPOSAL_TAGS,
         );
-        let newer_invalid = signed_key_package_event(&keys, MLS_KEY_PACKAGE_KIND, now, true, &[]);
+        let newer_invalid = signed_key_package_event(
+            &keys,
+            MLS_KEY_PACKAGE_KIND,
+            now,
+            false, // encoding tag omitted — baseline-invalid
+            &REQUIRED_MLS_PROPOSAL_TAGS,
+        );
 
         let lookup = EphemeralPlane::key_package_lookup_from_events(key_package_events(
             &keys,
@@ -1596,9 +1609,12 @@ mod tests {
     }
 
     #[test]
-    fn test_key_package_lookup_reports_missing_self_remove_as_incompatible() {
+    fn test_key_package_lookup_accepts_legacy_kp_missing_self_remove_as_found() {
+        // Under the consumer-side baseline validator a KP that omits the
+        // SelfRemove proposal advertisement is treated as a *legacy* KP — still
+        // valid for group invitation, with capability LCD applied by MDK.
         let keys = Keys::generate();
-        let incompatible = signed_key_package_event(
+        let legacy = signed_key_package_event(
             &keys,
             MLS_KEY_PACKAGE_KIND_LEGACY,
             Timestamp::now(),
@@ -1608,14 +1624,10 @@ mod tests {
 
         let lookup = EphemeralPlane::key_package_lookup_from_events(key_package_events(
             &keys,
-            vec![incompatible.clone()],
+            vec![legacy.clone()],
         ));
 
-        assert!(matches!(
-            lookup,
-            KeyPackageLookup::Incompatible { error }
-                if matches!(error, WhitenoiseError::MissingMlsProposals { .. })
-        ));
+        assert!(matches!(lookup, KeyPackageLookup::Found(event) if event.id == legacy.id));
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl AccountDatabase {
     /// with the real shared pool immediately after construction to apply
     /// pending globals (against shared) and locals (against this pool).
     pub async fn new(account_pubkey: PublicKey, db_path: PathBuf) -> Result<Self, DatabaseError> {
-        let inner = Database::open_without_migrations(db_path).await?;
+        let inner = Database::open_without_migrations(db_path, None).await?;
         Ok(Self {
             account_pubkey,
             inner,
@@ -223,10 +223,10 @@ mod tests {
         let account_path = dir.path().join(format!("{pubkey_hex}.db"));
 
         // 1. Open shared + account without migrations.
-        let shared = Database::open_without_migrations(shared_path)
+        let shared = Database::open_without_migrations(shared_path, None)
             .await
             .expect("open shared");
-        let account_pool = Database::open_without_migrations(account_path.clone())
+        let account_pool = Database::open_without_migrations(account_path.clone(), None)
             .await
             .expect("open account");
 

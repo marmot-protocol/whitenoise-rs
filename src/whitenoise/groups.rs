@@ -14,7 +14,7 @@ use crate::{
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
         group_information::GroupType,
-        key_packages::{REQUIRED_MLS_PROPOSAL_TAGS, validate_fetched_member_key_package},
+        key_packages::{marmot_key_package_capabilities, validate_fetched_member_key_package},
         relays::Relay,
         shared::SharedServices,
         users::User,
@@ -29,6 +29,13 @@ mod required_proposals;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 pub use required_proposals::RequiredProposal;
+pub use required_proposals::{
+    GroupCapabilityUpgradeStatus, RequiredProposalUpgradability, RequiredProposalUpgradeStatus,
+};
+pub(crate) use required_proposals::{
+    KeyPackageCapabilities, MlsExtensionId, find_member_missing_required_proposal,
+    project_group_capability_upgrade_status,
+};
 
 impl SharedServices {
     #[perf_instrument("groups")]
@@ -78,7 +85,17 @@ impl SharedServices {
 impl Whitenoise {
     /// Resolves a single member for group creation: finds or creates the user record,
     /// syncs relay lists for new users, fetches and validates the key package.
-    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
+    /// Resolves a single member for group creation: finds or creates the user record,
+    /// syncs relay lists for new users, fetches and validates the key package.
+    ///
+    /// Returns the user record, the resolved key-package event, and the
+    /// projected [`KeyPackageCapabilities`]. The capability projection is
+    /// computed once at the validation boundary so callers can fold it (e.g.
+    /// `create_group` counts legacy peers) without re-walking the event's tags.
+    async fn resolve_member_key_package(
+        &self,
+        pk: &PublicKey,
+    ) -> Result<(User, Event, KeyPackageCapabilities)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.shared.database).await?;
         if created && let Err(e) = user.update_relay_lists(&self.shared).await {
             tracing::warn!(
@@ -95,18 +112,12 @@ impl Whitenoise {
 
         let event = match lookup {
             KeyPackageLookup::Found(event) => event,
+            // The consumer-side baseline validator no longer treats missing
+            // capability advertisements (notably SelfRemove) as `Incompatible`
+            // — only genuine malformations do. The
+            // `KeyPackageMissingSelfRemove` error variant survives because
+            // `add_members_to_group`'s strict-add path still produces it.
             KeyPackageLookup::Incompatible { error } => {
-                if let WhitenoiseError::MissingMlsProposals { missing } = &error {
-                    let missing_self_remove = missing
-                        .iter()
-                        .any(|proposal| proposal == REQUIRED_MLS_PROPOSAL_TAGS[0]);
-                    if missing_self_remove {
-                        return Err(WhitenoiseError::KeyPackageMissingSelfRemove {
-                            member_pubkey: *pk,
-                        });
-                    }
-                }
-
                 return Err(WhitenoiseError::IncompatibleKeyPackage {
                     member_pubkey: *pk,
                     reason: error.to_string(),
@@ -121,7 +132,9 @@ impl Whitenoise {
 
         validate_fetched_member_key_package(&event, pk)?;
 
-        Ok((user, event))
+        let capabilities = marmot_key_package_capabilities(&event);
+
+        Ok((user, event, capabilities))
     }
 
     #[deprecated(
@@ -265,6 +278,106 @@ impl Whitenoise {
         Ok(required.into_iter().map(RequiredProposal::from).collect())
     }
 
+    /// Returns readiness for RequiredCapabilities proposal upgrades.
+    #[perf_instrument("groups")]
+    pub async fn group_capability_upgrade_status(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<GroupCapabilityUpgradeStatus> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let status = mdk
+            .group_capability_upgrade_status(group_id)
+            .map_err(|e| match e {
+                mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
+                other => WhitenoiseError::from(other),
+            })?;
+        Ok(project_group_capability_upgrade_status(status))
+    }
+
+    /// Adds proposal types to a group's `RequiredCapabilities` extension.
+    ///
+    /// Use [`Self::group_capability_upgrade_status`] first to discover which
+    /// proposals are upgradeable today; this method enforces the same MDK
+    /// gate (every member must already advertise the capability) and surfaces
+    /// blockers as [`WhitenoiseError::CapabilityUpgradeBlocked`].
+    ///
+    /// Per MIP-03, the evolution event is published to the group's relays
+    /// *before* merging the pending commit locally — local state only
+    /// advances once a relay has accepted the event.
+    ///
+    /// # Arguments
+    /// * `account` - The account performing the upgrade (must be group admin)
+    /// * `group_id` - The MLS group ID to upgrade
+    /// * `proposals_to_add` - Non-empty set of proposals to require; must not
+    ///   contain [`RequiredProposal::Unknown`]
+    ///
+    /// # Errors
+    /// * [`WhitenoiseError::InvalidInput`] - `proposals_to_add` is empty or
+    ///   contains [`RequiredProposal::Unknown`]
+    /// * [`WhitenoiseError::AccountNotAuthorized`] - `account` is not a group
+    ///   admin
+    /// * [`WhitenoiseError::GroupNotFound`] - No MLS record exists for
+    ///   `group_id`
+    /// * [`WhitenoiseError::CapabilityUpgradeBlocked`] - One or more members
+    ///   do not yet advertise the requested capability
+    ///
+    /// Idempotent when every requested proposal is already required.
+    #[allow(deprecated)]
+    #[perf_instrument("groups")]
+    pub async fn upgrade_group_required_proposals(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        proposals_to_add: BTreeSet<RequiredProposal>,
+    ) -> Result<()> {
+        if proposals_to_add.is_empty() {
+            return Err(WhitenoiseError::InvalidInput(
+                "proposals_to_add must be non-empty".to_string(),
+            ));
+        }
+
+        self.ensure_account_is_group_admin(account, group_id)
+            .await?;
+
+        let proposal_types = proposals_to_add
+            .iter()
+            .copied()
+            .map(ProposalType::try_from)
+            .collect::<Result<BTreeSet<_>>>()?;
+
+        let (relay_urls, evolution_event) = {
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
+            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+
+            let update_result = match mdk.upgrade_group_capabilities(group_id, &proposal_types) {
+                Ok(update_result) => update_result,
+                Err(mdk_core::Error::ProposalAlreadyRequired(proposal)) => {
+                    tracing::info!(
+                        target: "whitenoise::groups::upgrade_group_required_proposals",
+                        proposal = ?proposal,
+                        "proposal already required; treating upgrade as idempotent no-op"
+                    );
+                    return Ok(());
+                }
+                Err(other) => return Err(map_mdk_capability_upgrade_error(other)),
+            };
+
+            (relay_urls, update_result.evolution_event)
+        };
+
+        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
+            .await?;
+
+        tracing::info!(
+            target: "whitenoise::groups::upgrade_group_required_proposals",
+            added = ?proposals_to_add,
+            "upgraded group required proposals"
+        );
+
+        Ok(())
+    }
+
     #[allow(deprecated)]
     #[perf_instrument("groups")]
     async fn ensure_account_is_group_admin(
@@ -299,17 +412,61 @@ impl Whitenoise {
         let signer = self.get_signer_for_account(account)?;
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
+        let mut member_caps: Vec<(PublicKey, KeyPackageCapabilities)> =
+            Vec::with_capacity(members.len());
 
+        // Resolve key packages for all members. The third tuple element is the
+        // per-member capability projection used by the pre-check below.
         for pk in members.iter() {
-            let (user, event) = self.resolve_member_key_package(pk).await?;
+            let (user, event, caps) = self.resolve_member_key_package(pk).await?;
             key_package_events.push(event);
             users.push(user);
+            member_caps.push((*pk, caps));
+        }
+
+        // Pre-validate each invitee's advertised proposals against the group's
+        // `RequiredCapabilities` BEFORE invoking MDK so we can attribute the
+        // rejection to the offending member. MDK's typed error
+        // (`InviteeMissingRequiredProposal`) is a unit variant carrying no
+        // attribution; we keep it as defense-in-depth via
+        // `map_mdk_add_members_error`.
+        //
+        // Only pre-check proposals we model explicitly. `RequiredProposal::Unknown`
+        // is a unit variant: distinct unmodelled MLS proposal codepoints all
+        // collapse to the same value on both sides of the comparison, so a set
+        // difference on `Unknown` would yield false negatives (a group requiring
+        // proposal X and a member advertising only proposal Y both project to
+        // `{Unknown}`, masking the mismatch). MDK's leaf-node validation is
+        // authoritative for those cases — `map_mdk_add_members_error` translates
+        // its `InviteeMissingRequiredProposal` into the same defense-in-depth
+        // error path.
+        let required = self.group_required_proposals(account, group_id).await?;
+        let modeled_required: BTreeSet<RequiredProposal> = required
+            .iter()
+            .copied()
+            .filter(|p| !matches!(p, RequiredProposal::Unknown))
+            .collect();
+        if !modeled_required.is_empty()
+            && let Some((member_pubkey, missing)) =
+                find_member_missing_required_proposal(&member_caps, &modeled_required)
+        {
+            return Err(match missing {
+                RequiredProposal::SelfRemove => {
+                    WhitenoiseError::KeyPackageMissingSelfRemove { member_pubkey }
+                }
+                other => WhitenoiseError::GroupRejectedMember {
+                    member_pubkey: Some(member_pubkey),
+                    reason: format!("does not advertise {other:?}"),
+                },
+            });
         }
 
         let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
         let _mls_add = perf_span!("groups::mls_add_members");
-        let update_result = mdk.add_members(group_id, &key_package_events)?;
+        let update_result = mdk
+            .add_members(group_id, &key_package_events)
+            .map_err(map_mdk_add_members_error)?;
         drop(_mls_add);
 
         let evolution_event = update_result.evolution_event;
@@ -503,6 +660,66 @@ impl Whitenoise {
     }
 }
 
+/// Defense-in-depth mapping for `mdk.add_members` errors.
+///
+/// `add_members_to_group` pre-validates each invitee's
+/// [`KeyPackageCapabilities`] against the group's
+/// [`Whitenoise::group_required_proposals`] before invoking MDK, so an
+/// `InviteeMissingRequiredProposal` from MDK means the pre-check missed an
+/// edge case (e.g. an `openmls` enforcement rule that diverges from our
+/// projection). We surface it as
+/// [`WhitenoiseError::GroupRejectedMember`] with no member attribution
+/// (the MDK variant is a unit, no payload) and emit a `warn!` so the gap
+/// is visible in logs.
+///
+/// All other MDK errors keep their pre-existing `WhitenoiseError::from`
+/// pass-through.
+fn map_mdk_add_members_error(err: mdk_core::Error) -> WhitenoiseError {
+    match err {
+        mdk_core::Error::InviteeMissingRequiredProposal => {
+            tracing::warn!(
+                target: "whitenoise::accounts::groups::add_members",
+                "MDK rejected add despite passing pre-validation; pre-check has a gap"
+            );
+            WhitenoiseError::GroupRejectedMember {
+                member_pubkey: None,
+                reason: "invitee KeyPackage is missing a proposal type required by the group"
+                    .to_string(),
+            }
+        }
+        other => WhitenoiseError::from(other),
+    }
+}
+
+fn map_mdk_capability_upgrade_error(err: mdk_core::Error) -> WhitenoiseError {
+    match err {
+        mdk_core::Error::EmptyUpgradeSet => {
+            WhitenoiseError::InvalidInput("proposals_to_add must be non-empty".to_string())
+        }
+        mdk_core::Error::ProposalNotInSupportedSet(proposal) => WhitenoiseError::InvalidInput(
+            format!("proposal {proposal:?} is not supported for RequiredCapabilities upgrade"),
+        ),
+        mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
+        mdk_core::Error::NotAdmin => WhitenoiseError::AccountNotAuthorized,
+        mdk_core::Error::ProposalNotAvailableForUpgrade { proposal, blockers } => {
+            tracing::warn!(
+                target: "whitenoise::groups::upgrade_group_required_proposals",
+                proposal = ?proposal,
+                blockers = ?blockers,
+                "required proposal upgrade blocked by current member capabilities"
+            );
+            WhitenoiseError::CapabilityUpgradeBlocked {
+                proposal: RequiredProposal::from(proposal),
+                blockers,
+            }
+        }
+        mdk_core::Error::OwnLeafNotFound => WhitenoiseError::Internal(
+            "caller leaf is missing while upgrading group required proposals".to_string(),
+        ),
+        other => WhitenoiseError::from(other),
+    }
+}
+
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
@@ -510,6 +727,7 @@ mod tests {
     use crate::whitenoise::Whitenoise;
     use crate::whitenoise::database::media_files::MediaFile;
     use crate::whitenoise::group_information::GroupInformation;
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
     use crate::whitenoise::test_utils::*;
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
@@ -534,6 +752,43 @@ mod tests {
             mime_type: Some(mime_type.to_string()),
             uploaded: Timestamp::now(),
         }
+    }
+
+    async fn create_native_mdk_group_for_testing(
+        whitenoise: &Whitenoise,
+    ) -> (Account, group_types::Group) {
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+
+        let member_nsec = whitenoise
+            .export_account_nsec(&member_account)
+            .await
+            .unwrap();
+        let member_secret = nostr_sdk::SecretKey::from_bech32(&member_nsec).unwrap();
+        let member_keys = Keys::new(member_secret);
+
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let key_package_relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let key_package_data = member_mdk
+            .create_key_package_for_event(&member_account.pubkey, key_package_relays)
+            .unwrap();
+        let key_package_event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &key_package_data.content)
+            .tags(key_package_data.tags_30443)
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        let creator_mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let group = creator_mdk
+            .create_group(&creator_account.pubkey, vec![key_package_event], config)
+            .unwrap()
+            .group;
+
+        (creator_account, group)
     }
 
     #[tokio::test]
@@ -1093,6 +1348,35 @@ mod tests {
             matches!(update_result, Err(WhitenoiseError::AccountNotAuthorized)),
             "Expected AccountNotAuthorized for update_group_data, got: {:?}",
             update_result
+        );
+
+        let upgrade_result = whitenoise
+            .upgrade_group_required_proposals(
+                &creator_account,
+                &group.mls_group_id,
+                BTreeSet::from([RequiredProposal::SelfRemove]),
+            )
+            .await;
+        assert!(
+            matches!(upgrade_result, Err(WhitenoiseError::AccountNotAuthorized)),
+            "Expected AccountNotAuthorized for upgrade_group_required_proposals, got: {:?}",
+            upgrade_result
+        );
+
+        let upgrade_unknown_result = whitenoise
+            .upgrade_group_required_proposals(
+                &creator_account,
+                &group.mls_group_id,
+                BTreeSet::from([RequiredProposal::Unknown]),
+            )
+            .await;
+        assert!(
+            matches!(
+                upgrade_unknown_result,
+                Err(WhitenoiseError::AccountNotAuthorized)
+            ),
+            "Expected AccountNotAuthorized to take precedence over invalid input shape, got: {:?}",
+            upgrade_unknown_result
         );
     }
 
@@ -2430,5 +2714,175 @@ mod tests {
             .expect_err("fabricated group ID must error");
 
         assert!(matches!(err, WhitenoiseError::GroupNotFound));
+    }
+
+    #[tokio::test]
+    async fn group_capability_upgrade_status_reports_already_required_for_native_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (creator_account, group) = create_native_mdk_group_for_testing(&whitenoise).await;
+
+        let status = whitenoise
+            .group_capability_upgrade_status(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status.per_proposal,
+            vec![RequiredProposalUpgradeStatus {
+                proposal: RequiredProposal::SelfRemove,
+                state: RequiredProposalUpgradability::AlreadyRequired,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn group_capability_upgrade_status_errors_on_missing_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let missing_group_id = GroupId::from_slice(&[0; 32]);
+
+        let err = whitenoise
+            .group_capability_upgrade_status(&account, &missing_group_id)
+            .await
+            .expect_err("fabricated group ID must error");
+
+        assert!(matches!(err, WhitenoiseError::GroupNotFound));
+    }
+
+    #[tokio::test]
+    async fn upgrade_group_required_proposals_rejects_unknown_target() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (creator_account, group) = create_native_mdk_group_for_testing(&whitenoise).await;
+
+        let err = whitenoise
+            .upgrade_group_required_proposals(
+                &creator_account,
+                &group.mls_group_id,
+                BTreeSet::from([RequiredProposal::Unknown]),
+            )
+            .await
+            .expect_err("unknown upgrade target must be rejected as invalid input");
+
+        assert!(matches!(err, WhitenoiseError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn upgrade_group_required_proposals_rejects_empty_set_before_group_lookup() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let missing_group_id = GroupId::from_slice(&[0; 32]);
+
+        let err = whitenoise
+            .upgrade_group_required_proposals(&account, &missing_group_id, BTreeSet::new())
+            .await
+            .expect_err("empty upgrade target must fail before group lookup");
+
+        assert!(matches!(err, WhitenoiseError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn upgrade_group_required_proposals_is_idempotent_when_already_required() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (creator_account, group) = create_native_mdk_group_for_testing(&whitenoise).await;
+
+        whitenoise
+            .upgrade_group_required_proposals(
+                &creator_account,
+                &group.mls_group_id,
+                BTreeSet::from([RequiredProposal::SelfRemove]),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn map_capability_upgrade_empty_set_yields_invalid_input() {
+        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::EmptyUpgradeSet);
+
+        assert!(matches!(mapped, WhitenoiseError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn map_capability_upgrade_unsupported_proposal_yields_invalid_input() {
+        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::ProposalNotInSupportedSet(
+            ProposalType::Add,
+        ));
+
+        assert!(matches!(mapped, WhitenoiseError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn map_capability_upgrade_group_not_found_yields_group_not_found() {
+        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::GroupNotFound);
+
+        assert!(matches!(mapped, WhitenoiseError::GroupNotFound));
+    }
+
+    #[test]
+    fn map_capability_upgrade_not_admin_yields_account_not_authorized() {
+        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::NotAdmin);
+
+        assert!(matches!(mapped, WhitenoiseError::AccountNotAuthorized));
+    }
+
+    #[test]
+    fn map_capability_upgrade_blocked_yields_named_blockers() {
+        let blocker = Keys::generate().public_key();
+        let mapped =
+            map_mdk_capability_upgrade_error(mdk_core::Error::ProposalNotAvailableForUpgrade {
+                proposal: ProposalType::SelfRemove,
+                blockers: vec![blocker],
+            });
+
+        match mapped {
+            WhitenoiseError::CapabilityUpgradeBlocked { proposal, blockers } => {
+                assert_eq!(proposal, RequiredProposal::SelfRemove);
+                assert_eq!(blockers, vec![blocker]);
+            }
+            other => panic!("expected CapabilityUpgradeBlocked, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_capability_upgrade_own_leaf_not_found_yields_internal() {
+        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::OwnLeafNotFound);
+
+        assert!(matches!(mapped, WhitenoiseError::Internal(_)));
+    }
+
+    #[test]
+    fn map_invitee_missing_required_proposal_yields_group_rejected_member() {
+        // Defense-in-depth: if MDK still rejects an `add_members` call after
+        // our pre-check passed, the typed unit variant
+        // `InviteeMissingRequiredProposal` (no member attribution) maps to
+        // `WhitenoiseError::GroupRejectedMember { member_pubkey: None, .. }`.
+        let mapped = map_mdk_add_members_error(mdk_core::Error::InviteeMissingRequiredProposal);
+
+        match mapped {
+            WhitenoiseError::GroupRejectedMember {
+                member_pubkey,
+                reason,
+            } => {
+                assert_eq!(member_pubkey, None);
+                assert!(
+                    !reason.is_empty(),
+                    "GroupRejectedMember reason must be non-empty for FFI rendering"
+                );
+            }
+            other => panic!("expected GroupRejectedMember, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_other_mdk_errors_passes_through_unchanged() {
+        // Non-`InviteeMissingRequiredProposal` MDK errors keep their existing
+        // `WhitenoiseError::from` mapping (variant `MdkCoreError`).
+        let mapped =
+            map_mdk_add_members_error(mdk_core::Error::Group("some unrelated error".to_owned()));
+
+        assert!(
+            matches!(mapped, WhitenoiseError::MdkCoreError(_)),
+            "expected MdkCoreError pass-through, got: {mapped:?}"
+        );
     }
 }

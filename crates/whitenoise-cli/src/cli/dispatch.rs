@@ -1269,6 +1269,7 @@ async fn follows_check(
     Ok(Response::ok(serde_json::json!({ "following": following })))
 }
 
+#[allow(deprecated)]
 async fn block_user(
     wn: &Whitenoise,
     account_str: &str,
@@ -1282,6 +1283,7 @@ async fn block_user(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 async fn unblock_user(
     wn: &Whitenoise,
     account_str: &str,
@@ -1295,6 +1297,7 @@ async fn unblock_user(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 async fn blocked_users(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let entries = wn

@@ -55,22 +55,65 @@ impl Whitenoise {
         // (e.g. contact-list guard) can look it up immediately.
         self.insert_account_session(account).await?;
 
-        // Subscriptions and key package setup operate on disjoint relay
-        // sessions (group/inbox plane vs ephemeral plane) with no shared
-        // mutable state, so they run concurrently.  Key package setup is
-        // best-effort — the KeyPackageMaintenance scheduler retries failures.
-        let (sub_result, kp_result) = tokio::join!(
-            self.setup_subscriptions(account, inbox_relays),
-            self.setup_key_package(account, is_new_account, key_package_relays),
-        );
-        if let Err(e) = kp_result {
+        self.setup_subscriptions(account, inbox_relays).await?;
+
+        // Key package publish uses the account-scoped ephemeral session that
+        // subscription setup warms. Run it after subscription setup so the
+        // background publish does not race a still-starting relay session.
+        if let Err(e) = self
+            .setup_key_package(account, is_new_account, key_package_relays)
+            .await
+        {
             tracing::warn!(
                 target: "whitenoise::accounts",
                 "Key package setup failed, scheduler will retry: {}",
                 e
             );
         }
-        sub_result?;
+
+        tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
+        Ok(())
+    }
+
+    /// Activation path for brand-new local accounts created via
+    /// `create_identity` / `create_identity_without_initial_key_package`.
+    ///
+    /// Identical to [`Self::activate_account`] when
+    /// `publish_initial_key_package` is `true`. When `false`, the initial
+    /// key-package publish is skipped — used by integration-test fixtures
+    /// that want to be the sole publisher of the account's key packages.
+    #[perf_instrument("accounts")]
+    pub(super) async fn activate_new_account(
+        &self,
+        account: &Account,
+        relays: &[Relay],
+        publish_initial_key_package: bool,
+    ) -> Result<()> {
+        self.shared.discovery_sync_worker.request_rebuild();
+
+        // Session must exist before subscriptions so that event handlers
+        // (e.g. contact-list guard) can look it up immediately.
+        self.insert_account_session(account).await?;
+
+        self.setup_subscriptions(account, relays).await?;
+
+        if publish_initial_key_package {
+            // Key package publish uses the account-scoped ephemeral session that
+            // subscription setup warms. Run it after subscription setup so the
+            // background publish does not race a still-starting relay session.
+            if let Err(e) = self.setup_key_package(account, true, relays).await {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    "Key package setup failed, scheduler will retry: {}",
+                    e
+                );
+            }
+        } else {
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                "Skipping initial key package publish for new account (integration-test fixture)"
+            );
+        }
 
         tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
         Ok(())
