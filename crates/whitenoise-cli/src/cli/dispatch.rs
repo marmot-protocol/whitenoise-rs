@@ -6,8 +6,8 @@ use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 use whitenoise::{
-    AccountGroup, KeyPackageStatus, Language, PaginationOptions, RelayType, RequiredProposal,
-    ThemeMode, Whitenoise,
+    KeyPackageStatus, Language, PaginationOptions, RelayType, RequiredProposal, ThemeMode,
+    Whitenoise,
 };
 
 use super::protocol::{MuteDuration, Request, Response};
@@ -1139,20 +1139,15 @@ async fn respond_to_invite(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    let ag =
-        AccountGroup::find_by_account_and_group(&account.pubkey, &group_id, &wn.shared.database)
-            .await
-            .map_err(|e| Response::err(e.to_string()))?
-            .ok_or_else(|| Response::err("group not found for this account"))?;
-
-    if accept {
-        ag.accept(wn).await
+    #[allow(deprecated)]
+    let ag = if accept {
+        wn.accept_account_group(&account, &group_id).await
     } else {
-        ag.decline(wn).await
+        wn.decline_account_group(&account, &group_id).await
     }
     .map_err(|e| Response::err(e.to_string()))?;
 
-    Ok(Response::ok(serde_json::json!(null)))
+    Ok(to_response(&ag))
 }
 
 async fn profile_show(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
