@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use mdk_core::prelude::*;
+use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +16,7 @@ use crate::whitenoise::{
     accounts_groups::AccountGroup,
     aggregated_message::AggregatedMessage,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
-    error::Result,
+    error::{Result, WhitenoiseError},
     group_information::{GroupInformation, GroupType},
     groups::GroupWithMembership,
     message_aggregator::ChatMessageSummary,
@@ -275,6 +276,45 @@ impl Whitenoise {
         self.build_chat_list_for(account, archived).await
     }
 
+    /// Retrieves a single chat list item for the given account and group.
+    ///
+    /// Unlike [`Self::get_chat_list`], this is a point query — it answers "tell me about
+    /// *this* chat" rather than "show me my visible chats." That difference shows up
+    /// in two ways:
+    ///
+    /// - Returns the item even when the user has declined the group. List endpoints
+    ///   filter declined groups; a point query has explicit intent and surfaces
+    ///   declined membership instead. Callers that want chat-list visibility
+    ///   filtering can check [`AccountGroup::is_visible`] themselves.
+    /// - Returns [`WhitenoiseError::GroupNotFound`] when the MDK group, the
+    ///   `GroupInformation` row, or the `AccountGroup` row is missing — rather
+    ///   than `None`.
+    #[perf_instrument("chat_list")]
+    pub async fn get_chat_list_item(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<ChatListItem> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let group = mdk
+            .get_group(group_id)?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let group_info =
+            match GroupInformation::find_by_mls_group_id(group_id, &self.database).await {
+                Ok(info) => info,
+                Err(WhitenoiseError::SqlxError(sqlx::Error::RowNotFound)) => {
+                    return Err(WhitenoiseError::GroupNotFound);
+                }
+                Err(e) => return Err(e),
+            };
+        let account_group = AccountGroup::get(self, &account.pubkey, group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        self.assemble_chat_list_item(account, &mdk, group, group_info, account_group)
+            .await
+    }
+
     /// Builds a sorted chat list from a pre-filtered set of groups.
     ///
     /// Handles the expensive batch pipeline: group info, messages, users, images,
@@ -336,46 +376,66 @@ impl Whitenoise {
         Ok(items)
     }
 
-    /// Builds a single ChatListItem for a specific group.
+    /// Builds a single ChatListItem for a specific group, applying chat-list
+    /// visibility rules.
     ///
-    /// Used by the streaming system to construct updates without re-fetching the entire chat list.
-    /// Performs individual queries rather than batch operations.
+    /// Used by the streaming system to construct updates without re-fetching the
+    /// entire chat list. Performs individual queries rather than batch operations.
     ///
-    /// Returns `Ok(None)` if:
-    /// - Group doesn't exist in MDK
-    /// - GroupInformation doesn't exist (group not fully initialized)
-    /// - AccountGroup is declined
+    /// Returns `Ok(None)` when the group is not visible to this account in the
+    /// chat list — i.e. one of:
+    /// - the MDK group is missing
+    /// - the `GroupInformation` row is missing (group not fully initialized)
+    /// - no `AccountGroup` row exists
+    /// - the `AccountGroup` is declined
+    ///
+    /// Callers that want a point query without the visibility filter (for example,
+    /// to render a chat-detail screen for a declined group) should use
+    /// [`Self::get_chat_list_item`] instead.
     #[perf_instrument("chat_list")]
     pub(crate) async fn build_chat_list_item(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<ChatListItem>> {
-        // 1. Get group from MDK
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let Some(group) = mdk.get_group(group_id)? else {
             return Ok(None);
         };
-
-        // 2. Get GroupInformation (returns error if not found)
         let group_info =
             match GroupInformation::find_by_mls_group_id(group_id, &self.database).await {
                 Ok(info) => info,
-                Err(_) => return Ok(None), // Group not fully initialized
+                Err(WhitenoiseError::SqlxError(sqlx::Error::RowNotFound)) => return Ok(None),
+                Err(e) => return Err(e),
             };
-
-        // 3. Get AccountGroup for visibility/pending status and welcomer pubkey
-        let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
-        let Some(account_group) = account_group else {
-            return Ok(None); // No AccountGroup record
+        let Some(account_group) = AccountGroup::get(self, &account.pubkey, group_id).await? else {
+            return Ok(None);
         };
         if !account_group.is_visible() {
-            return Ok(None); // Declined
+            return Ok(None);
         }
-        let pending_confirmation = account_group.is_pending();
-        let welcomer_pubkey = account_group.welcomer_pubkey;
 
-        // 4. For DMs: get members, find other user, lookup metadata
+        let item = self
+            .assemble_chat_list_item(account, &mdk, group, group_info, account_group)
+            .await?;
+        Ok(Some(item))
+    }
+
+    /// Composes a [`ChatListItem`] from already-resolved group data.
+    ///
+    /// This is the shared assembly path used by both [`Self::build_chat_list_item`]
+    /// and [`Self::get_chat_list_item`]. It performs no row-existence checks and
+    /// no visibility filtering — those concerns belong to its callers.
+    async fn assemble_chat_list_item(
+        &self,
+        account: &Account,
+        mdk: &MDK<MdkSqliteStorage>,
+        group: group_types::Group,
+        group_info: GroupInformation,
+        account_group: AccountGroup,
+    ) -> Result<ChatListItem> {
+        let group_id = &group.mls_group_id;
+
         let (dm_peer_pubkey, dm_other_user) = if group_info.group_type == GroupType::DirectMessage {
             let members: Vec<PublicKey> = mdk.get_members(group_id)?.into_iter().collect();
             if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
@@ -388,18 +448,14 @@ impl Whitenoise {
             (None, None)
         };
 
-        // 5. Get last message
         let last_message_summaries = AggregatedMessage::find_last_by_group_ids(
             std::slice::from_ref(group_id),
             &self.database,
         )
         .await?;
-        let last_message_summary = last_message_summaries.into_iter().next();
-
-        // 6. Lookup message author metadata and build final last_message.
-        //    Filter out messages at or before chat_cleared_at so the chat list
-        //    preview does not show a message the user explicitly cleared.
-        let last_message_summary = last_message_summary
+        let last_message_summary = last_message_summaries
+            .into_iter()
+            .next()
             .filter(|summary| account_group.is_message_visible(summary.created_at));
         let last_message = if let Some(mut summary) = last_message_summary {
             let author_user = User::find_by_pubkey(&summary.author, &self.database)
@@ -411,7 +467,6 @@ impl Whitenoise {
             None
         };
 
-        // 7. Resolve name and image based on group type
         let name = resolve_chat_name(&group, &group_info.group_type, dm_other_user.as_ref());
 
         let (group_image_path, group_image_url) = match group_info.group_type {
@@ -431,7 +486,6 @@ impl Whitenoise {
             }
         };
 
-        // 8. Compute unread count
         let cleared_ms = account_group
             .chat_cleared_at
             .map(|dt| dt.timestamp_millis());
@@ -443,15 +497,7 @@ impl Whitenoise {
         )
         .await?;
 
-        // 9. Get pin order, archived_at, removed_at, self_removed, and muted_until
-        let pin_order = account_group.pin_order;
-        let archived_at = account_group.archived_at;
-        let removed_at = account_group.removed_at;
-        let self_removed = account_group.self_removed;
-        let muted_until = account_group.muted_until;
-
-        // 10. Assemble and return ChatListItem
-        Ok(Some(ChatListItem {
+        Ok(ChatListItem {
             mls_group_id: group_id.clone(),
             name,
             group_type: group_info.group_type,
@@ -459,16 +505,16 @@ impl Whitenoise {
             group_image_path,
             group_image_url,
             last_message,
-            pending_confirmation,
-            welcomer_pubkey,
+            pending_confirmation: account_group.is_pending(),
+            welcomer_pubkey: account_group.welcomer_pubkey,
             unread_count,
-            pin_order,
+            pin_order: account_group.pin_order,
             dm_peer_pubkey,
-            archived_at,
-            removed_at,
-            self_removed,
-            muted_until,
-        }))
+            archived_at: account_group.archived_at,
+            removed_at: account_group.removed_at,
+            self_removed: account_group.self_removed,
+            muted_until: account_group.muted_until,
+        })
     }
 
     /// Emit a chat list update with the given trigger for a specific account.
@@ -1315,6 +1361,124 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_item_surfaces_left_state() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        whitenoise
+            .mark_as_left(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        let item = whitenoise
+            .get_chat_list_item(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert!(item.removed_at.is_some());
+        assert!(item.self_removed);
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_item_surfaces_admin_removed_state() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        whitenoise
+            .mark_as_removed(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        let item = whitenoise
+            .get_chat_list_item(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert!(item.removed_at.is_some());
+        assert!(!item.self_removed);
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_item_returns_item_for_declined_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let account_group = AccountGroup::get(&whitenoise, &creator.pubkey, &group.mls_group_id)
+            .await
+            .unwrap()
+            .unwrap();
+        account_group.decline(&whitenoise).await.unwrap();
+
+        let item = whitenoise
+            .get_chat_list_item(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(item.mls_group_id, group.mls_group_id);
+        assert_eq!(item.group_type, GroupType::Group);
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_item_errors_when_mdk_group_missing() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let nonexistent = mdk_core::prelude::GroupId::from_slice(&[99; 32]);
+        let err = whitenoise
+            .get_chat_list_item(&account, &nonexistent)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WhitenoiseError::GroupNotFound));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_item_returns_active_for_fresh_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let item = whitenoise
+            .get_chat_list_item(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(item.mls_group_id, group.mls_group_id);
+        assert_eq!(item.name, Some("Test group".to_string()));
+        assert_eq!(item.group_type, GroupType::Group);
+        assert!(!item.pending_confirmation);
+        assert!(item.removed_at.is_none());
+        assert!(!item.self_removed);
     }
 
     #[tokio::test]

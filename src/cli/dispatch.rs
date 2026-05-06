@@ -322,6 +322,13 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::GetChatListItem { account, group_id } => {
+            match get_chat_list_item(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
         Request::ArchiveChat { account, group_id } => {
             match archive_chat(wn, &account, &group_id).await {
                 Ok(resp) => resp,
@@ -1359,6 +1366,21 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
         clean.push(clean_chat_list_item(wn, item).await);
     }
     Ok(to_response(&clean))
+}
+
+#[perf_instrument("dispatch")]
+async fn get_chat_list_item(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let item = wn
+        .get_chat_list_item(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(clean_chat_list_item(wn, &item).await))
 }
 
 #[perf_instrument("dispatch")]

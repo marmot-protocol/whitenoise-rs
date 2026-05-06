@@ -118,6 +118,8 @@ pub enum Request {
     // Chat list
     #[serde(rename = "chats_list")]
     ChatsList { account: String },
+    #[serde(rename = "get_chat_list_item")]
+    GetChatListItem { account: String, group_id: String },
     #[serde(rename = "archive_chat")]
     ArchiveChat { account: String, group_id: String },
     #[serde(rename = "unarchive_chat")]
@@ -521,6 +523,25 @@ mod tests {
         let serialized = serde_json::to_string(&duration).unwrap();
         let deserialized: MuteDuration = serde_json::from_str(&serialized).unwrap();
         assert_eq!(duration, deserialized);
+    }
+
+    #[test]
+    fn get_chat_list_item_roundtrip() {
+        let req = Request::GetChatListItem {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"method":"get_chat_list_item","params":{"account":"npub1abc","group_id":"abcd1234"}}"#
+        );
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GetChatListItem { account, group_id }
+                if account == "npub1abc" && group_id == "abcd1234"
+        ));
     }
 
     #[test]
