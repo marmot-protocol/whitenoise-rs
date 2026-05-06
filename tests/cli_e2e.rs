@@ -14,23 +14,14 @@
 
 #![cfg(all(feature = "cli", feature = "integration-tests"))]
 
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 #[path = "support/cli.rs"]
 mod cli_support;
 
-use cli_support::{Daemon, group_id_hex, poll_until, wait_for_group, wait_for_message, wn};
-
-async fn wait_for_key_package(socket: &PathBuf, pubkey: &str) {
-    let msg = format!("did not see a valid key package for {pubkey} within 30s");
-    poll_until(Duration::from_secs(30), &msg, || {
-        wn(socket, &["keys", "check", pubkey])
-            .get("status")
-            .and_then(|status| status.as_str())
-            == Some("valid")
-    })
-    .await;
-}
+use cli_support::{
+    Daemon, group_id_hex, wait_for_group, wait_for_key_package, wait_for_message, wn,
+};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -190,15 +181,18 @@ async fn group_metadata_and_membership() {
 
     wait_for_group(&bob.socket, &bob_pk).await;
 
-    // groups show returns the MLS group object
+    // groups show returns { group, required_proposals }
     let detail = wn(
         &alice.socket,
         &["--account", &alice_pk, "groups", "show", &gid],
     );
     assert!(detail.is_object(), "group detail should be a JSON object");
     assert!(
-        detail.get("mls_group_id").is_some(),
-        "should contain mls_group_id"
+        detail
+            .get("group")
+            .and_then(|g| g.get("mls_group_id"))
+            .is_some(),
+        "should contain group.mls_group_id"
     );
 
     // members includes both Alice and Bob

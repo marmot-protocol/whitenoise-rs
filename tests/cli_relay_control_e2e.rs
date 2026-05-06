@@ -20,7 +20,8 @@ use whitenoise::test_fixtures::nostr::{
 mod cli_support;
 
 use cli_support::{
-    Daemon, bytes_field_hex, group_id_hex, poll_until, wait_for_group, wait_for_message, wn,
+    Daemon, bytes_field_hex, group_id_hex, poll_until, wait_for_group, wait_for_key_package,
+    wait_for_message, wn,
 };
 
 const LOCAL_DEV_RELAYS: &[&str] = &["ws://localhost:8080", "ws://localhost:7777"];
@@ -183,6 +184,7 @@ async fn relay_control_snapshot_tracks_live_planes() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_key_package(&bob.socket, &bob_pk).await;
 
     let group = wn(
         &alice.socket,
