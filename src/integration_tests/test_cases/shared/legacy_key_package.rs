@@ -58,7 +58,6 @@ const NOSTR_GROUP_DATA_TAG: &str = "0xf2ee";
 /// this fixture. The fixture is sufficient to exercise WhiteNoise's
 /// consumer-side preflight softening, but end-to-end LCD verification needs
 /// real legacy LeafNode bytes recorded from an older MDK.
-#[allow(deprecated)]
 pub(crate) async fn publish_legacy_capability_key_package(
     context: &ScenarioContext,
     account: &crate::Account,
@@ -146,13 +145,9 @@ pub(crate) async fn publish_legacy_capability_key_package(
 
     context
         .whitenoise
-        .track_published_key_package_for_testing(
-            &account.pubkey,
-            &key_package_data.hash_ref,
-            &event_id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-        )
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .track_published_for_testing(&key_package_data.hash_ref, &event_id.to_hex())
         .await?;
 
     tracing::debug!(
@@ -173,7 +168,6 @@ pub(crate) async fn publish_legacy_capability_key_package(
 /// Unlike [`publish_legacy_capability_key_package`], this uses MDK's
 /// `test_util::create_legacy_key_package_event` helper, so MDK's LCD logic sees
 /// a real capability-poor leaf during group creation.
-#[allow(deprecated)]
 pub(crate) async fn publish_legacy_leaf_key_package(
     context: &ScenarioContext,
     account: &crate::Account,
@@ -197,13 +191,9 @@ pub(crate) async fn publish_legacy_leaf_key_package(
 
     context
         .whitenoise
-        .track_published_key_package_for_testing(
-            &account.pubkey,
-            &[],
-            &event_id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-        )
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .track_published_for_testing(&[], &event_id.to_hex())
         .await?;
 
     tracing::debug!(

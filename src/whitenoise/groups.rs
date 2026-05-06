@@ -323,7 +323,6 @@ impl Whitenoise {
     ///   do not yet advertise the requested capability
     ///
     /// Idempotent when every requested proposal is already required.
-    #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn upgrade_group_required_proposals(
         &self,
@@ -337,8 +336,12 @@ impl Whitenoise {
             ));
         }
 
-        self.ensure_account_is_group_admin(account, group_id)
-            .await?;
+        let session = self.require_session(&account.pubkey)?;
+
+        let admins = session.groups().admins(group_id)?;
+        if !admins.contains(&account.pubkey) {
+            return Err(WhitenoiseError::AccountNotAuthorized);
+        }
 
         let proposal_types = proposals_to_add
             .iter()
@@ -366,7 +369,9 @@ impl Whitenoise {
             (relay_urls, update_result.evolution_event)
         };
 
-        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
+        session
+            .groups()
+            .publish_and_merge_commit(evolution_event, group_id, &relay_urls)
             .await?;
 
         tracing::info!(
