@@ -251,12 +251,6 @@ impl Whitenoise {
             .token_request_timestamps
             .retain(|(account_pk, _, _, _), _| account_pk != pubkey);
 
-        // Evict rate-limiter entries for this account to prevent unbounded growth.
-        // Runs after subscription teardown to minimise the repopulation window.
-        self.shared
-            .token_request_timestamps
-            .retain(|(account_pk, _, _, _), _| account_pk != pubkey);
-
         if !ephemeral_warm_relays.is_empty()
             && let Err(error) = self
                 .shared
