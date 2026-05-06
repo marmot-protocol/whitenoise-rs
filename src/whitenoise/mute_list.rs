@@ -275,28 +275,47 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Emits a `UserBlockChanged` chat list update for the DM group with the
-    /// target user, if one exists.
-    async fn emit_block_changed(&self, account: &Account, target_pubkey: &PublicKey) {
-        match AccountGroup::find_dm_group_id_by_peer(&account.pubkey, target_pubkey, &self.database)
-            .await
-        {
-            Ok(Some(group_id)) => {
-                self.emit_chat_list_update(
-                    account,
-                    &group_id,
-                    ChatListUpdateTrigger::UserBlockChanged,
-                )
-                .await;
+    /// Emits `UserBlockChanged` chat list updates for every visible chat owned
+    /// by the account. Block state affects group unread counts, not just DMs.
+    async fn emit_block_changed(&self, account: &Account, _target_pubkey: &PublicKey) {
+        let has_active = self
+            .chat_list_stream_manager
+            .has_subscribers(&account.pubkey);
+        let has_archived = self
+            .archived_chat_list_stream_manager
+            .has_subscribers(&account.pubkey);
+
+        if !has_active && !has_archived {
+            return;
+        }
+
+        let account_groups =
+            match AccountGroup::find_visible_for_account(&account.pubkey, &self.database).await {
+                Ok(account_groups) => account_groups,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::mute_list",
+                        "Failed to look up groups for block change emission: {}",
+                        e,
+                    );
+                    return;
+                }
+            };
+
+        for account_group in account_groups {
+            if account_group.is_archived() && !has_archived {
+                continue;
             }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::mute_list",
-                    "Failed to look up DM group for block change emission: {}",
-                    e,
-                );
+            if !account_group.is_archived() && !has_active {
+                continue;
             }
+
+            self.emit_chat_list_update(
+                account,
+                &account_group.mls_group_id,
+                ChatListUpdateTrigger::UserBlockChanged,
+            )
+            .await;
         }
     }
 
@@ -350,11 +369,38 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::{EventBuilder, Keys, Kind, Tag};
+    use std::time::Duration;
+
+    use nostr_sdk::{EventBuilder, Keys, Kind, PublicKey, Tag, Tags, Timestamp};
+    use tokio::time::timeout;
 
     use super::*;
+    use crate::whitenoise::aggregated_message::AggregatedMessage;
     use crate::whitenoise::database::mute_list::MuteListEntry;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::message_aggregator::ChatMessage;
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
+
+    fn create_block_change_test_message(
+        seed: u8,
+        author: PublicKey,
+        timestamp: u64,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: format!("{:0>64}", format!("{seed:x}")),
+            author,
+            content: format!("message {seed}"),
+            created_at: Timestamp::from(timestamp),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: Default::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+        }
+    }
 
     #[tokio::test]
     async fn parse_mute_list_entries_public_tags_only() {
@@ -450,6 +496,44 @@ mod tests {
             result.is_ok(),
             "unblock_user on non-blocked user should be a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn user_block_changed_update_recalculates_group_unread_count() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![account.pubkey, member.pubkey]);
+        let group = whitenoise
+            .create_group(&account, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let message = create_block_change_test_message(1, member.pubkey, 1_700_000_001);
+        AggregatedMessage::insert_message(&message, &group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let mut subscription = whitenoise.subscribe_to_chat_list(&account).await.unwrap();
+        assert_eq!(subscription.initial_items.len(), 1);
+        assert_eq!(subscription.initial_items[0].unread_count, 1);
+
+        MuteListEntry::insert(&account.pubkey, &member.pubkey, true, &whitenoise.database)
+            .await
+            .unwrap();
+        whitenoise
+            .emit_block_changed(&account, &member.pubkey)
+            .await;
+
+        let update = timeout(Duration::from_secs(2), subscription.updates.recv())
+            .await
+            .expect("block change update should be emitted")
+            .expect("chat list stream should remain open");
+
+        assert_eq!(update.trigger, ChatListUpdateTrigger::UserBlockChanged);
+        assert_eq!(update.item.mls_group_id, group.mls_group_id);
+        assert_eq!(update.item.unread_count, 0);
     }
 
     // ── get_blocked_users / is_user_blocked (pure DB, no relay) ─────────────

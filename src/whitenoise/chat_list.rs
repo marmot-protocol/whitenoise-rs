@@ -318,8 +318,12 @@ impl Whitenoise {
                 (gid.clone(), ag.last_read_message_id, cleared_ms)
             })
             .collect();
-        let unread_counts =
-            AggregatedMessage::count_unread_for_groups(&group_markers, &self.database).await?;
+        let unread_counts = AggregatedMessage::count_visible_unread_for_groups(
+            &group_markers,
+            &account.pubkey,
+            &self.database,
+        )
+        .await?;
 
         let mut items = assemble_chat_list_items(
             &groups,
@@ -435,9 +439,10 @@ impl Whitenoise {
         let cleared_ms = account_group
             .chat_cleared_at
             .map(|dt| dt.timestamp_millis());
-        let unread_count = AggregatedMessage::count_unread_for_group(
+        let unread_count = AggregatedMessage::count_visible_unread_for_group(
             group_id,
             account_group.last_read_message_id.as_ref(),
+            &account.pubkey,
             &self.database,
             cleared_ms,
         )
@@ -750,9 +755,28 @@ impl Whitenoise {
 mod tests {
     use super::*;
     use crate::whitenoise::aggregated_message::AggregatedMessage;
+    use crate::whitenoise::database::mute_list::MuteListEntry;
     use crate::whitenoise::message_aggregator::ChatMessage;
     use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
-    use nostr_sdk::{Metadata, Timestamp};
+    use nostr_sdk::{EventId, Metadata, Timestamp};
+
+    fn create_chat_list_test_message(seed: u8, author: PublicKey, timestamp: u64) -> ChatMessage {
+        ChatMessage {
+            id: format!("{:0>64}", format!("{seed:x}")),
+            author,
+            content: format!("message {seed}"),
+            created_at: Timestamp::from(timestamp),
+            tags: nostr_sdk::Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: Default::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_get_chat_list_empty() {
@@ -785,6 +809,136 @@ mod tests {
         assert!(chat_list[0].welcomer_pubkey.is_none());
         // Groups should not have dm_peer_pubkey
         assert!(chat_list[0].dm_peer_pubkey.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_unread_count_excludes_blocked_author() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let message = create_chat_list_test_message(1, member.pubkey, 1_700_000_001);
+        AggregatedMessage::insert_message(&message, &group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        MuteListEntry::insert(&creator.pubkey, &member.pubkey, true, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let persisted = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].unread_count, 0);
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, message.id);
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_unread_count_includes_only_unblocked_authors() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let blocked_member = whitenoise.create_identity().await.unwrap();
+        let visible_member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![
+            creator.pubkey,
+            blocked_member.pubkey,
+            visible_member.pubkey,
+        ]);
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![blocked_member.pubkey, visible_member.pubkey],
+                config,
+                None,
+            )
+            .await
+            .unwrap();
+
+        for message in [
+            create_chat_list_test_message(2, blocked_member.pubkey, 1_700_000_002),
+            create_chat_list_test_message(3, visible_member.pubkey, 1_700_000_003),
+        ] {
+            AggregatedMessage::insert_message(&message, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        MuteListEntry::insert(
+            &creator.pubkey,
+            &blocked_member.pubkey,
+            true,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_unread_count_restores_after_unblock() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let read_message = create_chat_list_test_message(4, creator.pubkey, 1_700_000_004);
+        let unread_message = create_chat_list_test_message(5, member.pubkey, 1_700_000_005);
+        for message in [&read_message, &unread_message] {
+            AggregatedMessage::insert_message(message, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        let read_message_id = EventId::from_hex(&read_message.id).unwrap();
+        whitenoise
+            .mark_message_read(&creator, &read_message_id)
+            .await
+            .unwrap();
+        MuteListEntry::insert(&creator.pubkey, &member.pubkey, true, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let blocked_chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        MuteListEntry::delete(&creator.pubkey, &member.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let unblocked_chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let last_read_message_id = whitenoise
+            .get_last_read_message_id(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(blocked_chat_list.len(), 1);
+        assert_eq!(blocked_chat_list[0].unread_count, 0);
+        assert_eq!(unblocked_chat_list.len(), 1);
+        assert_eq!(unblocked_chat_list[0].unread_count, 1);
+        assert_eq!(last_read_message_id, Some(read_message_id));
     }
 
     #[tokio::test]
