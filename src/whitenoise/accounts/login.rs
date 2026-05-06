@@ -267,6 +267,7 @@ impl Whitenoise {
 
         // Delete the account from the database
         account.delete(&self.shared.database).await?;
+        self.delete_mdk_storage_for_account(pubkey).await?;
 
         // Sync discovery subscriptions with remaining accounts (tears down on last logout)
         if let Err(e) = self.sync_discovery_subscriptions().await {
@@ -329,6 +330,7 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use mdk_sqlite_storage::keyring;
     use nostr_sdk::prelude::*;
 
     use crate::RelayType;
@@ -336,6 +338,7 @@ mod tests {
     use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
+    use crate::whitenoise::{Whitenoise, WhitenoiseConfig};
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -450,14 +453,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_after_delete_all_data() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (whitenoise, data_temp, logs_temp) = create_mock_whitenoise().await;
 
         let account = setup_login_account(&whitenoise).await;
+        let secret_hex = account.1.secret_key().to_secret_hex();
         whitenoise.delete_all_data().await.unwrap();
-        let _acc = whitenoise
-            .login(account.1.secret_key().to_secret_hex())
-            .await
-            .unwrap();
+        drop(whitenoise);
+
+        // After delete_all_data the database pool is closed, so a fresh
+        // instance is required for subsequent logins.
+        let config = WhitenoiseConfig::new(data_temp.path(), logs_temp.path(), "wn.test.relogin");
+        let whitenoise = Whitenoise::new(config).await.unwrap();
+        let _acc = whitenoise.login(secret_hex).await.unwrap();
     }
 
     #[tokio::test]
@@ -878,6 +885,40 @@ mod tests {
         assert!(
             stored_keys_after.is_err(),
             "Key should be removed after logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_removes_mdk_storage_and_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        account.save(&whitenoise.shared.database).await.unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
+
+        let mls_storage_dir =
+            Account::mdk_storage_path(&account.pubkey, &whitenoise.config().data_dir);
+        tokio::fs::create_dir_all(&mls_storage_dir).await.unwrap();
+        tokio::fs::write(mls_storage_dir.join("storage.sqlite"), b"test")
+            .await
+            .unwrap();
+
+        let keyring_service_id = whitenoise.keyring_service_id().to_string();
+        let db_key_id = Account::mdk_db_key_id(&account.pubkey);
+        keyring::get_or_create_db_key(&keyring_service_id, &db_key_id)
+            .expect("Failed to create MDK database key");
+
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        assert!(!mls_storage_dir.exists());
+        assert!(
+            keyring::get_db_key(&keyring_service_id, &db_key_id)
+                .unwrap()
+                .is_none(),
+            "Account logout should remove the account-scoped MDK database key"
         );
     }
 

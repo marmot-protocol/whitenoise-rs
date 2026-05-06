@@ -9,7 +9,7 @@ use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -561,8 +561,8 @@ impl Account {
         data_dir: &Path,
         keyring_service_id: &str,
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
-        let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
-        let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
+        let mls_storage_dir = Self::mdk_storage_path(&pubkey, data_dir);
+        let db_key_id = Self::mdk_db_key_id(&pubkey);
         let storage = {
             let _storage_init_guard = MDK_STORAGE_INIT_LOCK
                 .lock()
@@ -570,6 +570,14 @@ impl Account {
             MdkSqliteStorage::new(mls_storage_dir, keyring_service_id, &db_key_id)?
         };
         Ok(MDK::new(storage))
+    }
+
+    pub(crate) fn mdk_storage_path(pubkey: &PublicKey, data_dir: &Path) -> PathBuf {
+        data_dir.join("mls").join(pubkey.to_hex())
+    }
+
+    pub(crate) fn mdk_db_key_id(pubkey: &PublicKey) -> String {
+        format!("mdk.db.key.{}", pubkey.to_hex())
     }
 }
 
