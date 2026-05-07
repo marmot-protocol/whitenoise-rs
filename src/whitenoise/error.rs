@@ -6,7 +6,7 @@ use crate::{
     whitenoise::{
         accounts::{AccountError, LoginError},
         database::DatabaseError,
-        groups::blossom_error::BlossomError,
+        groups::{RequiredProposal, blossom_error::BlossomError},
         message_aggregator::ProcessingError,
         secrets_store::SecretsStoreError,
         streaming_error::StreamingError,
@@ -194,10 +194,48 @@ pub enum WhitenoiseError {
     #[error("Missing required mls_proposals [{}]", missing.join(", "))]
     MissingMlsProposals { missing: Vec<String> },
 
+    /// The invitee's published key package does not advertise the SelfRemove
+    /// proposal that the existing group's `RequiredCapabilities` mandates.
+    ///
+    /// **Only `add_members_to_group`'s pre-validation produces this variant.**
+    /// `create_group` does not — see [`Self::IncompatibleKeyPackage`] for
+    /// genuine malformations and the `RequiredProposal::SelfRemove` LCD policy
+    /// in `whitenoise::groups::required_proposals` for the silent-downgrade
+    /// outcome.
     #[error(
         "Cannot add this user yet. Their key package was published by an older app version and does not advertise SelfRemove support. Ask them to update White Noise and open the app so it can publish a new key package."
     )]
     KeyPackageMissingSelfRemove { member_pubkey: PublicKey },
+
+    #[error(
+        "upgrade blocked: {} member(s) do not advertise the {proposal:?} proposal",
+        blockers.len()
+    )]
+    CapabilityUpgradeBlocked {
+        proposal: RequiredProposal,
+        blockers: Vec<PublicKey>,
+    },
+
+    /// MDK or our pre-validation rejected an `add_members_to_group` invitee
+    /// because their published key package does not satisfy the group's
+    /// `RequiredCapabilities`.
+    ///
+    /// `member_pubkey` carries the offending member when the rejection comes
+    /// from WhiteNoise's per-member pre-check; it is `None` when the rejection
+    /// comes from MDK's defense-in-depth fallback
+    /// (`mdk_core::Error::InviteeMissingRequiredProposal`), which is a unit
+    /// variant carrying no attribution.
+    #[error(
+        "Group rejected member{}: {reason}",
+        match member_pubkey {
+            Some(pk) => format!(" {pk}"),
+            None => String::new(),
+        }
+    )]
+    GroupRejectedMember {
+        member_pubkey: Option<PublicKey>,
+        reason: String,
+    },
 
     #[error(
         "Cannot add this user yet. Their key package is incompatible with this app version ({reason}). Ask them to update White Noise and open the app so it can publish a new key package."
@@ -258,5 +296,20 @@ pub enum WhitenoiseError {
 impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Self::Internal(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boxed_error_converts_to_internal_error() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("boxed failure"));
+
+        let err = WhitenoiseError::from(boxed);
+
+        assert!(matches!(err, WhitenoiseError::Internal(msg) if msg == "boxed failure"));
     }
 }

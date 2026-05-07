@@ -1,8 +1,11 @@
+use std::ffi::OsStr;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use ::rand::RngCore;
 use nostr_sdk::{PublicKey, RelayUrl};
+use once_cell::sync::OnceCell as SyncOnceCell;
 use tokio::sync::{
     Mutex, OnceCell,
     mpsc::{self, Sender},
@@ -32,6 +35,24 @@ pub mod group_information;
 pub mod groups;
 mod init_timing;
 pub mod key_packages;
+// Platform keyring wrappers are only needed where we install a custom
+// keyring-core default store, plus tests that exercise those wrappers.
+#[cfg(any(
+    test,
+    all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "android"
+        ),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )
+))]
+mod keyring_store;
 pub mod media_files;
 pub mod message_aggregator;
 pub mod message_streaming;
@@ -56,7 +77,7 @@ pub mod utils;
 pub mod zapstore;
 
 use mdk_core::prelude::MDK;
-use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_sqlite_storage::{MdkSqliteStorage, keyring};
 
 use crate::init_tracing;
 use crate::perf_instrument;
@@ -71,9 +92,41 @@ use database::*;
 use error::{Result, WhitenoiseError};
 use event_tracker::WhitenoiseEventTracker;
 use relays::*;
-use secrets_store::SecretsStore;
+use secrets_store::{SecretsStore, SecretsStoreError};
 #[cfg(test)]
 use users::User;
+
+struct KeyringStoreInit {
+    initialized: SyncOnceCell<()>,
+}
+
+impl KeyringStoreInit {
+    const fn new() -> Self {
+        Self {
+            initialized: SyncOnceCell::new(),
+        }
+    }
+
+    fn initialize_with<DefaultStoreExists, InitializeStore>(
+        &self,
+        default_store_exists: DefaultStoreExists,
+        initialize_store: InitializeStore,
+    ) -> Result<()>
+    where
+        DefaultStoreExists: Fn() -> bool,
+        InitializeStore: FnOnce() -> Result<()>,
+    {
+        self.initialized
+            .get_or_try_init(|| {
+                if default_store_exists() {
+                    return Ok(());
+                }
+
+                initialize_store()
+            })
+            .map(|_| ())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct WhitenoiseConfig {
@@ -91,11 +144,19 @@ pub struct WhitenoiseConfig {
     /// to avoid key collisions in the system keyring.
     pub keyring_service_id: String,
 
+    /// Override for the Whitenoise SQLCipher keyring key id; available in test and benchmark builds.
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+    pub database_key_id: Option<String>,
+
     /// Configured discovery relays for the relay-control discovery plane.
     pub discovery_relays: Vec<RelayUrl>,
 }
 
 impl WhitenoiseConfig {
+    fn normalize_keyring_service_id(&mut self) {
+        self.keyring_service_id = self.keyring_service_id.trim().to_string();
+    }
+
     pub fn new(data_dir: &Path, logs_dir: &Path, keyring_service_id: &str) -> Self {
         let env_suffix = if cfg!(debug_assertions) {
             "dev"
@@ -110,6 +171,8 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: None, // Use default MessageAggregator configuration
             keyring_service_id: keyring_service_id.to_string(),
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+            database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
     }
@@ -134,12 +197,20 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: Some(aggregator_config),
             keyring_service_id: keyring_service_id.to_string(),
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+            database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
     }
 
     pub fn with_discovery_relays(mut self, discovery_relays: Vec<RelayUrl>) -> Self {
         self.discovery_relays = discovery_relays;
+        self
+    }
+
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+    pub fn with_database_key_id(mut self, database_key_id: &str) -> Self {
+        self.database_key_id = Some(database_key_id.to_string());
         self
     }
 }
@@ -179,7 +250,6 @@ static GLOBAL_WHITENOISE: OnceCell<Arc<Whitenoise>> = OnceCell::const_new();
 /// standard [`WhitenoiseEventTracker`] until inside `Arc::new_cyclic`, where
 /// the `Weak<Whitenoise>` is available.
 struct UseWhitenoiseEventTracker;
-
 struct WhitenoiseComponents {
     event_tracker: UseWhitenoiseEventTracker,
     secrets_store: SecretsStore,
@@ -252,7 +322,7 @@ impl Whitenoise {
         let mut pools = Vec::with_capacity(pubkeys.len());
         for pubkey in pubkeys {
             let path = accounts_dir.join(format!("{pubkey}.db"));
-            let db = Database::open_without_migrations(path).await?;
+            let db = Database::open_without_migrations(path, None).await?;
             pools.push((db.pool, pubkey));
         }
 
@@ -265,10 +335,11 @@ impl Whitenoise {
     }
 
     fn from_components(
-        config: WhitenoiseConfig,
+        mut config: WhitenoiseConfig,
         database: Arc<Database>,
         components: WhitenoiseComponents,
     ) -> Arc<Self> {
+        config.normalize_keyring_service_id();
         let mut session_salt = [0u8; 16];
         ::rand::rng().fill_bytes(&mut session_salt);
         let discovery_relays = config.discovery_relays.clone();
@@ -345,96 +416,239 @@ impl Whitenoise {
     /// binaries require real platform keychain entitlements.
     ///
     /// This function is safe to call multiple times; only the first call has
-    /// an effect.
-    fn initialize_keyring_store() {
-        static KEYRING_STORE_INIT: OnceLock<()> = OnceLock::new();
-        KEYRING_STORE_INIT.get_or_init(|| {
-            // Use the mock (in-memory) store in test, integration-test, and
-            // benchmark-test builds so that `cargo test` and unsigned `cargo run`
-            // binaries never require real platform keychain entitlements.
-            // The real store is reserved for production builds (no feature flags).
-            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
-            {
-                keyring_core::set_default_store(
-                    keyring_core::mock::Store::new()
-                        .expect("Failed to create mock credential store"),
-                );
-            }
+    /// an effect. If another crate or host application has already configured
+    /// a `keyring-core` default store, that store is preserved.
+    fn initialize_keyring_store() -> Result<()> {
+        static KEYRING_STORE_INIT: KeyringStoreInit = KeyringStoreInit::new();
+        KEYRING_STORE_INIT.initialize_with(
+            || keyring_core::get_default_store().is_some(),
+            Self::initialize_platform_keyring_store,
+        )
+    }
 
-            #[cfg(all(
-                not(test),
-                not(feature = "integration-tests"),
-                not(feature = "benchmark-tests")
+    fn initialize_platform_keyring_store() -> Result<()> {
+        // Use the mock (in-memory) store in test, integration-test, and
+        // benchmark-test builds so that `cargo test` and unsigned `cargo run`
+        // binaries never require real platform keychain entitlements.
+        // The real store is reserved for production builds (no feature flags).
+        #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+        {
+            Self::set_default_keyring_store(keyring_core::mock::Store::new(), "mock")?;
+        }
+
+        #[cfg(all(
+            not(test),
+            not(feature = "integration-tests"),
+            not(feature = "benchmark-tests")
+        ))]
+        {
+            // CLI builds use the regular Keychain store on all macOS architectures.
+            // The `cli` feature gates the `wn`/`wnd` binaries, which are unsigned
+            // and cannot use the Protected Data store (it requires a provisioning
+            // profile with application-groups entitlement).
+            #[cfg(all(target_os = "macos", feature = "cli"))]
+            {
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::keychain::Store::new(),
+                    "macOS Keychain",
+                )?;
+            }
+            // Intel Macs (non-CLI): use the regular Keychain store.
+            // Protected Data store is not available on x86_64.
+            #[cfg(all(target_os = "macos", target_arch = "x86_64", not(feature = "cli")))]
+            {
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::keychain::Store::new(),
+                    "macOS Keychain",
+                )?;
+            }
+            // Apple Silicon (non-CLI): use the Protected Data store (audit #630).
+            // Requires code-signing with a provisioning profile that includes the
+            // com.apple.security.application-groups entitlement. The Flutter app
+            // build pipeline satisfies this.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", not(feature = "cli")))]
+            {
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::protected::Store::new(),
+                    "macOS protected-data",
+                )?;
+            }
+            #[cfg(target_os = "ios")]
+            {
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::protected::Store::new(),
+                    "iOS protected-data",
+                )?;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                Self::set_default_keyring_store(
+                    windows_native_keyring_store::Store::new(),
+                    "Windows",
+                )?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let primary = Self::create_secret_service_keyring_store("Linux Secret Service")?;
+                let store = Self::create_legacy_migration_keyring_store(
+                    primary,
+                    linux_keyutils_keyring_store::Store::new(),
+                    "legacy Linux keyutils",
+                );
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
             ))]
             {
-                // CLI builds use the regular Keychain store on all macOS architectures.
-                // The `cli` feature gates the `wn`/`wnd` binaries, which are unsigned
-                // and cannot use the Protected Data store (it requires a provisioning
-                // profile with application-groups entitlement).
-                #[cfg(all(target_os = "macos", feature = "cli"))]
-                {
-                    let store = apple_native_keyring_store::keychain::Store::new()
-                        .expect("Failed to create macOS Keychain credential store");
-                    keyring_core::set_default_store(store);
-                }
-                // Intel Macs (non-CLI): use the regular Keychain store.
-                // Protected Data store is not available on x86_64.
-                #[cfg(all(target_os = "macos", target_arch = "x86_64", not(feature = "cli")))]
-                {
-                    let store = apple_native_keyring_store::keychain::Store::new()
-                        .expect("Failed to create macOS Keychain credential store");
-                    keyring_core::set_default_store(store);
-                }
-                // Apple Silicon (non-CLI): use the Protected Data store (audit #630).
-                // Requires code-signing with a provisioning profile that includes the
-                // com.apple.security.application-groups entitlement. The Flutter app
-                // build pipeline satisfies this.
-                #[cfg(all(target_os = "macos", target_arch = "aarch64", not(feature = "cli")))]
-                {
-                    let store = apple_native_keyring_store::protected::Store::new()
-                        .expect("Failed to create macOS protected-data credential store");
-                    keyring_core::set_default_store(store);
-                }
-                #[cfg(target_os = "ios")]
-                {
-                    let store = apple_native_keyring_store::protected::Store::new()
-                        .expect("Failed to create iOS protected-data credential store");
-                    keyring_core::set_default_store(store);
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let store = windows_native_keyring_store::Store::new()
-                        .expect("Failed to create Windows credential store");
-                    keyring_core::set_default_store(store);
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    let store = linux_keyutils_keyring_store::Store::new()
-                        .expect("Failed to create Linux keyutils credential store");
-                    keyring_core::set_default_store(store);
-                }
-                #[cfg(target_os = "android")]
-                {
-                    let store = android_native_keyring_store::Store::new()
-                        .expect("Failed to create Android credential store");
-                    keyring_core::set_default_store(store);
-                }
-                #[cfg(not(any(
-                    target_os = "macos",
-                    target_os = "ios",
-                    target_os = "windows",
-                    target_os = "linux",
-                    target_os = "android",
-                )))]
-                {
-                    compile_error!(
-                        "No keyring-core credential store available for this target OS. \
-                         Add a platform-specific store crate to Cargo.toml and handle it \
-                         in initialize_keyring_store()."
-                    );
-                }
+                let store = Self::create_secret_service_keyring_store("BSD Secret Service")?;
+                keyring_core::set_default_store(store);
             }
-        });
+            #[cfg(target_os = "android")]
+            {
+                let primary = Self::create_keyring_store(
+                    android_native_keyring_store::Store::new(),
+                    "Android",
+                )?;
+                let store = Self::create_legacy_migration_keyring_store(
+                    primary,
+                    android_native_keyring_store::LegacyStore::from_ndk_context(),
+                    "legacy Android",
+                );
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "windows",
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly",
+                target_os = "android",
+            )))]
+            {
+                compile_error!(
+                    "No keyring-core credential store available for this target OS. \
+                     Add a platform-specific store crate to Cargo.toml and handle it \
+                     in initialize_keyring_store()."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn create_keyring_store<S>(
+        store: keyring_core::Result<Arc<S>>,
+        store_name: &str,
+    ) -> Result<Arc<keyring_core::CredentialStore>>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    {
+        let store = store.map_err(|e| {
+            WhitenoiseError::SecretsStore(SecretsStoreError::KeyringUnavailable(format!(
+                "Failed to create {store_name} credential store: {e}"
+            )))
+        })?;
+        Ok(store)
+    }
+
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ),
+        not(test),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    ))]
+    fn create_secret_service_keyring_store(
+        store_name: &str,
+    ) -> Result<Arc<keyring_core::CredentialStore>> {
+        Self::create_targeted_secret_service_keyring_store(
+            zbus_secret_service_keyring_store::Store::new(),
+            store_name,
+        )
+    }
+
+    #[cfg(any(
+        test,
+        all(
+            any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ),
+            not(feature = "integration-tests"),
+            not(feature = "benchmark-tests")
+        )
+    ))]
+    fn create_targeted_secret_service_keyring_store<S>(
+        store: keyring_core::Result<Arc<S>>,
+        store_name: &str,
+    ) -> Result<Arc<keyring_core::CredentialStore>>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    {
+        let store = Self::create_keyring_store(store, store_name)?;
+        Ok(keyring_store::TargetedCredentialStore::new(
+            store,
+            keyring_store::SECRET_SERVICE_TARGET,
+        ))
+    }
+
+    #[cfg(any(
+        test,
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(feature = "integration-tests"),
+            not(feature = "benchmark-tests")
+        )
+    ))]
+    fn create_legacy_migration_keyring_store<S, E>(
+        primary: Arc<keyring_core::CredentialStore>,
+        legacy: core::result::Result<Arc<S>, E>,
+        legacy_store_name: &str,
+    ) -> Arc<keyring_core::CredentialStore>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+        E: Into<keyring_core::Error>,
+    {
+        let legacy = legacy.map_err(Into::into);
+        match Self::create_keyring_store(legacy, legacy_store_name) {
+            Ok(legacy) => keyring_store::LegacyMigrationCredentialStore::new(primary, legacy),
+            Err(err) => {
+                tracing::warn!(
+                    target: "whitenoise::keyring_store",
+                    error = %err,
+                    store = legacy_store_name,
+                    "Failed to create legacy keyring store; continuing with primary store only"
+                );
+                primary
+            }
+        }
+    }
+
+    fn set_default_keyring_store<S>(
+        store: keyring_core::Result<Arc<S>>,
+        store_name: &str,
+    ) -> Result<()>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    {
+        let store = Self::create_keyring_store(store, store_name)?;
+        keyring_core::set_default_store(store);
+        Ok(())
     }
 
     /// Initializes the mock keyring store for testing environments.
@@ -455,7 +669,7 @@ impl Whitenoise {
     /// ```
     #[cfg(any(test, feature = "integration-tests"))]
     pub fn initialize_mock_keyring_store() {
-        Self::initialize_keyring_store();
+        Self::initialize_keyring_store().expect("Failed to initialize mock keyring store");
     }
 
     /// Creates an MDK instance for the given account public key using this
@@ -464,11 +678,7 @@ impl Whitenoise {
         &self,
         pubkey: PublicKey,
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
-        Account::create_mdk(
-            pubkey,
-            &self.shared.config.data_dir,
-            &self.shared.config.keyring_service_id,
-        )
+        Account::create_mdk(pubkey, &self.config().data_dir, self.keyring_service_id())
     }
 
     /// Constructs a fully-initialized `Whitenoise` instance and returns it
@@ -484,20 +694,21 @@ impl Whitenoise {
     /// handlers receive their own `Arc<Whitenoise>` clones internally via the
     /// weak self-reference stamped at construction.
     #[perf_instrument("whitenoise")]
-    pub async fn new(config: WhitenoiseConfig) -> Result<Arc<Self>> {
+    pub async fn new(mut config: WhitenoiseConfig) -> Result<Arc<Self>> {
         init_timing::start();
 
-        // Ensure keyring-core has a credential store before any MDK or
-        // SecretsStore operations attempt to create or read keyring entries.
-        Self::initialize_keyring_store();
-
         // Validate keyring_service_id is not empty or whitespace
-        let keyring_service_id = config.keyring_service_id.trim().to_string();
-        if keyring_service_id.is_empty() {
+        config.normalize_keyring_service_id();
+        if config.keyring_service_id.is_empty() {
             return Err(WhitenoiseError::Configuration(
                 "keyring_service_id cannot be empty or whitespace".to_string(),
             ));
         }
+        let keyring_service_id = config.keyring_service_id.clone();
+
+        // Ensure keyring-core has a credential store before any MDK or
+        // SecretsStore operations attempt to create or read keyring entries.
+        Self::initialize_keyring_store()?;
 
         // Create event processing channels
         let (event_sender, event_receiver) = mpsc::channel(2000);
@@ -538,20 +749,28 @@ impl Whitenoise {
 
         init_timing::record("directories_and_logging");
 
-        // Open shared without running migrations yet. The unified migration
-        // timeline contains global drops (v21–v26) that depend on per-account
-        // local copies (v15–v20) running first. If we let `Database::new` walk
-        // the timeline now (with `account = None`), locals get skipped and the
-        // drops fire on shared rows that were never copied to per-account DBs
-        // — losing every existing account's data on the first 18c boot.
-        //
-        // Instead: open shared and every persisted account's DB unmigrated,
-        // then call `MIGRATOR.run_all` so the framework walks one version at
-        // a time, applying each local to every account in lockstep with its
-        // surrounding globals. This is the X→A→Y ordering the unified
-        // timeline was designed for.
-        let database =
-            Arc::new(Database::open_without_migrations(data_dir.join("whitenoise.sqlite")).await?);
+        // Open shared database with SQLCipher encryption but without running
+        // migrations yet. The unified migration timeline contains global drops
+        // (v21-v26) that depend on per-account local copies (v15-v20) running
+        // first. We open encrypted without migrations, then call
+        // `MIGRATOR.run_all` so the framework walks one version at a time,
+        // applying each local to every account in lockstep with its surrounding
+        // globals.
+        let database_path = data_dir.join("whitenoise.sqlite");
+        #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+        let database = Arc::new(match config.database_key_id.as_deref() {
+            Some(database_key_id) => {
+                Database::new_encrypted_with_key_id(
+                    database_path,
+                    &keyring_service_id,
+                    database_key_id,
+                )
+                .await?
+            }
+            None => Database::new_encrypted(database_path, &keyring_service_id).await?,
+        });
+        #[cfg(not(any(test, feature = "integration-tests", feature = "benchmark-tests")))]
+        let database = Arc::new(Database::new_encrypted(database_path, &keyring_service_id).await?);
 
         let account_pools = Self::enumerate_account_pools(&database, &data_dir).await?;
         crate::whitenoise::database::rust_migrations::MIGRATOR
@@ -797,14 +1016,31 @@ impl Whitenoise {
         // Tear down shared relay-control subscriptions (group, ephemeral, telemetry)
         self.shared.relay_control.shutdown_all().await;
 
-        // Remove database (accounts and media) data
-        self.shared.database.delete_all_data().await?;
+        // Remove database files and key material.
+        let accounts = Account::all(&self.shared.database).await?;
+        let database_key_id = self.database_key_id().to_string();
+        let close_result = self.shared.database.close_and_delete_files().await;
+        let key_delete_result = keyring::delete_db_key(self.keyring_service_id(), &database_key_id);
+
+        match (close_result, key_delete_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(e), Ok(())) => return Err(e.into()),
+            (Ok(()), Err(e)) => return Err(e.into()),
+            (Err(close_error), Err(key_error)) => {
+                return Err(WhitenoiseError::Internal(format!(
+                    "Failed to delete database files ({close_error}) and app database key ({key_error})"
+                )));
+            }
+        }
 
         // Remove storage artifacts (media cache, etc.)
         self.shared.storage.wipe_all().await?;
 
         // Remove MLS related data
         let mls_dir = self.shared.config.data_dir.join("mls");
+        let orphaned_mdk_database_key_pubkeys = self
+            .collect_orphaned_mdk_storage_pubkeys(&accounts, &mls_dir)
+            .await?;
         if mls_dir.exists() {
             tracing::debug!(
                 target: "whitenoise::delete_all_data",
@@ -815,6 +1051,8 @@ impl Whitenoise {
         }
         // Always recreate the empty MLS directory
         tokio::fs::create_dir_all(&mls_dir).await?;
+        self.delete_mdk_database_keys_for_accounts(&accounts)?;
+        self.delete_mdk_database_keys_for_pubkeys(&orphaned_mdk_database_key_pubkeys)?;
 
         // Remove logs
         if self.shared.config.logs_dir.exists() {
@@ -830,6 +1068,148 @@ impl Whitenoise {
         }
 
         Ok(())
+    }
+
+    async fn delete_mdk_storage_for_account(&self, pubkey: &PublicKey) -> Result<()> {
+        let mls_storage_path = Account::mdk_storage_path(pubkey, &self.config().data_dir);
+        match tokio::fs::metadata(&mls_storage_path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                tokio::fs::remove_dir_all(mls_storage_path).await?;
+            }
+            Ok(_) => {
+                tokio::fs::remove_file(mls_storage_path).await?;
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if e.kind() == ErrorKind::NotADirectory => {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    account_pubkey = %pubkey,
+                    path = ?mls_storage_path,
+                    reason = "path component is not a directory",
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.delete_mdk_database_key_for_pubkey(pubkey)
+    }
+
+    fn delete_mdk_database_keys_for_accounts(&self, accounts: &[Account]) -> Result<()> {
+        let pubkeys = accounts
+            .iter()
+            .map(|account| account.pubkey)
+            .collect::<Vec<_>>();
+        self.delete_mdk_database_keys_for_pubkeys(&pubkeys)
+    }
+
+    fn delete_mdk_database_keys_for_pubkeys(&self, pubkeys: &[PublicKey]) -> Result<()> {
+        Self::delete_mdk_database_keys(pubkeys, |pubkey| {
+            self.delete_mdk_database_key_for_pubkey(pubkey)
+        })
+    }
+
+    fn delete_mdk_database_keys<F>(pubkeys: &[PublicKey], mut delete: F) -> Result<()>
+    where
+        F: FnMut(&PublicKey) -> Result<()>,
+    {
+        let mut first_error = None;
+
+        for pubkey in pubkeys {
+            if let Err(e) = delete(pubkey) {
+                tracing::warn!(
+                    target: "whitenoise::delete_all_data",
+                    account_pubkey = %pubkey,
+                    error = %e,
+                    reason = "failed to delete MDK database key",
+                );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn mdk_storage_pubkey_from_entry_name(file_name: &OsStr, path: &Path) -> Option<PublicKey> {
+        let Some(file_name) = file_name.to_str() else {
+            tracing::warn!(
+                target: "whitenoise::delete_all_data",
+                path = ?path,
+                reason = "non-UTF-8 MLS storage filename",
+            );
+            return None;
+        };
+
+        let Ok(pubkey) = file_name.parse::<PublicKey>() else {
+            tracing::debug!(
+                target: "whitenoise::delete_all_data",
+                path = ?path,
+                reason = "non-account MLS storage entry",
+            );
+            return None;
+        };
+
+        Some(pubkey)
+    }
+
+    async fn collect_orphaned_mdk_storage_pubkeys(
+        &self,
+        accounts: &[Account],
+        mls_dir: &Path,
+    ) -> Result<Vec<PublicKey>> {
+        let mut pubkeys = Vec::new();
+        let mut entries = match tokio::fs::read_dir(mls_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(pubkeys),
+            Err(e) => return Err(e.into()),
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_name = entry.file_name();
+            let Some(pubkey) = Self::mdk_storage_pubkey_from_entry_name(&file_name, &entry.path())
+            else {
+                continue;
+            };
+
+            if !accounts.iter().any(|account| account.pubkey == pubkey)
+                && !pubkeys.contains(&pubkey)
+            {
+                pubkeys.push(pubkey);
+            }
+        }
+
+        Ok(pubkeys)
+    }
+
+    fn delete_mdk_database_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
+        let db_key_id = Account::mdk_db_key_id(pubkey);
+        keyring::delete_db_key(self.keyring_service_id(), &db_key_id)?;
+        Ok(())
+    }
+
+    pub(crate) fn keyring_service_id(&self) -> &str {
+        &self.shared.config.keyring_service_id
+    }
+
+    fn database_key_id(&self) -> &str {
+        // The database_key_id override field only exists in test,
+        // integration-test, and benchmark builds; production always uses the
+        // stable app database key id.
+        #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+        {
+            self.config()
+                .database_key_id
+                .as_deref()
+                .unwrap_or(WHITENOISE_DB_KEY_ID)
+        }
+
+        #[cfg(not(any(test, feature = "integration-tests", feature = "benchmark-tests")))]
+        {
+            WHITENOISE_DB_KEY_ID
+        }
     }
 
     /// Gracefully shuts down all scheduled tasks.
@@ -884,6 +1264,10 @@ impl Whitenoise {
     #[cfg(feature = "integration-tests")]
     #[perf_instrument("whitenoise")]
     pub async fn wipe_database(&self) -> Result<()> {
+        // Integration scenarios use this row-level reset while keeping the
+        // same Whitenoise instance, pool, and database key alive. Full app
+        // wipes must use delete_all_data so database files and keyring entries
+        // are removed together.
         self.shared.database.delete_all_data().await?;
         Ok(())
     }
@@ -898,6 +1282,8 @@ impl Whitenoise {
 
 #[cfg(test)]
 pub mod test_utils {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::group_information::GroupInformation;
@@ -958,13 +1344,16 @@ pub mod test_utils {
 
     // Test configuration and setup helpers
     pub(crate) fn create_test_config() -> (WhitenoiseConfig, TempDir, TempDir) {
+        static TEST_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
+        let id = TEST_CONFIG_ID.fetch_add(1, Ordering::SeqCst);
         let data_temp_dir = TempDir::new().expect("Failed to create temp data dir");
         let logs_temp_dir = TempDir::new().expect("Failed to create temp logs dir");
         let config = WhitenoiseConfig::new(
             data_temp_dir.path(),
             logs_temp_dir.path(),
-            "com.whitenoise.test",
+            &format!("com.whitenoise.test.{id}"),
         )
+        .with_database_key_id(&format!("test.whitenoise.db.key.{id}"))
         .with_discovery_relays(Relay::urls(&Relay::defaults()));
         (config, data_temp_dir, logs_temp_dir)
     }
@@ -1454,9 +1843,201 @@ pub mod test_utils {
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use keyring_core::api::CredentialStoreApi;
+
     use super::test_utils::*;
     use super::*;
     use database::aggregated_messages::PaginationOptions;
+
+    struct CustomLegacyStoreCreationError;
+
+    impl From<CustomLegacyStoreCreationError> for keyring_core::Error {
+        fn from(_: CustomLegacyStoreCreationError) -> Self {
+            keyring_core::Error::Invalid(
+                "legacy Android".to_string(),
+                "custom missing NDK context".to_string(),
+            )
+        }
+    }
+
+    #[test]
+    fn keyring_store_init_retries_after_failed_attempt() {
+        let init = KeyringStoreInit::new();
+        let attempts = AtomicUsize::new(0);
+
+        let first = init.initialize_with(
+            || false,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(SecretsStoreError::KeyringUnavailable("transient failure".to_string()).into())
+            },
+        );
+
+        assert!(matches!(
+            first,
+            Err(WhitenoiseError::SecretsStore(
+                SecretsStoreError::KeyringUnavailable(_)
+            ))
+        ));
+
+        let second = init.initialize_with(
+            || false,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(second.is_ok());
+
+        let third = init.initialize_with(|| false, || panic!("initializer ran after success"));
+
+        assert!(third.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn keyring_store_init_preserves_existing_default_store() {
+        let init = KeyringStoreInit::new();
+        let attempts = AtomicUsize::new(0);
+
+        // Host apps may configure keyring-core before Whitenoise starts. In
+        // that case initialization should preserve the existing default store.
+        let result = init.initialize_with(
+            || true,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_keyring_store_maps_creation_error() {
+        let result = Whitenoise::create_keyring_store::<keyring_core::mock::Store>(
+            Err(keyring_core::Error::Invalid(
+                "store".to_string(),
+                "boom".to_string(),
+            )),
+            "test",
+        );
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::SecretsStore(
+                SecretsStoreError::KeyringUnavailable(msg)
+            ))
+                if msg.contains("Failed to create test credential store")
+                    && msg.contains("boom")
+        ));
+    }
+
+    #[test]
+    fn secret_service_keyring_store_wraps_store_with_target() {
+        let store = Whitenoise::create_targeted_secret_service_keyring_store(
+            keyring_core::mock::Store::new(),
+            "test Secret Service",
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .as_any()
+                .is::<keyring_store::TargetedCredentialStore>()
+        );
+        assert!(format!("{store:?}").contains(keyring_store::SECRET_SERVICE_TARGET));
+    }
+
+    #[test]
+    fn secret_service_keyring_store_maps_creation_error() {
+        let result =
+            Whitenoise::create_targeted_secret_service_keyring_store::<keyring_core::mock::Store>(
+                Err(keyring_core::Error::Invalid(
+                    "Secret Service".to_string(),
+                    "missing session bus".to_string(),
+                )),
+                "test Secret Service",
+            );
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::SecretsStore(
+                SecretsStoreError::KeyringUnavailable(msg)
+            ))
+                if msg.contains("Failed to create test Secret Service credential store")
+                    && msg.contains("missing session bus")
+        ));
+    }
+
+    #[test]
+    fn legacy_migration_keyring_store_falls_back_to_primary_when_legacy_store_creation_fails() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap()
+            .set_secret(b"primary-db-key")
+            .unwrap();
+
+        let store = Whitenoise::create_legacy_migration_keyring_store::<
+            keyring_core::mock::Store,
+            keyring_core::Error,
+        >(
+            primary,
+            Err(keyring_core::Error::Invalid(
+                "legacy Android".to_string(),
+                "missing NDK context".to_string(),
+            )),
+            "legacy Android",
+        );
+
+        assert_eq!(
+            store
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"primary-db-key"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_keyring_store_falls_back_to_primary_when_custom_legacy_error_converts() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap()
+            .set_secret(b"primary-db-key")
+            .unwrap();
+
+        let store = Whitenoise::create_legacy_migration_keyring_store::<
+            keyring_core::mock::Store,
+            CustomLegacyStoreCreationError,
+        >(
+            primary,
+            Err(CustomLegacyStoreCreationError),
+            "legacy Android",
+        );
+
+        assert_eq!(
+            store
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"primary-db-key"
+        );
+    }
 
     // Configuration Tests
     mod config_tests {
@@ -1509,6 +2090,17 @@ mod tests {
                 config.discovery_relays,
                 DiscoveryPlaneConfig::curated_default_relays()
             );
+        }
+
+        #[test]
+        fn test_keyring_service_id_normalization_trims_whitespace() {
+            let data_dir = std::path::Path::new("/test/data");
+            let logs_dir = std::path::Path::new("/test/logs");
+            let mut config = WhitenoiseConfig::new(data_dir, logs_dir, "  com.test.app  ");
+
+            config.normalize_keyring_service_id();
+
+            assert_eq!(config.keyring_service_id, "com.test.app");
         }
 
         #[tokio::test]
@@ -1599,6 +2191,8 @@ mod tests {
 
     // Data Management Tests
     mod data_management_tests {
+        use tempfile::TempDir;
+
         use super::*;
 
         #[tokio::test]
@@ -1606,6 +2200,8 @@ mod tests {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
             // Create test files in the whitenoise directories
+            let database_path = whitenoise.shared.database.path.clone();
+            let database_key_id = whitenoise.database_key_id().to_string();
             let test_data_file = whitenoise.config().data_dir.join("test_data.txt");
             let test_log_file = whitenoise.config().logs_dir.join("test_log.txt");
             tokio::fs::write(&test_data_file, "test data")
@@ -1630,17 +2226,28 @@ mod tests {
                 .filter_map(|e| e.ok())
                 .collect();
             assert_eq!(cache_entries.len(), 1);
+            keyring::get_or_create_db_key(
+                &whitenoise.config().keyring_service_id,
+                &database_key_id,
+            )
+            .expect("Failed to create app database key");
+            assert!(
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &database_key_id)
+                    .unwrap()
+                    .is_some()
+            );
 
             // Delete all data
             let result = whitenoise.delete_all_data().await;
             assert!(result.is_ok());
 
             // Verify cleanup
+            assert!(!database_path.exists());
             assert!(
-                Account::all(&whitenoise.shared.database)
-                    .await
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &database_key_id)
                     .unwrap()
-                    .is_empty()
+                    .is_none(),
+                "App wipe should remove the app database key"
             );
             assert!(!test_log_file.exists());
 
@@ -1652,6 +2259,245 @@ mod tests {
             let mls_dir = whitenoise.config().data_dir.join("mls");
             assert!(mls_dir.exists());
             assert!(mls_dir.is_dir());
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_delete_all_data_removes_app_database_key_when_file_delete_fails() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let database_path = whitenoise.shared.database.path.clone();
+            let lock_path = database_path.with_file_name(format!(
+                "{}.encryption.lock",
+                database_path.file_name().unwrap().to_string_lossy()
+            ));
+            let database_key_id = whitenoise.database_key_id().to_string();
+
+            keyring::get_or_create_db_key(
+                &whitenoise.config().keyring_service_id,
+                &database_key_id,
+            )
+            .expect("Failed to create app database key");
+            std::fs::create_dir(&lock_path).unwrap();
+
+            let result = whitenoise.delete_all_data().await;
+
+            assert!(result.is_err());
+            assert!(
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &database_key_id)
+                    .unwrap()
+                    .is_none(),
+                "App wipe should attempt key deletion even when database file deletion fails"
+            );
+        }
+
+        #[test]
+        fn test_normalize_keyring_service_id_trims_whitespace() {
+            let temp = TempDir::new().expect("Failed to create temp directory");
+            let mut config = WhitenoiseConfig::new(temp.path(), temp.path(), "  padded  ");
+            config.normalize_keyring_service_id();
+            assert_eq!(config.keyring_service_id, "padded");
+        }
+
+        #[tokio::test]
+        async fn test_construction_normalizes_keyring_service_id() {
+            Whitenoise::initialize_mock_keyring_store();
+            let temp = TempDir::new().expect("Failed to create temp directory");
+            let config = WhitenoiseConfig::new(temp.path(), temp.path(), "  padded  ");
+            let whitenoise = Whitenoise::new(config).await.unwrap();
+            assert_eq!(whitenoise.keyring_service_id(), "padded");
+        }
+
+        #[tokio::test]
+        async fn test_delete_all_data_removes_mdk_database_keys() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, _keys) = create_test_account(&whitenoise).await;
+            account.save(&whitenoise.shared.database).await.unwrap();
+
+            let db_key_id = Account::mdk_db_key_id(&account.pubkey);
+            keyring::get_or_create_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                .expect("Failed to create MDK database key");
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_some()
+            );
+
+            whitenoise.delete_all_data().await.unwrap();
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_none(),
+                "App wipe should remove account-scoped MDK database keys"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_all_data_removes_orphaned_mdk_database_keys_from_storage_dirs() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let orphan_pubkey = create_test_keys().public_key();
+            let orphan_storage_dir =
+                Account::mdk_storage_path(&orphan_pubkey, &whitenoise.config().data_dir);
+            let db_key_id = Account::mdk_db_key_id(&orphan_pubkey);
+
+            tokio::fs::create_dir_all(&orphan_storage_dir)
+                .await
+                .unwrap();
+            keyring::get_or_create_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                .expect("Failed to create orphaned MDK database key");
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_some()
+            );
+
+            whitenoise.delete_all_data().await.unwrap();
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!orphan_storage_dir.exists());
+        }
+
+        #[tokio::test]
+        async fn test_collect_orphaned_mdk_storage_pubkeys_handles_missing_and_invalid_entries() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let account_pubkey = create_test_keys().public_key();
+            let orphan_pubkey = create_test_keys().public_key();
+            let mls_dir = whitenoise.config().data_dir.join("scan_mls");
+            let missing_dir = whitenoise.config().data_dir.join("missing_mls");
+            let not_a_dir = whitenoise.config().data_dir.join("mls-file");
+            let accounts = vec![
+                Account::new_external(&whitenoise, account_pubkey)
+                    .await
+                    .unwrap(),
+            ];
+
+            let missing = whitenoise
+                .collect_orphaned_mdk_storage_pubkeys(&accounts, &missing_dir)
+                .await
+                .unwrap();
+            assert!(missing.is_empty());
+
+            tokio::fs::write(&not_a_dir, "not a directory")
+                .await
+                .unwrap();
+            assert!(
+                whitenoise
+                    .collect_orphaned_mdk_storage_pubkeys(&accounts, &not_a_dir)
+                    .await
+                    .is_err()
+            );
+
+            tokio::fs::create_dir_all(mls_dir.join(account_pubkey.to_string()))
+                .await
+                .unwrap();
+            tokio::fs::create_dir_all(mls_dir.join(orphan_pubkey.to_string()))
+                .await
+                .unwrap();
+            tokio::fs::write(mls_dir.join("not-a-pubkey"), "ignored")
+                .await
+                .unwrap();
+
+            let found = whitenoise
+                .collect_orphaned_mdk_storage_pubkeys(&accounts, &mls_dir)
+                .await
+                .unwrap();
+
+            assert_eq!(found, vec![orphan_pubkey]);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_mdk_storage_pubkey_from_entry_name_skips_non_utf8_and_invalid_names() {
+            let orphan_pubkey = create_test_keys().public_key();
+            let non_utf8_name = OsString::from_vec(vec![0xff, b'm', b'd', b'k']);
+
+            assert_eq!(
+                Whitenoise::mdk_storage_pubkey_from_entry_name(
+                    non_utf8_name.as_os_str(),
+                    Path::new("non-utf8")
+                ),
+                None
+            );
+            assert_eq!(
+                Whitenoise::mdk_storage_pubkey_from_entry_name(
+                    OsStr::new("not-a-pubkey"),
+                    Path::new("invalid")
+                ),
+                None
+            );
+            assert_eq!(
+                Whitenoise::mdk_storage_pubkey_from_entry_name(
+                    OsStr::new(&orphan_pubkey.to_string()),
+                    Path::new("valid")
+                ),
+                Some(orphan_pubkey)
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_mdk_storage_for_account_treats_not_a_directory_as_cleanup_complete() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = create_test_keys().public_key();
+            let mls_dir = whitenoise.config().data_dir.join("mls");
+            let db_key_id = Account::mdk_db_key_id(&pubkey);
+
+            let _ = tokio::fs::remove_dir_all(&mls_dir).await;
+            tokio::fs::write(&mls_dir, "not a directory").await.unwrap();
+            keyring::get_or_create_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                .expect("Failed to create MDK database key");
+
+            whitenoise
+                .delete_mdk_storage_for_account(&pubkey)
+                .await
+                .unwrap();
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_delete_mdk_storage_for_account_propagates_unexpected_metadata_errors() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = create_test_keys().public_key();
+            let mls_dir = whitenoise.config().data_dir.join("mls");
+
+            tokio::fs::create_dir_all(&mls_dir).await.unwrap();
+            std::fs::set_permissions(&mls_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let result = whitenoise.delete_mdk_storage_for_account(&pubkey).await;
+
+            std::fs::set_permissions(&mls_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_delete_mdk_database_keys_continues_after_delete_error() {
+            let first_pubkey = create_test_keys().public_key();
+            let second_pubkey = create_test_keys().public_key();
+            let pubkeys = vec![first_pubkey, second_pubkey];
+            let mut attempted_pubkeys = Vec::new();
+
+            let result = Whitenoise::delete_mdk_database_keys(&pubkeys, |pubkey| {
+                attempted_pubkeys.push(*pubkey);
+                if *pubkey == first_pubkey {
+                    return Err(WhitenoiseError::Internal("delete failed".to_string()));
+                }
+
+                Ok(())
+            });
+
+            assert!(result.is_err());
+            assert_eq!(attempted_pubkeys, pubkeys);
         }
     }
 

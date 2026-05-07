@@ -10,6 +10,7 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId, RequiredProposal};
 use crate::whitenoise::relays::Relay;
 
 /// The ciphersuite currently required by Marmot key package tags.
@@ -21,8 +22,23 @@ pub(crate) const MLS_KEY_PACKAGE_KIND: Kind = Kind::Custom(30443);
 /// Legacy Nostr event kind for MLS KeyPackage events.
 pub(crate) const MLS_KEY_PACKAGE_KIND_LEGACY: Kind = Kind::Custom(443);
 
-/// Required extension IDs that must appear in `mls_extensions` tags.
-const REQUIRED_MLS_EXTENSION_TAGS: [&str; 2] = ["0x000a", "0xf2ee"];
+/// The single Marmot-identity extension that every key package must
+/// advertise on the `mls_extensions` tag. The codepoint matches
+/// [`mdk_core`'s `NOSTR_GROUP_DATA_EXTENSION_TYPE`].
+///
+/// This is consumer-facing: legacy peers' KPs must still carry this tag for us
+/// to recognise them as Marmot KPs at all. Other capability codepoints
+/// (notably SelfRemove `0x000a`) are projected as soft signals, not required.
+pub(crate) const REQUIRED_MARMOT_IDENTITY_EXTENSION_TAG: &str = "0xf2ee";
+
+/// Required extension IDs for the strict (self-publish) validator.
+///
+/// Strict enforcement only: we keep this tighter than the consumer baseline so
+/// our own published key packages always carry the SelfRemove extension
+/// codepoint. The consumer-side baseline validator
+/// ([`validate_marmot_key_package_baseline`]) checks only
+/// [`REQUIRED_MARMOT_IDENTITY_EXTENSION_TAG`] (`0xf2ee`).
+const STRICT_REQUIRED_MLS_EXTENSION_TAGS: [&str; 2] = ["0x000a", "0xf2ee"];
 
 /// Required proposal IDs that must appear in `mls_proposals` tags.
 pub(crate) const REQUIRED_MLS_PROPOSAL_TAGS: [&str; 1] = ["0x000a"];
@@ -52,7 +68,7 @@ pub(crate) fn has_encoding_tag(event: &Event) -> bool {
 ///
 /// This performs a lightweight pre-check (before MDK add/create operations)
 /// so callers can fail early with actionable errors.
-pub(crate) fn validate_marmot_key_package_tags(
+pub(crate) fn validate_marmot_key_package_strict(
     event: &Event,
     expected_ciphersuite: &str,
 ) -> Result<()> {
@@ -85,7 +101,7 @@ pub(crate) fn validate_marmot_key_package_tags(
     let extensions: HashSet<String> = normalized_tag_values(event, TagKind::MlsExtensions)
         .into_iter()
         .collect();
-    let missing_extensions: Vec<String> = REQUIRED_MLS_EXTENSION_TAGS
+    let missing_extensions: Vec<String> = STRICT_REQUIRED_MLS_EXTENSION_TAGS
         .into_iter()
         .filter(|required| !extensions.contains(*required))
         .map(|required| required.to_string())
@@ -137,6 +153,86 @@ fn normalized_tag_values(event: &Event, tag_kind: TagKind<'_>) -> Vec<String> {
         .collect()
 }
 
+/// Validates that a key package advertises the minimum Marmot-identity extension tag.
+///
+/// This is the *consumer-facing* baseline: it checks only that the Marmot identity
+/// extension (`0xf2ee`) is present — it does NOT require the SelfRemove proposal
+/// tag. Use [`validate_marmot_key_package_strict`] for self-publish validation.
+pub(crate) fn validate_marmot_key_package_baseline(
+    event: &Event,
+    expected_ciphersuite: &str,
+) -> Result<()> {
+    if !is_key_package_kind(event.kind) {
+        return Err(WhitenoiseError::InvalidEventKind {
+            expected: format!("{MLS_KEY_PACKAGE_KIND} or {MLS_KEY_PACKAGE_KIND_LEGACY}"),
+            got: event.kind.to_string(),
+        });
+    }
+
+    if !has_encoding_tag(event) {
+        return Err(WhitenoiseError::MissingEncodingTag);
+    }
+
+    Base64::decode_vec(&event.content)?;
+
+    let expected_ciphersuite = expected_ciphersuite.to_ascii_lowercase();
+    let advertised_ciphersuites = normalized_tag_values(event, TagKind::MlsCiphersuite);
+    if !advertised_ciphersuites.contains(&expected_ciphersuite) {
+        return Err(WhitenoiseError::IncompatibleMlsCiphersuite {
+            expected: expected_ciphersuite,
+            advertised: advertised_ciphersuites,
+        });
+    }
+
+    // Baseline only requires the Marmot identity extension (0xf2ee).
+    let extensions: HashSet<String> = normalized_tag_values(event, TagKind::MlsExtensions)
+        .into_iter()
+        .collect();
+    let required = [REQUIRED_MARMOT_IDENTITY_EXTENSION_TAG];
+    let missing_extensions: Vec<String> = required
+        .into_iter()
+        .filter(|r| !extensions.contains(*r))
+        .map(|r| r.to_string())
+        .collect();
+
+    if !missing_extensions.is_empty() {
+        return Err(WhitenoiseError::MissingMlsExtensions {
+            missing: missing_extensions,
+        });
+    }
+
+    Ok(())
+}
+
+/// Extracts the Marmot key package capabilities (extensions + proposals) from
+/// the event's tags as structured enums for downstream policy checks.
+pub(crate) fn marmot_key_package_capabilities(event: &Event) -> KeyPackageCapabilities {
+    use std::collections::BTreeSet;
+
+    let extensions: BTreeSet<MlsExtensionId> = normalized_tag_values(event, TagKind::MlsExtensions)
+        .into_iter()
+        .map(|code| match code.as_str() {
+            "0x000a" => MlsExtensionId::SelfRemove,
+            "0xf2ee" => MlsExtensionId::NostrGroupData,
+            _ => MlsExtensionId::Unknown,
+        })
+        .collect();
+
+    let proposals: BTreeSet<RequiredProposal> =
+        normalized_tag_values(event, TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()))
+            .into_iter()
+            .map(|code| match code.as_str() {
+                "0x000a" => RequiredProposal::SelfRemove,
+                _ => RequiredProposal::Unknown,
+            })
+            .collect();
+
+    KeyPackageCapabilities {
+        proposals,
+        extensions,
+    }
+}
+
 /// Validates that a fetched key package event is signed by the expected public key and
 /// has the required Marmot compatibility tags.
 ///
@@ -150,7 +246,7 @@ pub(crate) fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey)
         )));
     }
 
-    validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
+    validate_marmot_key_package_baseline(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
         WhitenoiseError::InvalidInput(format!(
             "Incompatible key package event {} for member {}: {}",
             event.id, pk, e
@@ -1568,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_accepts_required_tags() {
+    fn test_validate_marmot_key_package_strict_accepts_required_tags() {
         let keys = Keys::generate();
         let event = create_key_package_event_with_compatibility_tags(
             &keys,
@@ -1576,12 +1672,12 @@ mod tests {
             &["0x000a", "0xF2EE"],
         );
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_ok(), "Expected valid compatibility tags");
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_accepts_current_kind() {
+    fn test_validate_marmot_key_package_strict_accepts_current_kind() {
         let keys = Keys::generate();
         let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "dGVzdF9jb250ZW50")
             .tag(Tag::identifier(
@@ -1603,7 +1699,7 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(
             result.is_ok(),
             "Expected current kind key package to validate"
@@ -1611,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_rejects_current_kind_without_d_tag() {
+    fn test_validate_marmot_key_package_strict_rejects_current_kind_without_d_tag() {
         let keys = Keys::generate();
         let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
@@ -1630,7 +1726,7 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(matches!(
             result,
             Err(WhitenoiseError::MissingKeyPackageDTag)
@@ -1638,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_rejects_wrong_ciphersuite() {
+    fn test_validate_marmot_key_package_strict_rejects_wrong_ciphersuite() {
         let keys = Keys::generate();
         let event = create_key_package_event_with_compatibility_tags(
             &keys,
@@ -1646,7 +1742,7 @@ mod tests {
             &["0x000a", "0xF2EE"],
         );
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_err(), "Expected ciphersuite mismatch to fail");
         assert!(matches!(
             result,
@@ -1655,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_rejects_missing_extensions() {
+    fn test_validate_marmot_key_package_strict_rejects_missing_extensions() {
         let keys = Keys::generate();
         let event = create_key_package_event_with_compatibility_tags(
             &keys,
@@ -1663,7 +1759,7 @@ mod tests {
             &["0x000a"],
         );
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_err(), "Expected missing extension to fail");
         assert!(matches!(
             result,
@@ -1672,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_rejects_invalid_base64_content() {
+    fn test_validate_marmot_key_package_strict_rejects_invalid_base64_content() {
         let keys = Keys::generate();
         let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-base64$$$")
             .tag(Tag::custom(
@@ -1691,13 +1787,13 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_err(), "Expected invalid base64 content to fail");
         assert!(matches!(result, Err(WhitenoiseError::InvalidBase64(_))));
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_rejects_wrong_kind() {
+    fn test_validate_marmot_key_package_strict_rejects_wrong_kind() {
         let keys = Keys::generate();
         let event = EventBuilder::new(Kind::TextNote, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
@@ -1716,7 +1812,7 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_err(), "Expected wrong kind to fail");
         assert!(matches!(
             result,
@@ -1725,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_rejects_missing_encoding_tag() {
+    fn test_validate_marmot_key_package_strict_rejects_missing_encoding_tag() {
         let keys = Keys::generate();
         let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
@@ -1739,13 +1835,17 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_err(), "Expected missing encoding tag to fail");
         assert!(matches!(result, Err(WhitenoiseError::MissingEncodingTag)));
     }
 
     #[test]
-    fn test_validate_marmot_key_package_tags_rejects_missing_self_remove_proposal() {
+    fn test_validate_marmot_key_package_strict_rejects_missing_self_remove_proposal() {
+        // The strict validator still rejects KPs that omit the SelfRemove
+        // proposal advertisement. This is intentional: the strict path is the
+        // self-publish lifecycle, where we want to fail closed against our own
+        // half-built outputs.
         let keys = Keys::generate();
         let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
@@ -1764,12 +1864,137 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        let result = validate_marmot_key_package_strict(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_err(), "Expected missing SelfRemove to fail");
         assert!(matches!(
             result,
             Err(WhitenoiseError::MissingMlsProposals { .. })
         ));
+    }
+
+    #[test]
+    fn test_validate_marmot_key_package_baseline_rejects_missing_marmot_identity_extension() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = validate_marmot_key_package_baseline(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MissingMlsExtensions { ref missing })
+                if missing.iter().any(|m| m == REQUIRED_MARMOT_IDENTITY_EXTENSION_TAG)
+        ));
+    }
+
+    #[test]
+    fn test_validate_marmot_key_package_baseline_accepts_kp_missing_self_remove_proposal() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0xf2ee"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = validate_marmot_key_package_baseline(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(
+            result.is_ok(),
+            "Expected legacy KP (missing SelfRemove tag) to pass baseline; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn test_marmot_key_package_capabilities_full_set() {
+        let keys = Keys::generate();
+        let event = create_key_package_event_with_compatibility_tags(
+            &keys,
+            REQUIRED_MLS_CIPHERSUITE_TAG,
+            &["0x000a", "0xf2ee"],
+        );
+
+        let caps = marmot_key_package_capabilities(&event);
+
+        assert_eq!(
+            caps,
+            KeyPackageCapabilities {
+                proposals: [RequiredProposal::SelfRemove].into_iter().collect(),
+                extensions: [MlsExtensionId::SelfRemove, MlsExtensionId::NostrGroupData]
+                    .into_iter()
+                    .collect(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_marmot_key_package_capabilities_legacy_kp_has_empty_proposals() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0xf2ee"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let caps = marmot_key_package_capabilities(&event);
+
+        assert_eq!(
+            caps,
+            KeyPackageCapabilities {
+                proposals: Default::default(),
+                extensions: [MlsExtensionId::NostrGroupData].into_iter().collect(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_marmot_key_package_capabilities_unknown_codepoints_collapse() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0xf2ee", "0x1234", "0x5678", "not-hex"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let caps = marmot_key_package_capabilities(&event);
+
+        assert_eq!(
+            caps,
+            KeyPackageCapabilities {
+                proposals: Default::default(),
+                extensions: [MlsExtensionId::NostrGroupData, MlsExtensionId::Unknown]
+                    .into_iter()
+                    .collect(),
+            }
+        );
     }
 
     #[test]

@@ -2,12 +2,12 @@
 members = [".", "crates/whitenoise-macros", "crates/whitenoise-cli"]
 
 [workspace.dependencies]
-mdk-core = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46", features = [
+mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "575ae29d25d58494135058d9e46affec7174e79a", features = [
     "mip04",
     "mip05",
 ] }
-mdk-sqlite-storage = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46" }
-mdk-storage-traits = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46" }
+mdk-sqlite-storage = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "575ae29d25d58494135058d9e46affec7174e79a" }
+mdk-storage-traits = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "575ae29d25d58494135058d9e46affec7174e79a" }
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44", "nip47", "nip59"] }
 tokio = { version = "1.44", features = ["full"] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -41,18 +41,19 @@ hex = { workspace = true }
 image = "0.25"
 indexmap = { version = "2", features = ["serde"] }
 infer = "0.19"
-keyring-core = "0.7"
+keyring-core = "1"
 mdk-core = { workspace = true }
 mdk-sqlite-storage = { workspace = true }
 mdk-storage-traits = { workspace = true }
 
 nostr-blossom = "0.44"
 nostr-sdk = { workspace = true }
+once_cell = "1"
 openmls = { version = "0.8.1", default-features = false }
 
 # LOCAL MDK FOR DEVELOPMENT
-# mdk-core = { version = "0.7.1", path="../mdk/crates/mdk-core" }
-# mdk-sqlite-storage = { version = "0.7.1", path="../mdk/crates/mdk-sqlite-storage" }
+# mdk-core = { version = "0.8.0", path="../mdk/crates/mdk-core" }
+# mdk-sqlite-storage = { version = "0.8.0", path="../mdk/crates/mdk-sqlite-storage" }
 
 # LOCAL RUST_NOSTR FOR DEVELOPMENT
 # nostr-blossom = { version = "0.43", path="../rust-nostr/rfs/nostr-blossom" }
@@ -110,19 +111,27 @@ indicatif = { version = "0.18.3", optional = true }
 # NOTE: apple_native_keyring_store::protected::Store requires the binary to be
 #   code-signed with a provisioning profile. The `cli` feature automatically
 #   selects keychain::Store instead, so CLI builds work without signing.
-apple-native-keyring-store = { version = "0.2", features = ["keychain", "protected"] }
+apple-native-keyring-store = { version = "1", features = ["keychain", "protected"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-apple-native-keyring-store = { version = "0.2", features = ["protected"] }
+apple-native-keyring-store = { version = "1", features = ["protected"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = "0.5"
+windows-native-keyring-store = "1"
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
+# Secret Service is the durable store for Linux and BSD targets.
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-linux-keyutils-keyring-store = "0.2"
+# Keyutils is retained only as a legacy migration source for Linux users
+# upgrading from the old backend.
+linux-keyutils-keyring-store = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
-android-native-keyring-store = "0.5"
+# Keep the v0.5-and-earlier by-service layout for upgraded Android installs.
+# The v1 default Store uses named stores and cannot see existing MDK DB keys.
+android-native-keyring-store = { version = "1", features = ["legacy"] }
 
 [dev-dependencies]
 mockito = "1.2"
@@ -133,7 +142,7 @@ default = []
 # Retained for keyring store selection on macOS: CLI binaries are unsigned and must
 # use the regular Keychain store (not Protected Data). Enabled by whitenoise-cli.
 cli = []
-integration-tests = ["clap"]
+integration-tests = ["clap", "mdk-core/test-utils"]
 benchmark-tests = ["integration-tests", "indicatif"]
 
 [[bin]]

@@ -20,6 +20,46 @@ wn (client)                         wnd (daemon)
 
 **IPC protocol:** Newline-delimited JSON. Request is a serde-tagged enum (`{"method": "...", "params": {...}}`). Response has `result`, `error`, and `stream_end` fields.
 
+## Linux and BSD Keyring Requirements
+
+The CLI can be installed on headless Linux and BSD systems, but `wnd` must be
+able to open a Freedesktop Secret Service store at runtime. On these targets,
+Whitenoise stores new secrets in Secret Service. Linux also reads keyutils as a
+legacy migration source. If no Secret Service provider is installed, running,
+and unlockable, daemon startup fails with a keyring unavailable error.
+
+Install a session D-Bus service and a provider for `org.freedesktop.secrets`.
+GNOME Keyring is the recommended provider for CLI and headless use:
+
+| Distribution | Packages |
+| ------------ | -------- |
+| Debian/Ubuntu | `dbus-user-session gnome-keyring libsecret-tools` |
+| Fedora/RHEL | `dbus gnome-keyring libsecret` |
+| Arch | `dbus gnome-keyring libsecret` |
+| FreeBSD | `dbus gnome-keyring libsecret` |
+| OpenBSD | `dbus gnome-keyring libsecret` |
+| NetBSD/pkgsrc | `dbus gnome-keyring libsecret` |
+| DragonFly BSD | `dbus gnome-keyring libsecret` |
+
+`libsecret-tools`/`libsecret` provides `secret-tool`, which is useful for a
+quick check:
+
+```sh
+printf 'test-secret' | secret-tool store --label='Whitenoise test' app whitenoise-test
+secret-tool lookup app whitenoise-test
+secret-tool clear app whitenoise-test
+```
+
+Headless systems also need a user session bus and an unlocked keyring. Desktop
+sessions usually start and unlock these through login/PAM. Minimal servers may
+need explicit setup for `gnome-keyring-daemon` and the user D-Bus environment.
+
+Other Secret Service providers can work if they own `org.freedesktop.secrets`.
+KeePassXC works when the app and database are running and Secret Service
+integration is enabled. KWallet/KSecretService is not recommended for Whitenoise
+yet because current MDK database keys are binary secrets, and KWallet-backed
+Secret Service implementations can require UTF-8 encoded values.
+
 ## Commands
 
 ### Identity & Auth
