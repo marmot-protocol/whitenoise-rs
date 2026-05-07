@@ -62,7 +62,7 @@ impl Whitenoise {
             return Err(e);
         }
 
-        self.emit_block_changed(account, target_pubkey).await;
+        self.emit_block_changed(account).await;
 
         Ok(())
     }
@@ -122,7 +122,7 @@ impl Whitenoise {
             return Err(e);
         }
 
-        self.emit_block_changed(account, target_pubkey).await;
+        self.emit_block_changed(account).await;
 
         Ok(())
     }
@@ -254,8 +254,8 @@ impl Whitenoise {
         Some(entries)
     }
 
-    /// Replaces the mute list cache and emits `UserBlockChanged` for every
-    /// pubkey that was added or removed compared to the previous state.
+    /// Replaces the mute list cache and emits `UserBlockChanged` once if any
+    /// blocked pubkeys were added or removed compared to the previous state.
     pub(crate) async fn sync_and_emit(
         &self,
         account: &Account,
@@ -268,8 +268,8 @@ impl Whitenoise {
 
         let new_pubkeys: HashSet<PublicKey> = entries.iter().map(|(pk, _)| *pk).collect();
 
-        for pubkey in old_pubkeys.symmetric_difference(&new_pubkeys) {
-            self.emit_block_changed(account, pubkey).await;
+        if old_pubkeys != new_pubkeys {
+            self.emit_block_changed(account).await;
         }
 
         Ok(())
@@ -277,7 +277,7 @@ impl Whitenoise {
 
     /// Emits `UserBlockChanged` chat list updates for every visible chat owned
     /// by the account. Block state affects group unread counts, not just DMs.
-    async fn emit_block_changed(&self, account: &Account, _target_pubkey: &PublicKey) {
+    async fn emit_block_changed(&self, account: &Account) {
         let has_active = self
             .chat_list_stream_manager
             .has_subscribers(&account.pubkey);
@@ -522,9 +522,7 @@ mod tests {
         MuteListEntry::insert(&account.pubkey, &member.pubkey, true, &whitenoise.database)
             .await
             .unwrap();
-        whitenoise
-            .emit_block_changed(&account, &member.pubkey)
-            .await;
+        whitenoise.emit_block_changed(&account).await;
 
         let update = timeout(Duration::from_secs(2), subscription.updates.recv())
             .await
@@ -534,6 +532,41 @@ mod tests {
         assert_eq!(update.trigger, ChatListUpdateTrigger::UserBlockChanged);
         assert_eq!(update.item.mls_group_id, group.mls_group_id);
         assert_eq!(update.item.unread_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_and_emit_sends_one_refresh_for_multiple_block_changes() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        let other_target = Keys::generate().public_key();
+
+        let config = create_nostr_group_config_data(vec![account.pubkey, member.pubkey]);
+        let group = whitenoise
+            .create_group(&account, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let mut subscription = whitenoise.subscribe_to_chat_list(&account).await.unwrap();
+
+        whitenoise
+            .sync_and_emit(&account, &[(member.pubkey, true), (other_target, true)])
+            .await
+            .unwrap();
+
+        let update = timeout(Duration::from_secs(2), subscription.updates.recv())
+            .await
+            .expect("block sync update should be emitted")
+            .expect("chat list stream should remain open");
+
+        assert_eq!(update.trigger, ChatListUpdateTrigger::UserBlockChanged);
+        assert_eq!(update.item.mls_group_id, group.mls_group_id);
+        assert!(
+            timeout(Duration::from_millis(200), subscription.updates.recv())
+                .await
+                .is_err(),
+            "sync should emit one chat-list refresh, not one per changed pubkey"
+        );
     }
 
     // ── get_blocked_users / is_user_blocked (pure DB, no relay) ─────────────
