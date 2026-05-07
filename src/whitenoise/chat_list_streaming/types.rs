@@ -34,8 +34,8 @@ pub enum ChatListUpdateTrigger {
     /// Emitted to both active and archived channels since the group
     /// could be in either state at the time of deletion.
     ChatDeleted,
-    /// A user was blocked or unblocked. The DM chat with that user should
-    /// refresh to show/hide the block banner and swap the input area.
+    /// A user was blocked or unblocked. Chats for the account should refresh
+    /// block-sensitive projections such as unread counts and DM block banners.
     UserBlockChanged,
 }
 
