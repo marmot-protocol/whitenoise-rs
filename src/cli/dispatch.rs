@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use mdk_core::prelude::{GroupId, NostrGroupConfigData, NostrGroupDataUpdate, group_types};
-use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
+use nostr_sdk::{EventId, PublicKey, RelayUrl, Timestamp};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
@@ -1006,8 +1006,43 @@ async fn add_members(
 
 #[derive(Serialize)]
 struct GroupShowResponse {
-    group: group_types::Group,
+    group: CliGroup,
     required_proposals: Vec<RequiredProposal>,
+}
+
+#[derive(Serialize)]
+struct CliGroup {
+    mls_group_id: GroupId,
+    nostr_group_id: [u8; 32],
+    name: String,
+    description: String,
+    image_hash: Option<[u8; 32]>,
+    admin_pubkeys: BTreeSet<PublicKey>,
+    last_message_id: Option<EventId>,
+    last_message_at: Option<Timestamp>,
+    last_message_processed_at: Option<Timestamp>,
+    epoch: u64,
+    state: group_types::GroupState,
+    self_update_state: group_types::SelfUpdateState,
+}
+
+impl From<group_types::Group> for CliGroup {
+    fn from(group: group_types::Group) -> Self {
+        Self {
+            mls_group_id: group.mls_group_id,
+            nostr_group_id: group.nostr_group_id,
+            name: group.name,
+            description: group.description,
+            image_hash: group.image_hash,
+            admin_pubkeys: group.admin_pubkeys,
+            last_message_id: group.last_message_id,
+            last_message_at: group.last_message_at,
+            last_message_processed_at: group.last_message_processed_at,
+            epoch: group.epoch,
+            state: group.state,
+            self_update_state: group.self_update_state,
+        }
+    }
 }
 
 #[perf_instrument("dispatch")]
@@ -1029,7 +1064,7 @@ async fn get_group(
         .into_iter()
         .collect();
     Ok(to_response(&GroupShowResponse {
-        group,
+        group: group.into(),
         required_proposals,
     }))
 }
