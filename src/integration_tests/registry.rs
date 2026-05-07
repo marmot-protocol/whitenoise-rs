@@ -79,6 +79,7 @@ scenario_registry! {
     "subscription-processing" => SubscriptionProcessingScenario,
     "advanced-messaging" => AdvancedMessagingScenario,
     "group-membership" => GroupMembershipScenario,
+    "group-state-streaming" => GroupStateStreamingScenario,
     "create-group-with-legacy-member" => CreateGroupWithLegacyMemberScenario,
     "add-member-to-strict-group-rejected" => AddMemberToStrictGroupRejectedScenario,
     "upgrade-required-proposals-after-legacy-self-update" => UpgradeRequiredProposalsAfterLegacySelfUpdateScenario,
@@ -210,6 +211,7 @@ mod tests {
         assert!(parse_scenario_name("subscription-processing").is_ok());
         assert!(parse_scenario_name("advanced-messaging").is_ok());
         assert!(parse_scenario_name("group-membership").is_ok());
+        assert!(parse_scenario_name("group-state-streaming").is_ok());
         assert!(parse_scenario_name("create-group-with-legacy-member").is_ok());
         assert!(parse_scenario_name("add-member-to-strict-group-rejected").is_ok());
         assert!(parse_scenario_name("upgrade-required-proposals-after-legacy-self-update").is_ok());
@@ -249,7 +251,7 @@ mod tests {
     fn test_get_all_scenario_names() {
         // Test that all scenario names are returned
         let names = get_all_scenario_names();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         assert!(names.contains(&"account-management"));
         assert!(names.contains(&"basic-messaging"));
         assert!(names.contains(&"drafts"));
