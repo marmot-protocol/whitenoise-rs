@@ -111,11 +111,22 @@ impl<'a> MuteListOps<'a> {
         }
 
         // Capture is_private before deleting so the rollback re-inserts the
-        // entry exactly as it was.
-        let is_private = MuteListEntry::find_by_muted_pubkey(target_pubkey, self.db())
-            .await?
-            .map(|e| e.is_private)
-            .unwrap_or(true);
+        // entry exactly as it was. If the entry vanished between the
+        // exists-check above and now (concurrent sync from another flow),
+        // default to private — the safer choice for a rollback.
+        let is_private = match MuteListEntry::find_by_muted_pubkey(target_pubkey, self.db()).await?
+        {
+            Some(e) => e.is_private,
+            None => {
+                tracing::debug!(
+                    target: "whitenoise::mute_list",
+                    "Mute entry for {} vanished between exists-check and read; \
+                     defaulting is_private=true for rollback",
+                    target_pubkey,
+                );
+                true
+            }
+        };
 
         MuteListEntry::delete(target_pubkey, self.db()).await?;
 

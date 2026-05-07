@@ -75,9 +75,10 @@ impl LocalMigration for Migration {
         .fetch_all(global_db)
         .await?;
 
-        let copied = rows.len() as u64;
+        let mut copied: usize = 0;
+        let mut skipped: usize = 0;
         for r in &rows {
-            sqlx::query(
+            let result = sqlx::query(
                 "INSERT OR IGNORE INTO mute_list (muted_pubkey, is_private, created_at)
                  VALUES (?, ?, ?)",
             )
@@ -86,13 +87,30 @@ impl LocalMigration for Migration {
             .bind(r.created_at)
             .execute(&mut *tx)
             .await?;
+
+            if result.rows_affected() == 0 {
+                skipped += 1;
+            } else {
+                copied += 1;
+            }
         }
 
         if copied > 0 {
             tracing::info!(
                 target: "whitenoise::database::rust_migrations::m0042",
                 account = account_pubkey,
-                "Copied {copied} mute_list row(s) to per-account DB"
+                "Copied {copied} mute_list row(s) to per-account DB",
+            );
+        }
+
+        // CHECK / UNIQUE constraint failures get swallowed by INSERT OR IGNORE.
+        // Surface the count so a corrupt-data scenario leaves a visible trail.
+        if skipped > 0 {
+            tracing::warn!(
+                target: "whitenoise::database::rust_migrations::m0042",
+                account = account_pubkey,
+                "Skipped {skipped} mute_list row(s) during migration \
+                 (constraint violation — likely malformed muted_pubkey)",
             );
         }
 

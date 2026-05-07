@@ -137,12 +137,13 @@ impl MuteListEntry {
         muted_pubkey: &PublicKey,
         db: &AccountDatabase,
     ) -> std::result::Result<bool, DatabaseError> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mute_list WHERE muted_pubkey = ?")
-            .bind(muted_pubkey.to_hex())
-            .fetch_one(&db.inner.pool)
-            .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM mute_list WHERE muted_pubkey = ?)")
+                .bind(muted_pubkey.to_hex())
+                .fetch_one(&db.inner.pool)
+                .await?;
 
-        Ok(count.0 > 0)
+        Ok(exists)
     }
 
     /// Replaces all mute list entries with the provided list. Used when
