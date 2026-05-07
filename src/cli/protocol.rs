@@ -299,6 +299,8 @@ pub enum Request {
     ArchivedChatsSubscribe { account: String },
     #[serde(rename = "notifications_subscribe")]
     NotificationsSubscribe,
+    #[serde(rename = "group_state_subscribe")]
+    GroupStateSubscribe { account: String, group_id: String },
 
     // Debug
     #[serde(rename = "debug_relay_control_state")]
@@ -373,6 +375,7 @@ impl Request {
                 | Self::ChatsSubscribe { .. }
                 | Self::ArchivedChatsSubscribe { .. }
                 | Self::NotificationsSubscribe
+                | Self::GroupStateSubscribe { .. }
                 | Self::UsersSearch { .. }
         )
     }
@@ -441,6 +444,26 @@ mod tests {
             parsed,
             Request::RelaysList { account, relay_type }
             if account == "npub1abc" && relay_type.is_none()
+        ));
+    }
+
+    #[test]
+    fn group_state_subscribe_is_streaming() {
+        let req = Request::GroupStateSubscribe {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        assert!(req.is_streaming());
+    }
+
+    #[test]
+    fn group_state_subscribe_wire_format_round_trips() {
+        let wire = r#"{"method":"group_state_subscribe","params":{"account":"npub1abc","group_id":"abcd1234"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GroupStateSubscribe { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
         ));
     }
 

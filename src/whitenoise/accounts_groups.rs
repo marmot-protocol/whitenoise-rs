@@ -10,7 +10,7 @@ use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise, accounts::Account, aggregated_message::AggregatedMessage,
     chat_list_streaming::ChatListUpdateTrigger, database::Database, drafts::Draft,
-    error::WhitenoiseError,
+    error::WhitenoiseError, group_state_streaming::GroupStateUpdate,
 };
 
 /// Represents the relationship between an account and an MLS group.
@@ -667,6 +667,11 @@ impl Whitenoise {
 
         self.emit_chat_list_update(account, mls_group_id, ChatListUpdateTrigger::LeftGroup)
             .await;
+        self.group_state_stream_manager.emit(
+            &account.pubkey,
+            mls_group_id,
+            GroupStateUpdate::LeftGroup,
+        );
 
         Ok(updated)
     }
@@ -699,6 +704,11 @@ impl Whitenoise {
             ChatListUpdateTrigger::RemovedFromGroup,
         )
         .await;
+        self.group_state_stream_manager.emit(
+            &account.pubkey,
+            mls_group_id,
+            GroupStateUpdate::RemovedFromGroup,
+        );
 
         Ok(updated)
     }
@@ -923,6 +933,7 @@ impl Whitenoise {
 mod tests {
     use super::*;
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
+    use crate::whitenoise::group_state_streaming::GroupStateUpdate;
     use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
 
     #[tokio::test]
@@ -2449,6 +2460,129 @@ mod tests {
         assert!(
             removed.self_removed,
             "self_removed must survive mark_as_removed no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_as_left_emits_group_state_update() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[201; 32]);
+        let (_, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let mut updates = whitenoise
+            .group_state_stream_manager
+            .subscribe(&account.pubkey, &group_id);
+
+        whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+
+        assert_eq!(
+            updates.try_recv().expect("should receive update"),
+            GroupStateUpdate::LeftGroup,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_as_removed_emits_group_state_update() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[202; 32]);
+        let (_, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let mut updates = whitenoise
+            .group_state_stream_manager
+            .subscribe(&account.pubkey, &group_id);
+
+        whitenoise
+            .mark_as_removed(&account, &group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updates.try_recv().expect("should receive update"),
+            GroupStateUpdate::RemovedFromGroup,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_state_only_emits_to_affected_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account_a = whitenoise.create_identity().await.unwrap();
+        let account_b = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[210; 32]);
+        whitenoise
+            .get_or_create_account_group(&account_a, &group_id, None)
+            .await
+            .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account_b, &group_id, None)
+            .await
+            .unwrap();
+
+        let mut updates_a = whitenoise
+            .group_state_stream_manager
+            .subscribe(&account_a.pubkey, &group_id);
+        let mut updates_b = whitenoise
+            .group_state_stream_manager
+            .subscribe(&account_b.pubkey, &group_id);
+
+        whitenoise
+            .mark_as_left(&account_b, &group_id)
+            .await
+            .unwrap();
+
+        assert!(
+            updates_a.try_recv().is_err(),
+            "account A's stream must not receive a state event triggered by account B",
+        );
+        assert_eq!(
+            updates_b
+                .try_recv()
+                .expect("account B must receive its own LeftGroup"),
+            GroupStateUpdate::LeftGroup,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_group_state_returns_group_not_found_for_unknown_pair() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let unknown_group = GroupId::from_slice(&[220; 32]);
+
+        let result = whitenoise
+            .subscribe_to_group_state(&account.pubkey, &unknown_group)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_mark_as_left_idempotent_does_not_double_emit() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[203; 32]);
+        let (_, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let mut updates = whitenoise
+            .group_state_stream_manager
+            .subscribe(&account.pubkey, &group_id);
+
+        whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+
+        let _first = updates.try_recv().expect("first call must emit");
+        assert!(
+            updates.try_recv().is_err(),
+            "second mark_as_left is a no-op and must not emit again",
         );
     }
 

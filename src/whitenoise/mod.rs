@@ -35,6 +35,7 @@ mod event_processor;
 pub mod event_tracker;
 pub mod follows;
 pub mod group_information;
+pub mod group_state_streaming;
 pub mod groups;
 mod init_timing;
 pub mod key_packages;
@@ -230,6 +231,7 @@ pub struct Whitenoise {
     user_stream_manager: user_streaming::UserStreamManager,
     chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
+    group_state_stream_manager: group_state_streaming::GroupStateStreamManager,
     notification_stream_manager: notification_streaming::NotificationStreamManager,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
@@ -303,6 +305,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("user_stream_manager", &"<REDACTED>")
             .field("chat_list_stream_manager", &"<REDACTED>")
             .field("archived_chat_list_stream_manager", &"<REDACTED>")
+            .field("group_state_stream_manager", &"<REDACTED>")
             .field("notification_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
@@ -349,6 +352,7 @@ impl Whitenoise {
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
             archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(
             ),
+            group_state_stream_manager: group_state_streaming::GroupStateStreamManager::default(),
             notification_stream_manager: notification_streaming::NotificationStreamManager::default(
             ),
             event_sender: components.event_sender,

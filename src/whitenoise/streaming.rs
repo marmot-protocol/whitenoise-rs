@@ -8,12 +8,12 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
-use crate::whitenoise::error::Result;
+use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::streaming_error::{StreamKind, StreamingError};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{
-    aggregated_message, chat_list, chat_list_streaming, media_files, message_aggregator,
-    message_streaming, notification_streaming, user_streaming,
+    aggregated_message, chat_list, chat_list_streaming, group_state_streaming, media_files,
+    message_aggregator, message_streaming, notification_streaming, user_streaming,
 };
 
 impl Whitenoise {
@@ -131,6 +131,40 @@ impl Whitenoise {
         Ok(message_streaming::GroupMessageSubscription {
             initial_messages,
             updates,
+        })
+    }
+
+    /// Subscribe to group state events for a specific account in a specific group.
+    ///
+    /// Real-time only — group state events are transitions (the account left
+    /// or was removed), not persistent state, so there is no initial snapshot
+    /// to seed. Open chat views subscribe alongside
+    /// [`Self::subscribe_to_group_messages`] to react when membership ends
+    /// without having to also drive a chat-list subscription.
+    ///
+    /// Streams are isolated per `(account, group)`: an event triggered by one
+    /// account never reaches another account's subscriber, even when both
+    /// accounts belong to the same group on the same device.
+    ///
+    /// # Errors
+    /// * [`WhitenoiseError::GroupNotFound`] if no `AccountGroup` row exists
+    ///   for the pair. Validating up front prevents typoed or arbitrary
+    ///   `(account, group)` pairs from leaving dead `broadcast::Sender`
+    ///   entries in the manager — the cleanup-on-emit path only runs when
+    ///   *something* is emitted, which never happens for a non-member key.
+    pub async fn subscribe_to_group_state(
+        &self,
+        account_pubkey: &PublicKey,
+        group_id: &mdk_core::prelude::GroupId,
+    ) -> Result<group_state_streaming::GroupStateSubscription> {
+        AccountGroup::get(self, account_pubkey, group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        Ok(group_state_streaming::GroupStateSubscription {
+            updates: self
+                .group_state_stream_manager
+                .subscribe(account_pubkey, group_id),
         })
     }
 
