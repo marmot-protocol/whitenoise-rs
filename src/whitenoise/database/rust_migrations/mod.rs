@@ -47,6 +47,7 @@ mod m0039_move_message_delivery_status;
 mod m0040_drop_shared_message_delivery_status;
 mod m0041_drop_shared_aggregated_messages;
 mod m0042_move_mute_list;
+mod m0043_drop_shared_mute_list;
 
 /// All global migrations, in version order. Lifted from individual modules
 /// so the test suite can build a globals-only `Migrator` for narrow tests.
@@ -81,6 +82,7 @@ pub fn all_global_migrations() -> Vec<Box<dyn GlobalMigration>> {
         Box::new(m0037_drop_shared_accounts_groups::Migration),
         Box::new(m0040_drop_shared_message_delivery_status::Migration),
         Box::new(m0041_drop_shared_aggregated_messages::Migration),
+        Box::new(m0043_drop_shared_mute_list::Migration),
     ]
 }
 
