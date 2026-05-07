@@ -103,8 +103,9 @@ mod tests {
         let result = whitenoise.handle_mute_list(&account, event).await;
         assert!(result.is_ok());
 
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         assert!(
-            MuteListEntry::exists(&account.pubkey, &target, &whitenoise.shared.database)
+            MuteListEntry::exists(&target, &session.account_db)
                 .await
                 .unwrap(),
             "public tag from own mute list event must be cached"
@@ -117,15 +118,12 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let pre_existing = Keys::generate().public_key();
 
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+
         // Pre-populate the cache
-        MuteListEntry::insert(
-            &account.pubkey,
-            &pre_existing,
-            true,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        MuteListEntry::insert(&pre_existing, true, &session.account_db)
+            .await
+            .unwrap();
 
         let account_keys = whitenoise
             .shared
@@ -144,7 +142,7 @@ mod tests {
 
         // Cache must be unchanged — parse failure returns None and we skip sync
         assert!(
-            MuteListEntry::exists(&account.pubkey, &pre_existing, &whitenoise.shared.database)
+            MuteListEntry::exists(&pre_existing, &session.account_db)
                 .await
                 .unwrap(),
             "pre-existing entry must survive a failed decrypt"
