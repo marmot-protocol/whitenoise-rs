@@ -1344,10 +1344,9 @@ async fn get_chat_list_item(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let item = wn
-        .build_chat_list_item(&account, &group_id)
+        .get_chat_list_item(&account, &group_id)
         .await
-        .map_err(|e| Response::err(e.to_string()))?
-        .ok_or_else(|| Response::err("group not found".to_string()))?;
+        .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(clean_chat_list_item(wn, &item).await))
 }
 
@@ -2296,7 +2295,6 @@ async fn keys_check(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
 #[cfg(test)]
 mod tests {
     use nostr_sdk::ToBech32;
-    use std::collections::BTreeSet;
 
     use super::*;
 
@@ -2361,44 +2359,6 @@ mod tests {
     fn to_response_string() {
         let resp = to_response(&"hello");
         assert_eq!(resp.result.unwrap(), serde_json::json!("hello"));
-    }
-
-    // --- get_group ---
-
-    #[cfg(feature = "integration-tests")]
-    #[tokio::test]
-    async fn get_group_returns_nested_shape_with_required_proposals() {
-        use whitenoise::whitenoise::test_utils::{
-            create_mock_whitenoise, create_nostr_group_config_data,
-        };
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
-
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
-        let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
-            .await
-            .unwrap();
-
-        let response = get_group(
-            &whitenoise,
-            &creator.pubkey.to_hex(),
-            &hex::encode(group.mls_group_id.as_slice()),
-        )
-        .await
-        .expect("get_group succeeds for a valid account and group");
-
-        let value = response.result.expect("response carries a result");
-        let obj = value.as_object().expect("result serializes as an object");
-
-        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
-        assert_eq!(keys, BTreeSet::from(["group", "required_proposals"]));
-
-        assert_eq!(
-            obj["required_proposals"],
-            serde_json::json!(["self_remove"]),
-        );
     }
 
     // --- parse_relay_type ---

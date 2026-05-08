@@ -15,7 +15,7 @@ use crate::whitenoise::{
     accounts_groups::AccountGroup,
     aggregated_message::AggregatedMessage,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
-    error::Result,
+    error::{Result, WhitenoiseError},
     group_information::{GroupInformation, GroupType},
     message_aggregator::ChatMessageSummary,
     users::User,
@@ -264,6 +264,23 @@ impl Whitenoise {
             .await
     }
 
+    /// Returns a single chat list item, or `GroupNotFound` if the group is
+    /// unknown to this account.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::chat_list().build_item() instead."
+    )]
+    #[perf_instrument("chat_list")]
+    pub async fn get_chat_list_item(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<ChatListItem> {
+        self.build_chat_list_item(account, group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)
+    }
+
     /// Builds a single ChatListItem for a specific group.
     ///
     /// Called from the emit path which runs inside `tokio::spawn`. Cannot
@@ -280,7 +297,7 @@ impl Whitenoise {
         note = "Use AccountSession::chat_list().build_item() instead."
     )]
     #[perf_instrument("chat_list")]
-    pub async fn build_chat_list_item(
+    pub(crate) async fn build_chat_list_item(
         &self,
         account: &Account,
         group_id: &GroupId,

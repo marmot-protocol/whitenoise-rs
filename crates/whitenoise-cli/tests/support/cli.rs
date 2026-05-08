@@ -159,6 +159,7 @@ pub(crate) async fn poll_until(
 /// Used to cover the asynchronous publish that happens after `create-identity`
 /// returns. Without it, callers can race ahead and try to pull the key package
 /// before it has reached the relays.
+#[allow(dead_code)] // used by cli_relay_control_e2e.rs but not cli_e2e.rs
 pub(crate) async fn wait_for_key_package(socket: &PathBuf, pubkey: &str) {
     let msg = format!("did not see a valid key package for {pubkey} within 30s");
     poll_until(Duration::from_secs(30), &msg, || {
