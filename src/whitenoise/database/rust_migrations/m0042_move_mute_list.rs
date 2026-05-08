@@ -105,12 +105,16 @@ impl LocalMigration for Migration {
 
         // CHECK / UNIQUE constraint failures get swallowed by INSERT OR IGNORE.
         // Surface the count so a corrupt-data scenario leaves a visible trail.
+        // Both causes are possible: a CHECK violation means malformed
+        // muted_pubkey in shared (corrupt source data); a UNIQUE violation
+        // means the migration is re-running over rows already copied
+        // (idempotent path, harmless).
         if skipped > 0 {
             tracing::warn!(
                 target: "whitenoise::database::rust_migrations::m0042",
                 account = account_pubkey,
                 "Skipped {skipped} mute_list row(s) during migration \
-                 (constraint violation — likely malformed muted_pubkey)",
+                 (CHECK violation on muted_pubkey, or UNIQUE collision on re-run)",
             );
         }
 
