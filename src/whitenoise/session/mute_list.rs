@@ -50,7 +50,7 @@ impl<'a> MuteListOps<'a> {
         }
 
         // Fast path: if already blocked locally no sync or publish is needed.
-        if MuteListEntry::exists(account_pubkey, target_pubkey, self.db()).await? {
+        if MuteListEntry::exists(target_pubkey, self.db()).await? {
             return Ok(());
         }
 
@@ -60,17 +60,15 @@ impl<'a> MuteListOps<'a> {
 
         // Re-check after sync: another device may have added this block while
         // we were fetching the latest list.
-        if MuteListEntry::exists(account_pubkey, target_pubkey, self.db()).await? {
+        if MuteListEntry::exists(target_pubkey, self.db()).await? {
             return Ok(());
         }
 
-        MuteListEntry::insert(account_pubkey, target_pubkey, true, self.db()).await?;
+        MuteListEntry::insert(target_pubkey, true, self.db()).await?;
 
         if let Err(e) = self.publish_mute_list().await {
             // Roll back the local insert so a retry runs the full flow from scratch.
-            if let Err(rb_err) =
-                MuteListEntry::delete(account_pubkey, target_pubkey, self.db()).await
-            {
+            if let Err(rb_err) = MuteListEntry::delete(target_pubkey, self.db()).await {
                 tracing::warn!(
                     target: "whitenoise::mute_list",
                     "Failed to roll back local block insert for {}: {}",
@@ -98,9 +96,7 @@ impl<'a> MuteListOps<'a> {
     /// retry the full operation cleanly.
     #[perf_instrument("mute_list")]
     pub async fn unblock_user(&self, target_pubkey: &PublicKey) -> Result<()> {
-        let account_pubkey = &self.session.account_pubkey;
-
-        if !MuteListEntry::exists(account_pubkey, target_pubkey, self.db()).await? {
+        if !MuteListEntry::exists(target_pubkey, self.db()).await? {
             return Ok(());
         }
 
@@ -110,25 +106,36 @@ impl<'a> MuteListOps<'a> {
 
         // Re-check after sync: another device may have already removed this
         // block while we were fetching the latest list.
-        if !MuteListEntry::exists(account_pubkey, target_pubkey, self.db()).await? {
+        if !MuteListEntry::exists(target_pubkey, self.db()).await? {
             return Ok(());
         }
 
         // Capture is_private before deleting so the rollback re-inserts the
-        // entry exactly as it was.
-        let is_private =
-            MuteListEntry::find_by_account_and_target(account_pubkey, target_pubkey, self.db())
-                .await?
-                .map(|e| e.is_private)
-                .unwrap_or(true);
+        // entry exactly as it was. If the entry vanished between the
+        // exists-check above and now (concurrent sync from another flow
+        // removed it), the user is already not blocked locally and any
+        // republish is the responsibility of the operation that wiped the
+        // entry. Treat this as a no-op: skip delete + publish entirely so
+        // the rollback path can't re-insert the row we just observed gone.
+        let is_private = match MuteListEntry::find_by_muted_pubkey(target_pubkey, self.db()).await?
+        {
+            Some(e) => e.is_private,
+            None => {
+                tracing::warn!(
+                    target: "whitenoise::mute_list",
+                    "Mute entry for {} vanished between exists-check and read; \
+                     skipping unblock delete/publish to avoid re-inserting it on rollback",
+                    target_pubkey,
+                );
+                return Ok(());
+            }
+        };
 
-        MuteListEntry::delete(account_pubkey, target_pubkey, self.db()).await?;
+        MuteListEntry::delete(target_pubkey, self.db()).await?;
 
         if let Err(e) = self.publish_mute_list().await {
             // Roll back the local delete so a retry runs the full flow from scratch.
-            if let Err(rb_err) =
-                MuteListEntry::insert(account_pubkey, target_pubkey, is_private, self.db()).await
-            {
+            if let Err(rb_err) = MuteListEntry::insert(target_pubkey, is_private, self.db()).await {
                 tracing::warn!(
                     target: "whitenoise::mute_list",
                     "Failed to roll back local unblock delete for {}: {}",
@@ -147,26 +154,24 @@ impl<'a> MuteListOps<'a> {
     /// Returns all blocked users for this account.
     #[perf_instrument("mute_list")]
     pub async fn get_blocked_users(&self) -> Result<Vec<MuteListEntry>> {
-        let entries =
-            MuteListEntry::find_by_account(&self.session.account_pubkey, self.db()).await?;
+        let entries = MuteListEntry::find_all(self.db()).await?;
         Ok(entries)
     }
 
     /// Returns `true` if the given pubkey is blocked by this account.
     #[perf_instrument("mute_list")]
     pub async fn is_user_blocked(&self, target_pubkey: &PublicKey) -> Result<bool> {
-        let blocked =
-            MuteListEntry::exists(&self.session.account_pubkey, target_pubkey, self.db()).await?;
+        let blocked = MuteListEntry::exists(target_pubkey, self.db()).await?;
         Ok(blocked)
     }
 
     /// Replaces the mute list cache and emits `UserBlockChanged` for every
     /// pubkey that was added or removed compared to the previous state.
     pub(crate) async fn sync_and_emit(&self, entries: &[(PublicKey, bool)]) -> Result<()> {
-        let old = MuteListEntry::find_by_account(&self.session.account_pubkey, self.db()).await?;
+        let old = MuteListEntry::find_all(self.db()).await?;
         let old_pubkeys: HashSet<PublicKey> = old.iter().map(|e| e.muted_pubkey).collect();
 
-        MuteListEntry::sync_from_event(&self.session.account_pubkey, entries, self.db()).await?;
+        MuteListEntry::sync_from_event(entries, self.db()).await?;
 
         let new_pubkeys: HashSet<PublicKey> = entries.iter().map(|(pk, _)| *pk).collect();
 
@@ -218,7 +223,7 @@ impl<'a> MuteListOps<'a> {
             return Ok(());
         };
 
-        MuteListEntry::sync_from_event(&self.session.account_pubkey, &entries, self.db()).await?;
+        MuteListEntry::sync_from_event(&entries, self.db()).await?;
 
         Ok(())
     }
@@ -301,8 +306,7 @@ impl<'a> MuteListOps<'a> {
         let signer = self.require_signer().await?;
         let relay_urls = self.account_relay_urls().await;
 
-        let entries =
-            MuteListEntry::find_by_account(&self.session.account_pubkey, self.db()).await?;
+        let entries = MuteListEntry::find_all(self.db()).await?;
 
         let mut public_tags: Vec<Tag> = Vec::new();
         let mut private_tags: Vec<Vec<String>> = Vec::new();
@@ -383,12 +387,13 @@ impl<'a> MuteListOps<'a> {
     /// Returns relay URLs for this account's NIP-65 relay list,
     /// falling back to discovery plane relays.
     async fn account_relay_urls(&self) -> Vec<nostr_sdk::RelayUrl> {
+        let shared = &self.session.shared.database;
         let nip65 = async {
-            let acct = Account::find_by_pubkey(&self.session.account_pubkey, self.db())
+            let acct = Account::find_by_pubkey(&self.session.account_pubkey, shared)
                 .await
                 .ok()?;
-            let user = acct.user(self.db()).await.ok()?;
-            let relays = user.relays(RelayType::Nip65, self.db()).await.ok()?;
+            let user = acct.user(shared).await.ok()?;
+            let relays = user.relays(RelayType::Nip65, shared).await.ok()?;
             Some(relays)
         }
         .await
@@ -406,7 +411,7 @@ impl<'a> MuteListOps<'a> {
         }
     }
 
-    fn db(&self) -> &crate::whitenoise::database::Database {
-        &self.session.shared.database
+    fn db(&self) -> &crate::whitenoise::database::account_db::AccountDatabase {
+        &self.session.account_db
     }
 }

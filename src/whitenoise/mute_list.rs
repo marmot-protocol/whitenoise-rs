@@ -122,9 +122,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let target = Keys::generate().public_key();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
 
         // Insert directly — bypasses relay so the test is Docker-independent.
-        MuteListEntry::insert(&account.pubkey, &target, true, &whitenoise.shared.database)
+        MuteListEntry::insert(&target, true, &session.account_db)
             .await
             .unwrap();
 
@@ -137,7 +138,7 @@ mod tests {
 
         // Entry must still be there (not double-inserted or removed).
         assert!(
-            MuteListEntry::exists(&account.pubkey, &target, &whitenoise.shared.database)
+            MuteListEntry::exists(&target, &session.account_db)
                 .await
                 .unwrap()
         );
@@ -165,18 +166,14 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let target1 = Keys::generate().public_key();
         let target2 = Keys::generate().public_key();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
 
-        MuteListEntry::insert(&account.pubkey, &target1, true, &whitenoise.shared.database)
+        MuteListEntry::insert(&target1, true, &session.account_db)
             .await
             .unwrap();
-        MuteListEntry::insert(
-            &account.pubkey,
-            &target2,
-            false,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        MuteListEntry::insert(&target2, false, &session.account_db)
+            .await
+            .unwrap();
 
         let blocked = whitenoise.get_blocked_users(&account).await.unwrap();
         assert_eq!(blocked.len(), 2);
@@ -192,15 +189,11 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let blocked_target = Keys::generate().public_key();
         let other_target = Keys::generate().public_key();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
 
-        MuteListEntry::insert(
-            &account.pubkey,
-            &blocked_target,
-            true,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        MuteListEntry::insert(&blocked_target, true, &session.account_db)
+            .await
+            .unwrap();
 
         assert!(
             whitenoise
@@ -329,12 +322,12 @@ mod tests {
         let blocked = whitenoise.get_blocked_users(&account).await.unwrap();
         assert_eq!(blocked.len(), 2);
         assert!(
-            MuteListEntry::exists(&account.pubkey, &target1, &whitenoise.shared.database)
+            MuteListEntry::exists(&target1, &session.account_db)
                 .await
                 .unwrap()
         );
         assert!(
-            MuteListEntry::exists(&account.pubkey, &target2, &whitenoise.shared.database)
+            MuteListEntry::exists(&target2, &session.account_db)
                 .await
                 .unwrap()
         );
@@ -346,19 +339,14 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let old_target = Keys::generate().public_key();
         let new_target = Keys::generate().public_key();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
 
         // Seed with old_target
-        MuteListEntry::insert(
-            &account.pubkey,
-            &old_target,
-            true,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        MuteListEntry::insert(&old_target, true, &session.account_db)
+            .await
+            .unwrap();
 
         // Sync with only new_target
-        let session = whitenoise.require_session(&account.pubkey).unwrap();
         session
             .mute_list()
             .sync_and_emit(&[(new_target, false)])
@@ -366,13 +354,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            !MuteListEntry::exists(&account.pubkey, &old_target, &whitenoise.shared.database)
+            !MuteListEntry::exists(&old_target, &session.account_db)
                 .await
                 .unwrap(),
             "old_target should be removed"
         );
         assert!(
-            MuteListEntry::exists(&account.pubkey, &new_target, &whitenoise.shared.database)
+            MuteListEntry::exists(&new_target, &session.account_db)
                 .await
                 .unwrap(),
             "new_target should be present"
@@ -385,11 +373,11 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&account.pubkey, &target, true, &whitenoise.shared.database)
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        MuteListEntry::insert(&target, true, &session.account_db)
             .await
             .unwrap();
 
-        let session = whitenoise.require_session(&account.pubkey).unwrap();
         session.mute_list().sync_and_emit(&[]).await.unwrap();
 
         let blocked = whitenoise.get_blocked_users(&account).await.unwrap();

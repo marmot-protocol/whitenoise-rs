@@ -212,3 +212,15 @@ CREATE TABLE IF NOT EXISTS message_delivery_status (
 
 CREATE INDEX IF NOT EXISTS idx_mds_group_account_status
     ON message_delivery_status (mls_group_id, account_pubkey, status);
+
+-- Local mute_list (NIP-51 block list). Moved from shared in m0042; the
+-- account_pubkey column is dropped because ownership is implicit in the file.
+CREATE TABLE IF NOT EXISTS mute_list (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    muted_pubkey  TEXT NOT NULL UNIQUE
+        CHECK (length(muted_pubkey) = 64
+               AND muted_pubkey GLOB '[0-9a-fA-F]*'),
+    is_private    INTEGER NOT NULL DEFAULT 1
+        CHECK (is_private IN (0, 1)),
+    created_at    INTEGER NOT NULL
+);

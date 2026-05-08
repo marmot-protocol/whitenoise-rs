@@ -23,7 +23,7 @@ use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 /// `accounts_groups`, `drafts`, `push_registrations`, `group_push_tokens`,
 /// `published_key_packages`, `published_events`,
 /// `processed_events` (account-level), `aggregated_messages`,
-/// `message_delivery_status`, and `media_references`.
+/// `message_delivery_status`, `media_references`, and `mute_list`.
 ///
 /// See `rearchitecture.md` Appendix B for the authoritative table ownership
 /// map.
