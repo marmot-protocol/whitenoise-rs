@@ -1040,16 +1040,18 @@ impl AggregatedMessage {
         message_id: &str,
         group_id: &GroupId,
         deletion_event_id: &str,
+        target_author: &PublicKey,
         database: &Database,
     ) -> Result<()> {
         sqlx::query(
             "UPDATE aggregated_messages
              SET deletion_event_id = ?
-             WHERE message_id = ? AND mls_group_id = ? AND kind IN (7, 9)",
+             WHERE message_id = ? AND mls_group_id = ? AND kind IN (7, 9) AND author = ?",
         )
         .bind(deletion_event_id)
         .bind(message_id)
         .bind(group_id.as_slice())
+        .bind(target_author.to_hex())
         .execute(&database.pool)
         .await?;
 
@@ -1602,17 +1604,18 @@ impl AggregatedMessage {
             .collect())
     }
 
-    /// Find orphaned deletions targeting a specific message
-    /// Returns the event IDs of deletions (kind 5) that reference the target message_id
-    /// Uses json_each to properly parse the tags array
+    /// Find orphaned deletions targeting a specific message.
+    /// Returns deletions (kind 5) that reference the target `message_id`.
+    /// Callers must check `author` before applying — only deletions whose
+    /// author matches the target's author are valid.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_orphaned_deletions(
         message_id: &str,
         group_id: &GroupId,
         database: &Database,
-    ) -> Result<Vec<EventId>> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT am.message_id FROM aggregated_messages am
+    ) -> Result<Vec<AggregatedMessage>> {
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "SELECT * FROM aggregated_messages am
              WHERE am.kind = 5
                AND am.mls_group_id = ?
                AND EXISTS (
@@ -1627,9 +1630,9 @@ impl AggregatedMessage {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(ids
+        Ok(rows
             .into_iter()
-            .filter_map(|id| EventId::from_hex(&id).ok())
+            .map(AggregatedMessageRow::into_aggregated_message)
             .collect())
     }
 
@@ -1942,7 +1945,7 @@ mod tests {
 
         // Mark as deleted - need a valid 64-char hex ID
         let deletion_event_id = format!("{:0>64}", "abc123");
-        AggregatedMessage::mark_deleted(&message.id, &group_id, &deletion_event_id, db)
+        AggregatedMessage::mark_deleted(&message.id, &group_id, &deletion_event_id, &author, db)
             .await
             .unwrap();
 
@@ -2195,6 +2198,7 @@ mod tests {
             &msg_deleted.id,
             &group_with_deletion,
             &format!("{:0>64}", "del"),
+            &author,
             db,
         )
         .await
@@ -2377,9 +2381,15 @@ mod tests {
             .unwrap();
 
         // Delete msg2
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &format!("{:0>64}", "del"), db)
-            .await
-            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &msg2.id,
+            &group_id,
+            &format!("{:0>64}", "del"),
+            &author,
+            db,
+        )
+        .await
+        .unwrap();
 
         let count = AggregatedMessage::count_unread_for_group(&group_id, None, db, None)
             .await
@@ -2773,9 +2783,15 @@ mod tests {
         }
 
         // Delete msg2
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &format!("{:0>64}", "del"), db)
-            .await
-            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &msg2.id,
+            &group_id,
+            &format!("{:0>64}", "del"),
+            &author,
+            db,
+        )
+        .await
+        .unwrap();
 
         let input = vec![(group_id.clone(), None, None)];
         let result = AggregatedMessage::count_unread_for_groups(&input, db)
@@ -2894,10 +2910,10 @@ mod tests {
         let del_id = format!("{:0>64x}", 0xde1182u64);
 
         // Mark both as deleted by the same deletion event
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, db)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, &author, db)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, db)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, &author, db)
             .await
             .unwrap();
 
@@ -2948,10 +2964,10 @@ mod tests {
         let del_a = format!("{:0>64x}", 0xde1au64);
         let del_b = format!("{:0>64x}", 0xde1bu64);
 
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, db)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, &author, db)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, db)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, &author, db)
             .await
             .unwrap();
 
@@ -3015,7 +3031,7 @@ mod tests {
 
         // Now mark the reaction as deleted
         let del_id = format!("{:0>64x}", 0xde1186u64);
-        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, db)
+        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, &author, db)
             .await
             .unwrap();
 
@@ -3954,7 +3970,7 @@ mod tests {
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, db)
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &author, db)
             .await
             .unwrap();
 
@@ -4008,7 +4024,7 @@ mod tests {
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, db)
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &author, db)
             .await
             .unwrap();
 
