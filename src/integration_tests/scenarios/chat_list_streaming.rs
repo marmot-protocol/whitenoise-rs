@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::integration_tests::{
     core::*,
-    test_cases::{chat_list_streaming::*, shared::*},
+    test_cases::{chat_list_streaming::*, group_membership::*, shared::*},
 };
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
 use crate::{Whitenoise, WhitenoiseError};
@@ -226,6 +226,57 @@ impl ChatListStreamingScenario {
         tracing::info!("✓ Lower pin_order appears first in subscription initial items");
         Ok(())
     }
+
+    async fn phase8_test_left_group(&mut self) -> Result<(), WhitenoiseError> {
+        tracing::info!("=== Phase 8: Test LeftGroup update ===");
+
+        // Subscribe to the leaver's chat list before the action.
+        let leave_verifier =
+            VerifyChatListUpdateTestCase::new("stream_member", ChatListUpdateTrigger::LeftGroup)
+                .expect_group_name(Self::INACTIVE_GROUP_NAME);
+        leave_verifier.subscribe(&self.context).await?;
+
+        let group_id = self
+            .context
+            .get_group(Self::INACTIVE_GROUP_NAME)?
+            .mls_group_id
+            .clone();
+        LeaveGroupTestCase::new("stream_member", group_id)
+            .execute(&mut self.context)
+            .await?;
+
+        leave_verifier.execute(&mut self.context).await?;
+
+        tracing::info!("✓ LeftGroup update received after voluntary departure");
+        Ok(())
+    }
+
+    async fn phase9_test_removed_from_group(&mut self) -> Result<(), WhitenoiseError> {
+        tracing::info!("=== Phase 9: Test RemovedFromGroup update ===");
+
+        // Subscribe to the kicked member's chat list before the action.
+        let removed_verifier = VerifyChatListUpdateTestCase::new(
+            "stream_member",
+            ChatListUpdateTrigger::RemovedFromGroup,
+        )
+        .expect_group_name(Self::GROUP_NAME);
+        removed_verifier.subscribe(&self.context).await?;
+
+        let group_id = self
+            .context
+            .get_group(Self::GROUP_NAME)?
+            .mls_group_id
+            .clone();
+        let member_pubkey = self.context.get_account("stream_member")?.pubkey;
+        RemoveGroupMembersTestCase::new("stream_creator", group_id, vec![member_pubkey])
+            .execute(&mut self.context)
+            .await?;
+
+        removed_verifier.execute(&mut self.context).await?;
+
+        tracing::info!("✓ RemovedFromGroup update received after admin removal");
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -244,6 +295,8 @@ impl Scenario for ChatListStreamingScenario {
         self.phase5_test_last_message_deleted().await?;
         self.phase6_verify_subscription_ordering().await?;
         self.phase7_verify_pin_order_in_subscription().await?;
+        self.phase8_test_left_group().await?;
+        self.phase9_test_removed_from_group().await?;
 
         tracing::info!("✓ ChatListStreamingScenario completed successfully");
         Ok(())

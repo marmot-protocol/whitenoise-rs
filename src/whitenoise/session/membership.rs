@@ -16,6 +16,7 @@ use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
 use crate::whitenoise::database::Database;
 use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::group_state_streaming::GroupStateUpdate;
 
 /// Account-scoped membership view. Constructed via [`AccountSession::membership`].
 pub struct MembershipOps<'a> {
@@ -193,6 +194,16 @@ impl<'a> MembershipOpsForGroup<'a> {
             .await;
     }
 
+    /// Emits a per-(account, group) group state update so subscribers like
+    /// open chat views can react to membership changes.
+    fn emit_group_state(&self, update: GroupStateUpdate) {
+        self.session.shared.group_state_stream_manager.emit(
+            &self.session.account_pubkey,
+            self.group_id,
+            update,
+        );
+    }
+
     // ── Create / query ────────────────────────────────────────────
 
     /// Get or create the account-group membership.
@@ -330,6 +341,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         };
         self.emit_chat_list_update(ChatListUpdateTrigger::LeftGroup)
             .await;
+        self.emit_group_state(GroupStateUpdate::LeftGroup);
         Ok(updated)
     }
 
@@ -345,6 +357,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         };
         self.emit_chat_list_update(ChatListUpdateTrigger::RemovedFromGroup)
             .await;
+        self.emit_group_state(GroupStateUpdate::RemovedFromGroup);
         Ok(updated)
     }
 

@@ -32,6 +32,7 @@ mod event_processor;
 pub mod event_tracker;
 pub mod follows;
 pub mod group_information;
+pub mod group_state_streaming;
 pub mod groups;
 mod init_timing;
 pub mod key_packages;
@@ -4417,8 +4418,12 @@ mod tests {
 
     // External Signer Registry Tests
     mod external_signer_tests {
-        use super::*;
+        use std::collections::HashSet;
+
         use nostr_sdk::Keys;
+
+        use super::*;
+        use crate::whitenoise::relays::RelayType;
 
         /// Helper to create a test signer using Keys (which implements NostrSigner)
         fn create_test_signer() -> (Keys, PublicKey) {
@@ -4655,6 +4660,141 @@ mod tests {
             assert!(
                 after,
                 "register_external_signer should recover missing account subscriptions"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_recovers_only_the_target_account_subscriptions() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let keys_one = Keys::generate();
+            let account_one = whitenoise
+                .login_with_external_signer_for_test(keys_one.clone())
+                .await
+                .unwrap();
+
+            let keys_two = Keys::generate();
+            let account_two = whitenoise
+                .login_with_external_signer_for_test(keys_two.clone())
+                .await
+                .unwrap();
+
+            whitenoise.remove_external_signer(&account_one.pubkey);
+            whitenoise.remove_external_signer(&account_two.pubkey);
+            whitenoise
+                .session(&account_one.pubkey)
+                .expect("session should exist")
+                .deactivate_subscriptions()
+                .await;
+            whitenoise
+                .session(&account_two.pubkey)
+                .expect("session should exist")
+                .deactivate_subscriptions()
+                .await;
+
+            whitenoise
+                .register_external_signer(account_one.pubkey, keys_one)
+                .await
+                .unwrap();
+
+            let one_after_first_registration = whitenoise
+                .is_account_subscriptions_operational(&account_one)
+                .await
+                .unwrap();
+            let two_after_first_registration = whitenoise
+                .is_account_subscriptions_operational(&account_two)
+                .await
+                .unwrap();
+            assert!(
+                one_after_first_registration,
+                "Registering account one's signer should recover account one"
+            );
+            assert!(
+                !two_after_first_registration,
+                "Registering account one's signer should not recover account two"
+            );
+
+            whitenoise
+                .register_external_signer(account_two.pubkey, keys_two)
+                .await
+                .unwrap();
+
+            let two_after_second_registration = whitenoise
+                .is_account_subscriptions_operational(&account_two)
+                .await
+                .unwrap();
+            assert!(
+                two_after_second_registration,
+                "Registering account two's signer should recover account two"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_recovers_subscriptions_with_nip65_inbox_fallback() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let keys = Keys::generate();
+            let account = whitenoise
+                .login_with_external_signer_for_test(keys.clone())
+                .await
+                .unwrap();
+
+            let nip65_relays = account.nip65_relays(&whitenoise.shared).await.unwrap();
+            assert!(
+                !nip65_relays.is_empty(),
+                "test setup should give the account NIP-65 relays"
+            );
+
+            let user = account.user(&whitenoise.shared.database).await.unwrap();
+            user.sync_relay_urls(&whitenoise.shared, RelayType::Inbox, &HashSet::new(), None)
+                .await
+                .unwrap();
+
+            assert!(
+                account
+                    .inbox_relays(&whitenoise.shared)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "test setup should leave the account with no explicit inbox relays"
+            );
+            assert!(
+                !account
+                    .effective_inbox_relays(&whitenoise.shared)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "effective inbox relay lookup should fall back to NIP-65 relays"
+            );
+
+            whitenoise.remove_external_signer(&account.pubkey);
+            whitenoise
+                .session(&account.pubkey)
+                .expect("session should exist")
+                .deactivate_subscriptions()
+                .await;
+
+            let before = whitenoise
+                .is_account_subscriptions_operational(&account)
+                .await
+                .unwrap();
+            assert!(
+                !before,
+                "Account subscriptions should be non-operational before signer re-registration"
+            );
+
+            whitenoise
+                .register_external_signer(account.pubkey, keys)
+                .await
+                .unwrap();
+
+            let after = whitenoise
+                .is_account_subscriptions_operational(&account)
+                .await
+                .unwrap();
+            assert!(
+                after,
+                "register_external_signer should recover subscriptions using NIP-65 fallback relays"
             );
         }
 

@@ -56,9 +56,9 @@ impl Whitenoise {
         // On app restore, external accounts may exist before their signer is
         // re-registered. Startup subscription setup can fail in that gap.
         // Rebuild account subscriptions now that signing/decryption is available.
-        // Only inbox_relays is needed by setup_subscriptions; do not gate
-        // recovery on the nip65 lookup which is not used here.
-        match account.inbox_relays(&self.shared).await {
+        // Match startup behavior by using the effective inbox relay set, so
+        // legacy accounts without kind 10050 relays still fall back to NIP-65.
+        match account.effective_inbox_relays(&self.shared).await {
             Ok(inbox_relays) => {
                 if let Err(e) = self.setup_subscriptions(&account, &inbox_relays).await {
                     tracing::warn!(

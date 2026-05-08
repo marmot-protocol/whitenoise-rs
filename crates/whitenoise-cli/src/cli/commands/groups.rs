@@ -124,6 +124,12 @@ pub enum GroupsCmd {
         /// MLS group ID (hex)
         group_id: String,
     },
+
+    /// Subscribe to live group state events (LeftGroup, RemovedFromGroup)
+    SubscribeState {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
 }
 
 impl GroupsCmd {
@@ -166,8 +172,37 @@ impl GroupsCmd {
             Self::SelfDemote { group_id } => {
                 self_demote(socket, json, account_flag, group_id).await
             }
+            Self::SubscribeState { group_id } => {
+                subscribe_state(socket, json, account_flag, group_id).await
+            }
         }
     }
+}
+
+async fn subscribe_state(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> crate::cli::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let req = Request::GroupStateSubscribe {
+        account: pubkey,
+        group_id,
+    };
+    let mut had_error = false;
+    client::stream(socket, &req, |resp| {
+        let ok = output::print_stream_response(resp, json);
+        if !ok {
+            had_error = true;
+        }
+        ok
+    })
+    .await?;
+    if had_error {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn create(

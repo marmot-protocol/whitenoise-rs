@@ -539,6 +539,7 @@ pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
         | Request::ChatsSubscribe { .. }
         | Request::ArchivedChatsSubscribe { .. }
         | Request::NotificationsSubscribe
+        | Request::GroupStateSubscribe { .. }
         | Request::UsersSearch { .. } => {
             Response::err("streaming commands must use dispatch_streaming")
         }
@@ -598,6 +599,9 @@ where
         }
         Request::NotificationsSubscribe => {
             notifications_subscribe(wn, &mut writer).await;
+        }
+        Request::GroupStateSubscribe { account, group_id } => {
+            group_state_subscribe(wn, &mut writer, &account, &group_id).await;
         }
         Request::UsersSearch {
             account,
@@ -759,6 +763,67 @@ where
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("chat list stream lagged by {n} updates");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} updates dropped")),
+                )
+                .await;
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
+}
+
+async fn group_state_subscribe<W>(
+    wn: &Whitenoise,
+    writer: &mut W,
+    account_str: &str,
+    group_id_hex: &str,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    let account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+    let group_id = match parse_group_id(group_id_hex) {
+        Ok(id) => id,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let subscription = match wn
+        .subscribe_to_group_state(&account.pubkey, &group_id)
+        .await
+    {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let resp = Response::ok(serde_json::json!({ "update": update }));
+                if !write_response(writer, &resp).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("group state stream lagged by {n} updates");
                 let _ = write_response(
                     writer,
                     &Response::err(format!("stream lagged: {n} updates dropped")),
