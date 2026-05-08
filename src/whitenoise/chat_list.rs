@@ -280,7 +280,7 @@ impl Whitenoise {
         note = "Use AccountSession::chat_list().build_item() instead."
     )]
     #[perf_instrument("chat_list")]
-    pub(crate) async fn build_chat_list_item(
+    pub async fn build_chat_list_item(
         &self,
         account: &Account,
         group_id: &GroupId,
@@ -364,9 +364,10 @@ impl Whitenoise {
         let cleared_ms = account_group
             .chat_cleared_at
             .map(|dt| dt.timestamp_millis());
-        let unread_count = AggregatedMessage::count_unread_for_group(
+        let unread_count = AggregatedMessage::count_visible_unread_for_group(
             group_id,
             account_group.last_read_message_id.as_ref(),
+            &account.pubkey,
             &session.account_db.inner,
             cleared_ms,
         )

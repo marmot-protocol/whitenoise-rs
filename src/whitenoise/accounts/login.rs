@@ -88,7 +88,7 @@ impl Whitenoise {
         Ok(account)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-tests"))]
     pub(crate) async fn create_test_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
         self.create_identity_with_keys_inner(keys, true).await
     }

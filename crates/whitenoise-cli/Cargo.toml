@@ -26,6 +26,11 @@ whitenoise = { path = "../..", features = ["cli", "integration-tests"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 
+[features]
+default = []
+# Gates tests that depend on whitenoise's `test_utils` helpers.
+integration-tests = []
+
 [[bin]]
 name = "wn"
 path = "src/bin/wn.rs"

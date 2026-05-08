@@ -1263,10 +1263,18 @@ mod tests {
             .unwrap();
         let group_id = &group.mls_group_id;
 
-        // Create a message ID that doesn't exist yet (simulating out-of-order delivery)
-        let future_message_id = EventId::all_zeros();
+        // Build the message first so MDK can stamp a valid content-hash id,
+        // then tag the orphaned reaction at that id.
+        let mut actual_message = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Late message".to_string(),
+        );
+        actual_message.ensure_id();
+        let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
-        // Send reaction to non-existent message (orphaned reaction)
         let mut orphaned_reaction = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -1298,15 +1306,6 @@ mod tests {
             "Should have one orphaned reaction"
         );
 
-        // Now send the actual message with the matching ID
-        let mut actual_message = UnsignedEvent::new(
-            creator_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Late message".to_string(),
-        );
-        actual_message.id = Some(future_message_id);
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
@@ -1368,7 +1367,17 @@ mod tests {
             .unwrap();
         let group_id = &group.mls_group_id;
 
-        let future_message_id = EventId::all_zeros();
+        // Build the target first so MDK can stamp a valid content-hash id,
+        // then tag the orphaned reactions at that id.
+        let mut actual_message = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Target message".to_string(),
+        );
+        actual_message.ensure_id();
+        let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
         // Send a VALID orphaned reaction
         let mut valid_reaction = UnsignedEvent::new(
@@ -1404,15 +1413,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Now send the target message - this should succeed despite invalid orphaned reaction
-        let mut actual_message = UnsignedEvent::new(
-            creator_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Target message".to_string(),
-        );
-        actual_message.id = Some(future_message_id);
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise

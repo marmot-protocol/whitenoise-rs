@@ -1280,7 +1280,7 @@ impl Whitenoise {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-tests"))]
 pub mod test_utils {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1439,7 +1439,7 @@ pub mod test_utils {
         (whitenoise, event_receiver, data_temp, logs_temp)
     }
 
-    pub(crate) async fn create_mock_whitenoise() -> (Arc<Whitenoise>, TempDir, TempDir) {
+    pub async fn create_mock_whitenoise() -> (Arc<Whitenoise>, TempDir, TempDir) {
         let (whitenoise, _event_receiver, data_temp, logs_temp) =
             create_mock_whitenoise_internal().await;
         (whitenoise, data_temp, logs_temp)
@@ -1603,7 +1603,7 @@ pub mod test_utils {
         (account, keys)
     }
 
-    pub(crate) fn create_nostr_group_config_data(admins: Vec<PublicKey>) -> NostrGroupConfigData {
+    pub fn create_nostr_group_config_data(admins: Vec<PublicKey>) -> NostrGroupConfigData {
         NostrGroupConfigData::new(
             "Test group".to_owned(),
             "test description".to_owned(),

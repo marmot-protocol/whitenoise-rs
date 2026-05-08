@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::{GroupId, message_types::Message};
 use nostr_sdk::prelude::*;
+use sqlx::Row;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::nostr_manager::parser::SerializableToken;
@@ -1319,43 +1320,84 @@ impl AggregatedMessage {
         database: &Database,
         chat_cleared_at_ms: Option<i64>,
     ) -> Result<usize> {
-        let count: i64 = match read_marker {
-            Some(message_id) => {
-                // Count messages after the read marker's timestamp
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM aggregated_messages am
-                     WHERE am.mls_group_id = ?
-                       AND am.kind = 9
-                       AND am.deletion_event_id IS NULL
-                       AND am.created_at > COALESCE(
-                           (SELECT created_at FROM aggregated_messages
-                            WHERE message_id = ? AND mls_group_id = ?),
-                           0
-                       )
-                       AND am.created_at > COALESCE(?, 0)",
-                )
-                .bind(group_id.as_slice())
-                .bind(message_id.to_hex())
-                .bind(group_id.as_slice())
-                .bind(chat_cleared_at_ms)
-                .fetch_one(&database.pool)
-                .await?
-            }
-            None => {
-                // No read marker = all messages are unread
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM aggregated_messages
-                     WHERE mls_group_id = ?
-                       AND kind = 9
-                       AND deletion_event_id IS NULL
-                       AND created_at > COALESCE(?, 0)",
-                )
-                .bind(group_id.as_slice())
-                .bind(chat_cleared_at_ms)
-                .fetch_one(&database.pool)
-                .await?
-            }
-        };
+        Self::count_unread_for_group_filtered(
+            group_id,
+            read_marker,
+            database,
+            chat_cleared_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Count chat-list-visible unread messages for a group.
+    ///
+    /// This is the same unread projection as `count_unread_for_group`, except it
+    /// excludes messages authored by users blocked by `account_pubkey`.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn count_visible_unread_for_group(
+        group_id: &GroupId,
+        read_marker: Option<&EventId>,
+        account_pubkey: &PublicKey,
+        database: &Database,
+        chat_cleared_at_ms: Option<i64>,
+    ) -> Result<usize> {
+        Self::count_unread_for_group_filtered(
+            group_id,
+            read_marker,
+            database,
+            chat_cleared_at_ms,
+            Some(account_pubkey),
+        )
+        .await
+    }
+
+    async fn count_unread_for_group_filtered(
+        group_id: &GroupId,
+        read_marker: Option<&EventId>,
+        database: &Database,
+        chat_cleared_at_ms: Option<i64>,
+        account_pubkey: Option<&PublicKey>,
+    ) -> Result<usize> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT COUNT(*) FROM aggregated_messages am
+             WHERE am.mls_group_id = ",
+        );
+        qb.push_bind(group_id.as_slice());
+        qb.push(
+            " AND am.kind = 9
+              AND am.deletion_event_id IS NULL",
+        );
+
+        if let Some(message_id) = read_marker {
+            qb.push(
+                " AND am.created_at > COALESCE(
+                    (SELECT created_at FROM aggregated_messages
+                     WHERE message_id = ",
+            );
+            qb.push_bind(message_id.to_hex());
+            qb.push(" AND mls_group_id = ");
+            qb.push_bind(group_id.as_slice());
+            qb.push("), 0)");
+        }
+
+        qb.push(" AND am.created_at > COALESCE(");
+        qb.push_bind(chat_cleared_at_ms);
+        qb.push(", 0)");
+
+        if account_pubkey.is_some() {
+            // mute_list is per-account so account scoping is implicit.
+            // The Option<&PublicKey> parameter acts as a feature toggle:
+            // Some = filter blocked authors, None = no filter.
+            qb.push(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM mute_list ml
+                    WHERE ml.muted_pubkey = am.author
+                )",
+            );
+        }
+
+        let count: i64 = qb.build_query_scalar().fetch_one(&database.pool).await?;
 
         Ok(count as usize)
     }
@@ -1371,8 +1413,26 @@ impl AggregatedMessage {
         group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
         database: &Database,
     ) -> Result<HashMap<GroupId, usize>> {
-        use sqlx::Row;
+        Self::count_unread_for_groups_filtered(group_markers, database, None).await
+    }
 
+    /// Count chat-list-visible unread messages for multiple groups.
+    ///
+    /// Excludes messages authored by users blocked by `account_pubkey`.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn count_visible_unread_for_groups(
+        group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
+        account_pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<HashMap<GroupId, usize>> {
+        Self::count_unread_for_groups_filtered(group_markers, database, Some(account_pubkey)).await
+    }
+
+    async fn count_unread_for_groups_filtered(
+        group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
+        database: &Database,
+        account_pubkey: Option<&PublicKey>,
+    ) -> Result<HashMap<GroupId, usize>> {
         if group_markers.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1441,17 +1501,33 @@ impl AggregatedMessage {
              WHERE am.mls_group_id IN (",
         );
 
-        let mut sep = qb.separated(", ");
-        for group_id in &all_group_ids {
-            sep.push_bind(group_id);
+        {
+            let mut sep = qb.separated(", ");
+            for group_id in &all_group_ids {
+                sep.push_bind(group_id);
+            }
         }
-        sep.push_unseparated(
+
+        qb.push(
             ") AND am.kind = 9 \
              AND am.deletion_event_id IS NULL \
              AND am.created_at > COALESCE(mt.created_at, 0) \
-             AND am.created_at > COALESCE(ct.cleared_at, 0) \
-             GROUP BY am.mls_group_id",
+             AND am.created_at > COALESCE(ct.cleared_at, 0)",
         );
+
+        if account_pubkey.is_some() {
+            // mute_list is per-account so account scoping is implicit.
+            // The Option<&PublicKey> parameter acts as a feature toggle:
+            // Some = filter blocked authors, None = no filter.
+            qb.push(
+                " AND NOT EXISTS ( \
+                    SELECT 1 FROM mute_list ml \
+                    WHERE ml.muted_pubkey = am.author \
+                )",
+            );
+        }
+
+        qb.push(" GROUP BY am.mls_group_id");
 
         let rows = qb.build().fetch_all(&database.pool).await?;
 

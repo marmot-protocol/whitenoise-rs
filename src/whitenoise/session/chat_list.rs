@@ -247,8 +247,9 @@ impl<'a> ChatListOps<'a> {
                 (gid.clone(), ag.last_read_message_id, cleared_ms)
             })
             .collect();
-        let unread_counts = AggregatedMessage::count_unread_for_groups(
+        let unread_counts = AggregatedMessage::count_visible_unread_for_groups(
             &group_markers,
+            &self.session.account_pubkey,
             &self.session.account_db.inner,
         )
         .await?;

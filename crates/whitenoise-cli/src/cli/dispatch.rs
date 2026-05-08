@@ -313,6 +313,13 @@ pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
             Err(resp) => resp,
         },
 
+        Request::GetChatListItem { account, group_id } => {
+            match get_chat_list_item(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
         Request::ArchiveChat { account, group_id } => {
             match archive_chat(wn, &account, &group_id).await {
                 Ok(resp) => resp,
@@ -1329,6 +1336,22 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
 }
 
 #[allow(deprecated)]
+async fn get_chat_list_item(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let item = wn
+        .build_chat_list_item(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?
+        .ok_or_else(|| Response::err("group not found".to_string()))?;
+    Ok(Response::ok(clean_chat_list_item(wn, &item).await))
+}
+
+#[allow(deprecated)]
 async fn archive_chat(
     wn: &Whitenoise,
     account_str: &str,
@@ -2275,8 +2298,6 @@ mod tests {
     use nostr_sdk::ToBech32;
     use std::collections::BTreeSet;
 
-    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
-
     use super::*;
 
     // --- parse_pubkey ---
@@ -2344,8 +2365,12 @@ mod tests {
 
     // --- get_group ---
 
+    #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn get_group_returns_nested_shape_with_required_proposals() {
+        use whitenoise::whitenoise::test_utils::{
+            create_mock_whitenoise, create_nostr_group_config_data,
+        };
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
