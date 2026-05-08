@@ -8,6 +8,7 @@ pub mod drafts;
 pub mod follow_management;
 pub mod group_capability_upgrade;
 pub mod group_membership;
+pub mod group_state_streaming;
 pub mod login_flow;
 pub mod message_streaming;
 pub mod metadata_management;
