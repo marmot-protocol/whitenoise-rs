@@ -41,6 +41,8 @@ pub enum Language {
     #[default]
     System,
     English,
+    ChineseSimplified,
+    ChineseTraditional,
     Spanish,
     French,
     German,
@@ -55,6 +57,8 @@ impl fmt::Display for Language {
         match self {
             Language::System => write!(f, "system"),
             Language::English => write!(f, "en"),
+            Language::ChineseSimplified => write!(f, "zh"),
+            Language::ChineseTraditional => write!(f, "zh_Hant"),
             Language::Spanish => write!(f, "es"),
             Language::French => write!(f, "fr"),
             Language::German => write!(f, "de"),
@@ -73,6 +77,12 @@ impl FromStr for Language {
         match s.to_lowercase().as_str() {
             "system" => Ok(Language::System),
             "en" | "english" => Ok(Language::English),
+            "zh" | "zh_hans" | "chinese" | "chinese-simplified" | "simplified-chinese" => {
+                Ok(Language::ChineseSimplified)
+            }
+            "zh_hant" | "chinese-traditional" | "traditional-chinese" => {
+                Ok(Language::ChineseTraditional)
+            }
             "es" | "spanish" => Ok(Language::Spanish),
             "fr" | "french" => Ok(Language::French),
             "de" | "german" => Ok(Language::German),
@@ -196,6 +206,8 @@ mod tests {
         for variant in [
             Language::System,
             Language::English,
+            Language::ChineseSimplified,
+            Language::ChineseTraditional,
             Language::Spanish,
             Language::French,
             Language::German,
@@ -212,6 +224,14 @@ mod tests {
     #[test]
     fn language_from_str_accepts_full_names() {
         assert_eq!(Language::from_str("english").unwrap(), Language::English);
+        assert_eq!(
+            Language::from_str("simplified-chinese").unwrap(),
+            Language::ChineseSimplified
+        );
+        assert_eq!(
+            Language::from_str("traditional-chinese").unwrap(),
+            Language::ChineseTraditional
+        );
         assert_eq!(Language::from_str("spanish").unwrap(), Language::Spanish);
         assert_eq!(Language::from_str("french").unwrap(), Language::French);
         assert_eq!(Language::from_str("german").unwrap(), Language::German);
@@ -227,6 +247,10 @@ mod tests {
     #[test]
     fn language_from_str_is_case_insensitive() {
         assert_eq!(Language::from_str("EN").unwrap(), Language::English);
+        assert_eq!(
+            Language::from_str("zh_Hant").unwrap(),
+            Language::ChineseTraditional
+        );
         assert_eq!(Language::from_str("SPANISH").unwrap(), Language::Spanish);
         assert_eq!(Language::from_str("Fr").unwrap(), Language::French);
     }

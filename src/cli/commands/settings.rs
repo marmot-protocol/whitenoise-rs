@@ -19,7 +19,7 @@ pub enum SettingsCmd {
 
     /// Set the language
     Language {
-        /// Language: system, en, es, fr, de, it, pt, ru, tr
+        /// Language: system, en, zh, zh_Hant, es, fr, de, it, pt, ru, tr
         lang: String,
     },
 }
