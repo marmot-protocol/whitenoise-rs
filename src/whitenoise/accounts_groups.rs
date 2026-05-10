@@ -645,8 +645,8 @@ impl Whitenoise {
         };
 
         // 3. Pre-build the ChatListItem while data still exists
-        //    (MDK state and DB data are needed for build_chat_list_item)
-        let chat_list_item = self.build_chat_list_item(account, group_id).await;
+        //    (MDK state and DB data are needed to build the item)
+        let chat_list_item = session.chat_list().build_item(group_id).await;
 
         // 4. Delete per-account accounts_groups row
         AccountGroup::delete_for_group(group_id, &session.account_db.inner.pool).await?;
