@@ -838,6 +838,22 @@ impl Whitenoise {
 
         init_timing::record("discovery_plane");
 
+        // Restore account sessions before any startup step that resolves a
+        // session by pubkey. `sync_message_cache_on_startup` reads per-account
+        // `aggregated_messages` via `session.account_db` (post phase-18e), so
+        // sessions must be populated first or it raises `AccountNotFound`.
+        // Migrations were already applied in lockstep across shared and every
+        // on-disk per-account file via `MIGRATOR.run_all` at the top of
+        // `Whitenoise::new`, so `run_account_migrations` here is a no-op for
+        // already-stamped versions. Only newly-created accounts (e.g. first
+        // login post-boot) need it to fire the bootstrap migration.
+        let _ = whitenoise
+            .account_manager
+            .restore_sessions(&whitenoise)
+            .await;
+
+        init_timing::record("session_restore");
+
         tracing::info!(
             target: "whitenoise::new",
             "Synchronizing message cache with MDK..."
@@ -906,20 +922,6 @@ impl Whitenoise {
         }
 
         init_timing::record("background_tasks");
-
-        // Restore account sessions for all persisted accounts before setting up
-        // subscriptions so that each account has an MDK instance ready.
-        // Migrations were already applied in lockstep across shared and every
-        // on-disk per-account file via `MIGRATOR.run_all` at the top of
-        // `Whitenoise::new`, so `run_account_migrations` here is a no-op for
-        // already-stamped versions. Only newly-created accounts (e.g. first
-        // login post-boot) need it to fire the bootstrap migration.
-        let _ = whitenoise
-            .account_manager
-            .restore_sessions(&whitenoise)
-            .await;
-
-        init_timing::record("session_restore");
 
         // Fetch events and setup subscriptions after event processing has started
         whitenoise.setup_all_subscriptions().await?;
