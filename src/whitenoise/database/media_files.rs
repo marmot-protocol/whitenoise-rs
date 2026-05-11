@@ -104,7 +104,7 @@ struct ReferenceRow {
     original_file_hash: Option<String>,
     media_type: String,
     nostr_key: Option<String>,
-    file_metadata: Option<String>,
+    file_metadata: Option<Vec<u8>>,
     nonce: Option<String>,
     scheme_version: Option<String>,
     created_at: i64,
@@ -137,8 +137,9 @@ impl MediaFile {
         let original_file_hash = r
             .original_file_hash
             .and_then(|hex_str| hex::decode(&hex_str).ok());
-        let file_metadata: Option<FileMetadata> =
-            r.file_metadata.and_then(|s| serde_json::from_str(&s).ok());
+        let file_metadata: Option<FileMetadata> = r
+            .file_metadata
+            .and_then(|s| serde_json::from_slice(&s).ok());
         let created_at = match chrono::DateTime::from_timestamp_millis(r.created_at) {
             Some(ts) => ts,
             None => {
@@ -1990,6 +1991,102 @@ mod tests {
         assert!(
             retrieved.thumbhash.is_none(),
             "Old records without thumbhash should deserialize with None"
+        );
+    }
+
+    /// Regression: a non-null `file_metadata` written through the production
+    /// path must round-trip cleanly back into `MediaFile.file_metadata`.
+    ///
+    /// This exercises the read side of `media_references.file_metadata`,
+    /// which is declared `BLOB` in the schema. The internal `ReferenceRow`
+    /// must accept whatever SQLite stores there (TEXT or BLOB) without a
+    /// sqlx column-decode error.
+    #[tokio::test]
+    async fn test_file_metadata_blob_column_roundtrip() {
+        let t = setup_test_dbs().await;
+
+        let group_id = mdk_core::GroupId::from_slice(&[7u8; 8]);
+        let encrypted_hash = [77u8; 32];
+        let file_path = t._dir.path().join("blob_roundtrip.jpg");
+
+        let metadata = FileMetadata::new()
+            .with_filename("photo.jpg".to_string())
+            .with_dimensions("4032x3024".to_string())
+            .with_blurhash("L9AB*A%MfQ%M~qfQfQfQfQfQfQfQ".to_string())
+            .with_thumbhash("3OcRJYB4d3h_iIeHeYh3eIhw+j3A".to_string());
+
+        MediaFile::save(
+            &t.account_pool,
+            &t.shared,
+            &group_id,
+            &t.account_pubkey,
+            MediaFileParams {
+                file_path: &file_path,
+                original_file_hash: None,
+                encrypted_file_hash: &encrypted_hash,
+                mime_type: "image/jpeg",
+                media_type: "chat_media",
+                blossom_url: Some("https://blossom.example.com/77"),
+                nostr_key: None,
+                file_metadata: Some(&metadata),
+                nonce: None,
+                scheme_version: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Simulate the on-disk state reported in production: a row whose
+        // `file_metadata` cell carries SQLite's BLOB storage class, not TEXT.
+        // sqlx's `Json<T>` for SQLite encodes as TEXT, so the production
+        // BLOB-typed cells must have come from a path that wrote raw bytes —
+        // overwrite directly via `CAST(... AS BLOB)` to reproduce that state.
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+        sqlx::query("UPDATE media_references SET file_metadata = CAST(? AS BLOB) WHERE encrypted_file_hash = ?")
+            .bind(&metadata_bytes)
+            .bind(hex::encode(encrypted_hash))
+            .execute(&t.account_pool)
+            .await
+            .unwrap();
+
+        // Sanity-check: the stored value's runtime storage class is now BLOB.
+        let storage_class: String = sqlx::query_scalar(
+            "SELECT typeof(file_metadata) FROM media_references WHERE encrypted_file_hash = ?",
+        )
+        .bind(hex::encode(encrypted_hash))
+        .fetch_one(&t.account_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            storage_class, "blob",
+            "test setup must reproduce the production storage class"
+        );
+
+        // Read back via the production path. Before the fix this fails with:
+        //   mismatched types; Rust type `core::option::Option<alloc::string::String>`
+        //   (as SQL type `TEXT`) is not compatible with SQL type `BLOB`
+        let found = MediaFile::find_by_hash(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &encrypted_hash,
+        )
+        .await
+        .expect("decoding a BLOB-typed file_metadata cell must not error")
+        .expect("row must still be present");
+
+        let retrieved = found
+            .file_metadata
+            .expect("file_metadata must round-trip from BLOB storage");
+        assert_eq!(retrieved.original_filename, Some("photo.jpg".to_string()));
+        assert_eq!(retrieved.dimensions, Some("4032x3024".to_string()));
+        assert_eq!(
+            retrieved.blurhash,
+            Some("L9AB*A%MfQ%M~qfQfQfQfQfQfQfQ".to_string())
+        );
+        assert_eq!(
+            retrieved.thumbhash,
+            Some("3OcRJYB4d3h_iIeHeYh3eIhw+j3A".to_string())
         );
     }
 }
