@@ -304,8 +304,8 @@ impl Whitenoise {
         // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
         let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
-            Self::rotate_key_package(whitenoise, account, session, key_package_event_id),
-            Self::sync_group_image(whitenoise, account, group_id),
+            Self::rotate_key_package(session, key_package_event_id),
+            Self::sync_group_image(session, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
         );
 
@@ -402,11 +402,8 @@ impl Whitenoise {
     ///
     /// Marks the consumed key package in the published_key_packages table,
     /// then deletes it from relays and publishes a fresh replacement.
-    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
     async fn rotate_key_package(
-        whitenoise: &Whitenoise,
-        account: &Account,
         session: &Arc<AccountSession>,
         key_package_event_id: EventId,
     ) -> Result<()> {
@@ -429,7 +426,7 @@ impl Whitenoise {
 
         // Publish new key package first so the account is never left with zero
         // key packages on relays. If this fails, the old one stays available.
-        whitenoise.publish_key_package_for_account(account).await?;
+        session.key_packages().publish().await?;
         tracing::debug!(
             target: "whitenoise::event_processor::process_welcome::background",
             "Published new key package"
@@ -437,8 +434,9 @@ impl Whitenoise {
 
         // Now delete the used key package. Failure here is non-fatal — the
         // scheduler will clean it up during routine maintenance.
-        match whitenoise
-            .delete_key_package_for_account(account, &key_package_event_id, false)
+        match session
+            .key_packages()
+            .delete(&key_package_event_id, false)
             .await
         {
             Ok(true) => {
@@ -466,15 +464,12 @@ impl Whitenoise {
     }
 
     /// Sync group image cache if needed
-    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
-    async fn sync_group_image(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        whitenoise
-            .sync_group_image_cache_if_needed(account, group_id)
+    async fn sync_group_image(session: &Arc<AccountSession>, group_id: &GroupId) -> Result<()> {
+        session
+            .groups()
+            .media()
+            .sync_group_image_cache_if_needed(group_id)
             .await
     }
 
@@ -498,10 +493,10 @@ impl Whitenoise {
     /// advance local state after confirming the relay accepted the event.
     /// If all publish attempts fail, the pending commit is never merged and
     /// the group state remains unchanged.
-    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
     async fn perform_self_update(
         whitenoise: &Whitenoise,
+        session: &Arc<AccountSession>,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
@@ -516,8 +511,9 @@ impl Whitenoise {
             update_result.evolution_event
         };
 
-        whitenoise
-            .publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
+        session
+            .groups()
+            .publish_and_merge_commit(evolution_event, group_id, &relay_urls)
             .await?;
 
         tracing::info!(
@@ -532,7 +528,6 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
@@ -831,7 +826,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
         whitenoise
-            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 

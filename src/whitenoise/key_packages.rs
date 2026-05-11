@@ -10,6 +10,7 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::{Result, WhitenoiseError};
+#[cfg(test)]
 use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId, RequiredProposal};
 use crate::whitenoise::relays::Relay;
 
@@ -206,6 +207,7 @@ pub(crate) fn validate_marmot_key_package_baseline(
 
 /// Extracts the Marmot key package capabilities (extensions + proposals) from
 /// the event's tags as structured enums for downstream policy checks.
+#[cfg(test)]
 pub(crate) fn marmot_key_package_capabilities(event: &Event) -> KeyPackageCapabilities {
     use std::collections::BTreeSet;
 
@@ -284,7 +286,6 @@ pub(crate) fn filter_key_package_events_for_account(
     (valid_events, dropped_wrong_kind, dropped_wrong_author)
 }
 
-#[allow(deprecated)]
 impl Whitenoise {
     /// Helper method to create and encode a key package for the given account.
     ///
@@ -304,24 +305,6 @@ impl Whitenoise {
             .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))?;
 
         Ok(data)
-    }
-
-    /// Publishes the MLS key package for the given account to its key package relays.
-    ///
-    /// Creates a single MLS key package, then retries relay publishing up to
-    /// 3 times with exponential backoff (2s, 4s) if publishing fails. The key
-    /// package is created only once to avoid orphaning unused key material in
-    /// local MLS storage.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().publish() instead."
-    )]
-    #[perf_instrument("key_packages")]
-    pub async fn publish_key_package_for_account(&self, account: &Account) -> Result<()> {
-        self.require_session(&account.pubkey)?
-            .key_packages()
-            .publish()
-            .await
     }
 
     /// Publishes the MLS key package using an external signer.
@@ -353,28 +336,7 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Creates a new MLS key package for the account and publishes it to the given relays.
-    ///
-    /// This is a convenience wrapper that calls [`Self::encoded_key_package`] followed by
-    /// [`Self::publish_key_package_to_relays`]. If you need retry semantics, prefer calling
-    /// those two methods separately so the key package is only created once.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().create_and_publish() instead."
-    )]
-    #[perf_instrument("key_packages")]
-    pub(crate) async fn create_and_publish_key_package(
-        &self,
-        account: &Account,
-        relays: &[Relay],
-    ) -> Result<()> {
-        self.require_session(&account.pubkey)?
-            .key_packages()
-            .create_and_publish(relays)
-            .await
-    }
-
-    /// Like [`Self::create_and_publish_key_package`], but the relay publish
+    /// Like the session `create_and_publish()` flow, but the relay publish
     /// Creates a key package, publishes it to the configured relays, and
     /// records the published event in the database.
     ///
@@ -574,24 +536,6 @@ impl Whitenoise {
     /// - For external accounts (Amber/NIP-55): uses the registered external signer
     /// - For local accounts: uses keys from the secrets store
     ///
-    /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().delete() instead."
-    )]
-    #[perf_instrument("key_packages")]
-    pub async fn delete_key_package_for_account(
-        &self,
-        account: &Account,
-        event_id: &EventId,
-        delete_mls_stored_keys: bool,
-    ) -> Result<bool> {
-        self.require_session(&account.pubkey)?
-            .key_packages()
-            .delete(event_id, delete_mls_stored_keys)
-            .await
-    }
-
     /// Deletes the key package from the relays using an external signer.
     ///
     /// This is used for external signer accounts (like Amber/NIP-55) where the
@@ -779,22 +723,6 @@ impl Whitenoise {
     /// - Account has no key package relays configured
     /// - Failed to retrieve account's key package relays
     /// - Network error while fetching events from relays
-    /// - NostrSDK error during event streaming
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().fetch_all() instead."
-    )]
-    #[perf_instrument("key_packages")]
-    pub async fn fetch_all_key_packages_for_account(
-        &self,
-        account: &Account,
-    ) -> Result<Vec<Event>> {
-        self.require_session(&account.pubkey)?
-            .key_packages()
-            .fetch_all()
-            .await
-    }
-
     /// Deletes all legacy key package events from relays for the given account.
     ///
     /// This developer-facing cleanup keeps canonical replaceable kind:30443 key packages
@@ -812,33 +740,6 @@ impl Whitenoise {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().delete_all() instead."
-    )]
-    #[perf_instrument("key_packages")]
-    pub async fn delete_all_key_packages_for_account(
-        &self,
-        account: &Account,
-        delete_mls_stored_keys: bool,
-    ) -> Result<usize> {
-        self.require_session(&account.pubkey)?
-            .key_packages()
-            .delete_all(delete_mls_stored_keys)
-            .await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().delete_legacy() instead."
-    )]
-    #[perf_instrument("key_packages")]
-    pub async fn delete_legacy_key_packages_for_account(&self, account: &Account) -> Result<usize> {
-        let session = self.require_session(&account.pubkey)?;
-        session.key_packages().delete_legacy().await
-    }
-
     /// Deletes all legacy key package events from relays using an external signer.
     ///
     /// This is used for external signer accounts (like Amber/NIP-55) where the
@@ -847,24 +748,6 @@ impl Whitenoise {
     ///
     /// # Returns
     ///
-    /// Returns the number of legacy key packages that were successfully deleted.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().delete_legacy() instead. The session carries the signer."
-    )]
-    #[perf_instrument("key_packages")]
-    pub async fn delete_legacy_key_packages_for_account_with_signer(
-        &self,
-        account: &Account,
-        signer: impl NostrSigner + 'static,
-    ) -> Result<usize> {
-        // The session already carries the correct signer, so the explicit
-        // signer argument is ignored in the delegation path.
-        let _ = signer;
-        let session = self.require_session(&account.pubkey)?;
-        session.key_packages().delete_legacy().await
-    }
-
     /// Deletes the specified key package events from relays for the given account.
     ///
     /// This method publishes batch deletion events and retries up to `max_retries` times
@@ -882,26 +765,6 @@ impl Whitenoise {
     /// * `max_retries` - Maximum number of retries after the initial attempt (0 = no retries)
     ///
     /// # Returns
-    ///
-    /// Returns the number of key packages that were successfully deleted.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().delete_batch() instead."
-    )]
-    #[perf_instrument("key_packages")]
-    pub(crate) async fn delete_key_packages_for_account(
-        &self,
-        account: &Account,
-        key_package_events: Vec<Event>,
-        delete_mls_stored_keys: bool,
-        max_retries: u32,
-    ) -> Result<usize> {
-        self.require_session(&account.pubkey)?
-            .key_packages()
-            .delete_batch(key_package_events, delete_mls_stored_keys, max_retries)
-            .await
-    }
-
     #[perf_instrument("key_packages")]
     async fn delete_key_packages_for_account_internal(
         &self,
@@ -964,7 +827,11 @@ impl Whitenoise {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
             // Check which of our original packages are still present
-            let remaining_events = self.fetch_all_key_packages_for_account(account).await?;
+            let remaining_events = self
+                .require_session(&account.pubkey)?
+                .key_packages()
+                .fetch_all()
+                .await?;
             pending_ids = remaining_events
                 .iter()
                 .filter(|e| original_ids.contains(&e.id))
@@ -1153,90 +1020,9 @@ impl Whitenoise {
             }
         }
     }
-
-    /// Looks up a published key package record by account and event ID.
-    ///
-    /// Integration-test helper for verifying lifecycle states (consumed_at,
-    /// key_material_deleted) without exposing the raw database handle.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().find_published_for_testing() instead."
-    )]
-    #[cfg(feature = "integration-tests")]
-    pub async fn find_published_key_package_for_testing(
-        &self,
-        account_pubkey: &nostr_sdk::PublicKey,
-        event_id: &str,
-    ) -> Result<Option<PublishedKeyPackage>> {
-        self.require_session(account_pubkey)?
-            .repos
-            .published_key_packages
-            .find_by_event_id(event_id)
-            .await
-    }
-
-    /// Records a published key package in the lifecycle tracking table.
-    ///
-    /// Integration-test helper for cases that manually publish custom key
-    /// package events (for example with a backdated timestamp) and still need
-    /// maintenance to treat them as locally-owned packages. Callers pass the
-    /// event kind explicitly so canonical and legacy test fixtures match the
-    /// event that was actually published.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().track_published_for_testing() instead."
-    )]
-    #[cfg(feature = "integration-tests")]
-    pub async fn track_published_key_package_for_testing(
-        &self,
-        account_pubkey: &nostr_sdk::PublicKey,
-        hash_ref: &[u8],
-        event_id: &str,
-        kind: Kind,
-        d_tag: Option<&str>,
-    ) -> Result<()> {
-        self.require_session(account_pubkey)?
-            .repos
-            .published_key_packages
-            .create(hash_ref, event_id, kind, d_tag)
-            .await
-    }
-
-    /// Backdates the `consumed_at` timestamp for a published key package.
-    ///
-    /// Integration-test helper that shifts `consumed_at` into the past so the
-    /// maintenance task considers it eligible for cleanup without waiting the
-    /// full quiet period.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::key_packages().backdate_consumed_at_for_testing() instead."
-    )]
-    #[cfg(feature = "integration-tests")]
-    pub async fn backdate_consumed_at_for_testing(
-        &self,
-        account_pubkey: &nostr_sdk::PublicKey,
-        event_id: &str,
-        age_secs: i64,
-    ) -> Result<()> {
-        self.require_session(account_pubkey)?
-            .repos
-            .published_key_packages
-            .backdate_consumed_at(event_id, age_secs)
-            .await?;
-
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Backdated consumed_at by {}s for KP hash_ref group containing event {} (TEST ONLY)",
-            age_secs,
-            event_id
-        );
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use chrono::Utc;
     use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
@@ -1548,7 +1334,12 @@ mod tests {
         let account = register_session_with_keys(&whitenoise, account, &keys).await;
 
         // Attempt to publish key package without relays
-        let result = whitenoise.publish_key_package_for_account(&account).await;
+        let result = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .publish()
+            .await;
 
         // Should fail with AccountMissingKeyPackageRelays error
         assert!(result.is_err());
@@ -2138,7 +1929,12 @@ mod tests {
 
         // Pause time so exponential backoff sleeps complete instantly.
         tokio::time::pause();
-        let result = whitenoise.publish_key_package_for_account(&account).await;
+        let result = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .publish()
+            .await;
         tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
@@ -2155,7 +1951,10 @@ mod tests {
         // Pause time so exponential backoff sleeps complete instantly.
         tokio::time::pause();
         let result = whitenoise
-            .create_and_publish_key_package(&account, &relays)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .create_and_publish(&relays)
             .await;
         tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
@@ -2182,7 +1981,10 @@ mod tests {
         let account = register_session_with_keys(&whitenoise, account, &keys).await;
 
         let result = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -2206,7 +2008,10 @@ mod tests {
         let account = create_local_account_struct();
 
         let result = whitenoise
-            .delete_legacy_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .delete_legacy()
             .await;
 
         assert!(result.is_err(), "Should fail when no signer is available");
@@ -2223,24 +2028,10 @@ mod tests {
         let account = register_session_with_keys(&whitenoise, account, &keys).await;
 
         let result = whitenoise
-            .delete_legacy_key_packages_for_account(&account)
-            .await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            WhitenoiseError::AccountMissingKeyPackageRelays
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_delete_legacy_key_packages_with_signer_without_relays_fails() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, keys) = create_test_account(&whitenoise).await;
-        let account = register_session_with_keys(&whitenoise, account, &keys).await;
-        let signer_keys = Keys::generate();
-
-        let result = whitenoise
-            .delete_legacy_key_packages_for_account_with_signer(&account, signer_keys)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .delete_legacy()
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -2255,7 +2046,10 @@ mod tests {
         let account = create_account_with_relay(&whitenoise).await;
 
         let result = whitenoise
-            .delete_key_packages_for_account(&account, vec![], false, 1)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .delete_batch(vec![], false, 1)
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
@@ -2411,7 +2205,10 @@ mod tests {
         let event_id = EventId::all_zeros();
 
         let result = whitenoise
-            .delete_key_package_for_account(&account, &event_id, false)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .delete(&event_id, false)
             .await;
         assert!(result.is_err(), "Should fail when no signer is available");
     }

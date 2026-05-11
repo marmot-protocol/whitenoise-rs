@@ -31,7 +31,6 @@ impl WaitForWelcomeTestCase {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl TestCase for WaitForWelcomeTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;
@@ -54,7 +53,11 @@ impl TestCase for WaitForWelcomeTestCase {
                     let group_id = group_id.clone();
                     let account_name = account_name.clone();
                     async move {
-                        let groups = wn.groups(&account, true).await?;
+                        let groups = wn
+                            .require_session(&account.pubkey)
+                            .unwrap()
+                            .groups()
+                            .all(true)?;
                         if groups.iter().any(|g| g.mls_group_id == group_id) {
                             Ok(())
                         } else {

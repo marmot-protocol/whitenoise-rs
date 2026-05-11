@@ -173,7 +173,6 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
@@ -282,7 +281,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group = whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -313,7 +315,10 @@ mod tests {
         ]);
         config.name = "".to_string(); // Empty name for DirectMessage
         let group = whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -410,7 +415,10 @@ mod tests {
         ]);
         config1.name = "".to_string(); // Empty name for DirectMessage
         let group1 = whitenoise
-            .create_group(&creator_account, vec![member1.pubkey], config1, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -418,7 +426,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group2 = whitenoise
-            .create_group(&creator_account, vec![member2.pubkey], config2, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, None)
             .await
             .unwrap();
 
@@ -426,7 +437,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group3 = whitenoise
-            .create_group(&creator_account, vec![member3.pubkey], config3, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member3.pubkey], config3, None)
             .await
             .unwrap();
 
@@ -479,7 +493,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group1 = whitenoise
-            .create_group(&creator_account, vec![member1.pubkey], config1, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -487,7 +504,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group2 = whitenoise
-            .create_group(&creator_account, vec![member2.pubkey], config2, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, None)
             .await
             .unwrap();
 
@@ -537,7 +557,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group1 = whitenoise
-            .create_group(&creator_account, vec![member1.pubkey], config1, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -545,7 +568,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group2 = whitenoise
-            .create_group(&creator_account, vec![member2.pubkey], config2, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, None)
             .await
             .unwrap();
 
@@ -553,7 +579,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group3 = whitenoise
-            .create_group(&creator_account, vec![member3.pubkey], config3, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member3.pubkey], config3, None)
             .await
             .unwrap();
 

@@ -20,7 +20,6 @@ impl FollowUserTestCase {
 
 #[async_trait]
 impl TestCase for FollowUserTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Following user {} from account: {}",
@@ -29,20 +28,15 @@ impl TestCase for FollowUserTestCase {
         );
 
         let account = context.get_account(&self.follower_account_name)?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
 
         // Perform the follow operation
-        context
-            .whitenoise
-            .follow_user(account, &self.target_pubkey)
-            .await?;
+        session.social().follow_user(&self.target_pubkey).await?;
 
         // Wait for follow operation to be reflected in the system
         retry_default(
             || async {
-                let is_following = context
-                    .whitenoise
-                    .is_following_user(account, &self.target_pubkey)
-                    .await?;
+                let is_following = session.social().is_following(&self.target_pubkey).await?;
 
                 if is_following {
                     Ok(())

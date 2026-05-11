@@ -80,7 +80,6 @@ impl BenchmarkScenario for UserSearchBenchmark {
         unreachable!()
     }
 
-    #[allow(deprecated)]
     async fn run_benchmark(
         &mut self,
         whitenoise: Arc<Whitenoise>,
@@ -92,12 +91,13 @@ impl BenchmarkScenario for UserSearchBenchmark {
 
         let searcher = context.get_account("searcher")?;
         let searcher_pubkey = searcher.pubkey;
+        let session = whitenoise.require_session(&searcher.pubkey)?;
 
         let target_pubkey = PublicKey::parse(SEARCHER_NPUB)
             .map_err(|e| WhitenoiseError::InvalidInput(format!("Invalid searcher npub: {}", e)))?;
 
         // Follow the target so their social graph becomes our radius 1
-        whitenoise.follow_user(searcher, &target_pubkey).await?;
+        session.social().follow_user(&target_pubkey).await?;
 
         // Clear perf samples accumulated during setup/follow so only
         // actual search timings appear in the breakdown.

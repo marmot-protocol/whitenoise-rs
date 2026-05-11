@@ -23,15 +23,34 @@ impl<'a> SettingsOps<'a> {
 
     /// Set `notifications_enabled` and return the updated settings.
     ///
-    /// **Note:** this only updates the database row. It does **not** perform
-    /// push-token reconciliation. Callers that need the full side-effectful
-    /// behaviour should use `Whitenoise::update_notifications_enabled` (which
-    /// delegates here and then handles push-token sync separately).
+    /// Also performs MIP-05 push-token reconciliation across this account's
+    /// joined groups: enabling shares the local push token; disabling removes
+    /// it. Reconciliation failures are logged but do not fail the call.
     pub async fn update_notifications_enabled(&self, enabled: bool) -> Result<AccountSettings> {
-        self.session
+        let settings = self
+            .session
             .repos
             .settings
             .update_notifications_enabled(enabled)
-            .await
+            .await?;
+
+        let push = self.session.push();
+        let reconciliation = if enabled {
+            push.share_local_token_to_joined_groups().await
+        } else {
+            push.remove_local_token_from_joined_groups().await
+        };
+
+        if let Err(error) = reconciliation {
+            tracing::warn!(
+                target: "whitenoise::session::settings",
+                account = %self.session.account_pubkey.to_hex(),
+                enabled,
+                error = %error,
+                "Failed to reconcile shared push tokens after notification preference change"
+            );
+        }
+
+        Ok(settings)
     }
 }

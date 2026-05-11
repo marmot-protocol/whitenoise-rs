@@ -411,13 +411,15 @@ mod tests {
     }
 
     /// Verify that an account has a key package published.
-    #[allow(deprecated)]
     async fn verify_account_key_package_exists(
         whitenoise: &crate::whitenoise::Whitenoise,
         account: &Account,
     ) {
         let key_package_events = whitenoise
-            .fetch_all_key_packages_for_account(account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
 

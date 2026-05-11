@@ -43,7 +43,6 @@ impl UploadChatImageTestCase {
 
 #[async_trait]
 impl TestCase for UploadChatImageTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Uploading chat image for group {} using account: {}",
@@ -80,13 +79,11 @@ impl TestCase for UploadChatImageTestCase {
 
         let media_file = context
             .whitenoise
-            .upload_chat_media(
-                account,
-                &group.mls_group_id,
-                temp_path,
-                blossom_url,
-                options,
-            )
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .upload_chat_media(&group.mls_group_id, temp_path, blossom_url, options)
             .await?;
 
         // Keep temp_file alive until after upload completes

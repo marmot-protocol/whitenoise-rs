@@ -40,7 +40,6 @@ impl AddMembersBenchmark {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl BenchmarkTestCase for AddMembersBenchmark {
     async fn run_iteration(
         &self,
@@ -68,7 +67,10 @@ impl BenchmarkTestCase for AddMembersBenchmark {
 
         context
             .whitenoise
-            .add_members_to_group(admin, &group_id, member_pubkeys)
+            .require_session(&admin.pubkey)
+            .unwrap()
+            .groups()
+            .add_members(&group_id, member_pubkeys)
             .await?;
 
         Ok(start.elapsed())

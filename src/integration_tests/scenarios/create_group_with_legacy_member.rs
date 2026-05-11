@@ -41,7 +41,6 @@ impl Scenario for CreateGroupWithLegacyMemberScenario {
         &self.context
     }
 
-    #[allow(deprecated)]
     async fn run_scenario(&mut self) -> Result<(), WhitenoiseError> {
         // A creates the group, B is the "legacy" peer. B is constructed via
         // the no-initial-KP path so the legacy fixture below is the *only*
@@ -102,8 +101,10 @@ impl Scenario for CreateGroupWithLegacyMemberScenario {
         let members = self
             .context
             .whitenoise
-            .group_members(&creator_account, &group.mls_group_id)
-            .await?;
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)?;
 
         if !members.contains(&peer_pubkey) {
             return Err(WhitenoiseError::Internal(format!(

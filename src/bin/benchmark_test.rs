@@ -259,7 +259,6 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
 }
 
 #[tokio::main]
-#[allow(deprecated)]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
 
@@ -294,11 +293,17 @@ async fn main() -> Result<(), WhitenoiseError> {
     if let Some(ref nsec) = args.login {
         let account = whitenoise.login(nsec.clone()).await?;
         tracing::info!("Logged in as {}", account.pubkey.to_hex());
+        let session = whitenoise.session(&account.pubkey).ok_or_else(|| {
+            WhitenoiseError::Internal(format!(
+                "Account session unavailable after login for {}",
+                account.pubkey.to_hex()
+            ))
+        })?;
 
         // Wait for the contact list to arrive from relays
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let follows = whitenoise.follows(&account).await?;
+            let follows = session.social().follows().await?;
             if !follows.is_empty() {
                 tracing::info!("Contact list synced: {} follows", follows.len());
                 break;

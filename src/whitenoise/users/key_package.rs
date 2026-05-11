@@ -89,7 +89,7 @@ impl User {
     pub async fn key_package_event(&self, shared: &Arc<SharedServices>) -> Result<Option<Event>> {
         match self.key_package_lookup(shared).await? {
             KeyPackageLookup::Found(event) => Ok(Some(event)),
-            KeyPackageLookup::Incompatible { .. } | KeyPackageLookup::NotFound => Ok(None),
+            KeyPackageLookup::Incompatible | KeyPackageLookup::NotFound => Ok(None),
         }
     }
 
@@ -178,7 +178,7 @@ pub(super) fn classify_key_package(event: Option<Event>) -> KeyPackageStatus {
 fn classify_key_package_lookup(lookup: KeyPackageLookup) -> KeyPackageStatus {
     match lookup {
         KeyPackageLookup::Found(event) => KeyPackageStatus::Valid(Box::new(event)),
-        KeyPackageLookup::Incompatible { .. } => KeyPackageStatus::Incompatible,
+        KeyPackageLookup::Incompatible => KeyPackageStatus::Incompatible,
         KeyPackageLookup::NotFound => KeyPackageStatus::NotFound,
     }
 }

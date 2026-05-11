@@ -28,7 +28,6 @@ impl SaveDraftTestCase {
 
 #[async_trait]
 impl TestCase for SaveDraftTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Saving draft for account '{}' in group '{}'...",
@@ -40,9 +39,10 @@ impl TestCase for SaveDraftTestCase {
         let group = context.get_group(&self.group_name)?;
         let group_id = GroupId::from_slice(group.mls_group_id.as_slice());
 
-        let draft = context
-            .whitenoise
-            .save_draft(account, &group_id, &self.content, None, &[])
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+        let draft = session
+            .drafts()
+            .save(&group_id, &self.content, None, &[])
             .await?;
 
         assert!(draft.id.is_some(), "Draft should have an ID after save");

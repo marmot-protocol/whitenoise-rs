@@ -14,7 +14,6 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use futures::stream::{self, StreamExt};
 use mdk_core::mip05::{
     EncryptedToken, LeafTokenTag, NotificationPlatform, PushTokenPlaintext, TokenTag,
     build_notification_batches, build_token_list_response_rumor, build_token_request_rumor,
@@ -55,11 +54,6 @@ pub(crate) enum TokenRateKind {
     /// Rate-limit bucket for token removal events.
     Removal,
 }
-
-/// Maximum number of groups to publish push token events to concurrently.
-/// Caps relay connection pressure while still parallelising the bulk of the
-/// per-group relay round-trips.
-const MAX_CONCURRENT_GROUP_PUBLISHES: usize = 10;
 
 /// Supported native push-token platforms for device registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -610,148 +604,7 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
     Ok(())
 }
 
-/// Deprecated facades that delegate to session-scoped `PushOps`.
-///
-/// These will be removed once all call sites (groups.rs, accounts_groups.rs,
-/// account_settings.rs, handle_mls_message.rs) are migrated to use the session
-/// directly.
-#[allow(deprecated)]
 impl Whitenoise {
-    /// Returns a non-sensitive summary of cached push-token state for a group.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().get_group_debug_info() instead."
-    )]
-    #[perf_instrument("push_notifications")]
-    pub async fn get_group_push_debug_info(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<GroupPushDebugInfo> {
-        let session = self.require_session(&account.pubkey)?;
-        session.push().get_group_debug_info(group_id).await
-    }
-
-    /// Returns the locally stored push registration for `account`, if present.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().registration() instead."
-    )]
-    #[perf_instrument("push_notifications")]
-    pub async fn push_registration(&self, account: &Account) -> Result<Option<PushRegistration>> {
-        let session = self.require_session(&account.pubkey)?;
-        Ok(PushRegistration::find(&account.pubkey, &session.account_db.inner.pool).await?)
-    }
-
-    /// Creates or replaces the locally stored push registration for `account`.
-    ///
-    /// This updates local persistence and, when notifications remain shareable,
-    /// best-effort MIP-05 token sharing for the account's joined groups.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().upsert_registration() instead."
-    )]
-    #[perf_instrument("push_notifications")]
-    pub async fn upsert_push_registration(
-        &self,
-        account: &Account,
-        platform: PushPlatform,
-        raw_token: &str,
-        server_pubkey: &PublicKey,
-        relay_hint: Option<&RelayUrl>,
-    ) -> Result<PushRegistration> {
-        validate_raw_token(raw_token)?;
-        let pending_registration = PushRegistration {
-            account_pubkey: account.pubkey,
-            platform,
-            raw_token: raw_token.to_string(),
-            server_pubkey: *server_pubkey,
-            relay_hint: relay_hint.cloned(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_shared_at: None,
-        };
-        pending_registration.push_token_plaintext()?;
-
-        let previous_token_tag = self
-            .push_registration(account)
-            .await?
-            .as_ref()
-            .map(PushRegistration::token_tag)
-            .transpose()?
-            .flatten();
-        let new_token_tag = pending_registration.token_tag()?;
-
-        // Validate the session and notification preference BEFORE persisting
-        // the upsert. If the session lookup fails, we don't want a stale
-        // push_registrations row to outlive the missing session.
-        let session = self.require_session(&account.pubkey)?;
-        let notifications_enabled = session.repos.settings.notifications_enabled().await?;
-
-        let registration = PushRegistration::upsert(
-            &account.pubkey,
-            platform,
-            raw_token,
-            server_pubkey,
-            relay_hint,
-            &session.account_db.inner.pool,
-        )
-        .await?;
-
-        if previous_token_tag.is_some() && new_token_tag.is_none() {
-            if let Err(error) = self
-                .remove_local_push_token_from_joined_groups(account)
-                .await
-            {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account.pubkey.to_hex(),
-                    error = %error,
-                    "Failed to remove previously shared push token after registration became unshareable"
-                );
-            }
-        } else if notifications_enabled
-            && let Some(new_token_tag) = new_token_tag.as_ref()
-            && let Err(error) = self
-                .share_push_token_to_joined_groups(account, new_token_tag)
-                .await
-        {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account.pubkey.to_hex(),
-                error = %error,
-                "Failed to share updated push registration to joined groups"
-            );
-        }
-
-        Ok(registration)
-    }
-
-    /// Removes the locally stored push registration for `account`.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().clear_registration() instead."
-    )]
-    #[perf_instrument("push_notifications")]
-    pub async fn clear_push_registration(&self, account: &Account) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        PushRegistration::delete(&session.account_db.inner.pool).await?;
-
-        if let Err(error) = self
-            .remove_local_push_token_from_joined_groups(account)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account.pubkey.to_hex(),
-                error = %error,
-                "Failed to remove shared push token from joined groups after local clear"
-            );
-        }
-
-        Ok(())
-    }
-
     #[cfg(test)]
     #[perf_instrument("push_notifications")]
     pub(crate) async fn handle_received_push_group_message(
@@ -890,37 +743,6 @@ impl Whitenoise {
             .insert((account_pubkey, group_id, request_event_id), ());
     }
 
-    #[cfg(test)]
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::pending_push_token_responses directly."
-    )]
-    pub(crate) fn has_pending_token_response(
-        &self,
-        account_pubkey: &PublicKey,
-        group_id: &GroupId,
-        request_event_id: &EventId,
-    ) -> bool {
-        // Production code now writes to the per-session map; the legacy
-        // shared-services map (kept under #[cfg(test)] for the
-        // `insert_pending_token_response_for_test` shim) is never populated
-        // by real handlers. Read from the session first, then fall back to
-        // the legacy map for tests that still seed via the shim.
-        if let Some(session) = self.session(account_pubkey)
-            && session
-                .pending_push_token_responses
-                .contains_key(&(group_id.clone(), *request_event_id))
-        {
-            return true;
-        }
-
-        self.shared.pending_push_token_responses.contains_key(&(
-            *account_pubkey,
-            group_id.clone(),
-            *request_event_id,
-        ))
-    }
-
     /// Returns `true` if the MIP-05 message from `(account, group_id, leaf_index, kind)`
     /// is allowed, i.e. no message of the same kind from that sender has been accepted
     /// within the [`TOKEN_REQUEST_COOLDOWN`] window. On acceptance the timestamp is
@@ -966,24 +788,6 @@ impl Whitenoise {
             .pending_push_token_responses
             .remove(&(*account_pubkey, group_id.clone(), *request_event_id))
             .is_some()
-    }
-
-    #[cfg(test)]
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().dispatch_pending_token_response() instead."
-    )]
-    pub(crate) async fn dispatch_pending_token_response(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        request_event_id: EventId,
-    ) -> Result<bool> {
-        let session = self.require_session(&account.pubkey)?;
-        session
-            .push()
-            .dispatch_pending_token_response(group_id, request_event_id)
-            .await
     }
 
     #[cfg(test)]
@@ -1152,50 +956,6 @@ impl Whitenoise {
         }
     }
 
-    #[perf_instrument("push_notifications")]
-    async fn share_push_token_to_joined_groups(
-        &self,
-        account: &Account,
-        token_tag: &TokenTag,
-    ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let groups = mdk.get_groups()?;
-
-        // Drive groups concurrently with a bounded cap so relay connections
-        // are not overwhelmed. RTTs for independent groups overlap while
-        // total in-flight publishes stay within a reasonable limit.
-        let failures: Vec<String> = stream::iter(groups)
-            .map(|group| {
-                let group_state = group.state;
-                let group_id = group.mls_group_id;
-                let mdk = &mdk;
-
-                async move {
-                    self.share_token_to_single_group(
-                        mdk,
-                        account,
-                        &group_id,
-                        group_state,
-                        token_tag,
-                    )
-                    .await
-                }
-            })
-            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
-            .filter_map(|r| async move { r.err() })
-            .collect()
-            .await;
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(WhitenoiseError::Configuration(format!(
-                "failed to share push token to one or more groups: {}",
-                failures.join(", ")
-            )))
-        }
-    }
-
     /// Publishes a push token request to a single group and updates the local
     /// cache. Returns `Ok(())` if the group is ineligible (treated as a no-op)
     /// or if both operations succeed. Returns `Err` with a descriptive message
@@ -1236,56 +996,6 @@ impl Whitenoise {
         self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
             .await
             .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().share_local_token_to_joined_groups() instead."
-    )]
-    pub(crate) async fn share_local_push_token_to_joined_groups(
-        &self,
-        account: &Account,
-    ) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session.push().share_local_token_to_joined_groups().await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().share_local_token_to_group() instead."
-    )]
-    pub(crate) async fn share_local_push_token_to_group(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session.push().share_local_token_to_group(group_id).await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().remove_local_token_from_joined_groups() instead."
-    )]
-    pub(crate) async fn remove_local_push_token_from_joined_groups(
-        &self,
-        account: &Account,
-    ) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session.push().remove_local_token_from_joined_groups().await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().remove_local_token_from_group() instead."
-    )]
-    pub(crate) async fn remove_local_push_token_from_group(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session.push().remove_local_token_from_group(group_id).await
     }
 
     async fn merge_token_request(
@@ -1376,7 +1086,8 @@ impl Whitenoise {
 
     #[perf_instrument("push_notifications")]
     async fn local_push_token_tag(&self, account: &Account) -> Result<Option<TokenTag>> {
-        let Some(registration) = self.push_registration(account).await? else {
+        let session = self.require_session(&account.pubkey)?;
+        let Some(registration) = session.push().registration().await? else {
             return Ok(None);
         };
 
@@ -1441,7 +1152,6 @@ impl PushRegistration {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
@@ -1840,7 +1550,10 @@ mod tests {
         .unwrap();
 
         let debug_info = whitenoise
-            .get_group_push_debug_info(&account, &group_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .push()
+            .get_group_debug_info(&group_id)
             .await
             .unwrap();
 
@@ -2544,7 +2257,10 @@ mod tests {
             .unwrap();
 
         let settings = whitenoise
-            .update_notifications_enabled(&account, false)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .settings()
+            .update_notifications_enabled(false)
             .await
             .unwrap();
         assert!(!settings.notifications_enabled);
@@ -2679,7 +2395,10 @@ mod tests {
         assert!(after_share_count > before_share_count);
 
         whitenoise
-            .update_notifications_enabled(&admin_account, false)
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .settings()
+            .update_notifications_enabled(false)
             .await
             .unwrap();
 
@@ -2871,13 +2590,19 @@ mod tests {
             nostr_group_id: None,
         };
         whitenoise
-            .update_group_data(&admin_account, &group_id, relay_swap)
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group_id, relay_swap)
             .await
             .unwrap();
 
         tokio::time::pause();
         let settings = whitenoise
-            .update_notifications_enabled(&admin_account, false)
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .settings()
+            .update_notifications_enabled(false)
             .await
             .unwrap();
         tokio::time::resume();
@@ -2943,7 +2668,10 @@ mod tests {
             .await;
 
         whitenoise
-            .update_notifications_enabled(&admin_account, false)
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .settings()
+            .update_notifications_enabled(false)
             .await
             .unwrap();
 
@@ -3209,7 +2937,11 @@ mod tests {
 
         // Accept the group invite.
         whitenoise
-            .accept_account_group(&member_account, &group_id)
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .accept()
             .await
             .unwrap();
 
@@ -3341,12 +3073,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(
-                &creator,
-                vec![member_account.pubkey],
-                config,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, Some(GroupType::Group))
             .await
             .unwrap();
 
@@ -3406,7 +3136,10 @@ mod tests {
 
         // Trigger fanout so the member's token is shared to the accepted group.
         whitenoise
-            .share_local_push_token_to_joined_groups(&member_account)
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .share_local_token_to_joined_groups()
             .await
             .unwrap();
 
@@ -3432,7 +3165,11 @@ mod tests {
 
         // Decline the group.
         whitenoise
-            .decline_account_group(&member_account, &group_id)
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .decline()
             .await
             .unwrap();
 
@@ -3610,7 +3347,11 @@ mod tests {
         // The first request must have scheduled a pending response.
         if let Some(eid) = event_id_1 {
             assert!(
-                whitenoise.has_pending_token_response(&account.pubkey, &group_id, &eid),
+                whitenoise
+                    .session(&account.pubkey)
+                    .unwrap()
+                    .pending_push_token_responses
+                    .contains_key(&(group_id.clone(), eid)),
                 "first request must have a pending response scheduled"
             );
         }
@@ -3619,7 +3360,11 @@ mod tests {
         // was dropped before `schedule_pending_token_response` was reached.
         if let Some(eid) = event_id_2 {
             assert!(
-                !whitenoise.has_pending_token_response(&account.pubkey, &group_id, &eid),
+                !whitenoise
+                    .session(&account.pubkey)
+                    .unwrap()
+                    .pending_push_token_responses
+                    .contains_key(&(group_id.clone(), eid)),
                 "rate-limited request must not schedule a pending response"
             );
         }

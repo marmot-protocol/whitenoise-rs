@@ -1,59 +1,4 @@
-use nostr_sdk::PublicKey;
-
-use crate::whitenoise::{
-    Whitenoise, accounts::Account, database::mute_list::MuteListEntry, error::Result,
-};
-
-impl Whitenoise {
-    /// Blocks a user by adding them to the local mute list cache and publishing
-    /// an updated NIP-51 kind 10000 event to relays.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::mute_list().block_user() instead."
-    )]
-    pub async fn block_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session.mute_list().block_user(target_pubkey).await
-    }
-
-    /// Unblocks a user by removing them from the local mute list cache and
-    /// publishing an updated NIP-51 kind 10000 event to relays.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::mute_list().unblock_user() instead."
-    )]
-    pub async fn unblock_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session.mute_list().unblock_user(target_pubkey).await
-    }
-
-    /// Returns all blocked users for the given account.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::mute_list().get_blocked_users() instead."
-    )]
-    pub async fn get_blocked_users(&self, account: &Account) -> Result<Vec<MuteListEntry>> {
-        let session = self.require_session(&account.pubkey)?;
-        session.mute_list().get_blocked_users().await
-    }
-
-    /// Returns `true` if the given pubkey is blocked by the account.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::mute_list().is_user_blocked() instead."
-    )]
-    pub async fn is_user_blocked(
-        &self,
-        account_pubkey: &PublicKey,
-        target_pubkey: &PublicKey,
-    ) -> Result<bool> {
-        let session = self.require_session(account_pubkey)?;
-        session.mute_list().is_user_blocked(target_pubkey).await
-    }
-}
-
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use nostr_sdk::{EventBuilder, Keys, Kind, NostrSigner, Tag};
 
@@ -130,7 +75,7 @@ mod tests {
             .unwrap();
 
         // block_user fast-path: exists() check fires before any sync.
-        let result = whitenoise.block_user(&account, &target).await;
+        let result = session.mute_list().block_user(&target).await;
         assert!(
             result.is_ok(),
             "block_user on already-blocked user should be a no-op"
@@ -149,9 +94,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let target = Keys::generate().public_key();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
 
         // Target is not blocked — unblock_user must return Ok without touching relays.
-        let result = whitenoise.unblock_user(&account, &target).await;
+        let result = session.mute_list().unblock_user(&target).await;
         assert!(
             result.is_ok(),
             "unblock_user on non-blocked user should be a no-op"
@@ -175,7 +121,7 @@ mod tests {
             .await
             .unwrap();
 
-        let blocked = whitenoise.get_blocked_users(&account).await.unwrap();
+        let blocked = session.mute_list().get_blocked_users().await.unwrap();
         assert_eq!(blocked.len(), 2);
 
         let pubkeys: Vec<_> = blocked.iter().map(|e| e.muted_pubkey).collect();
@@ -196,15 +142,17 @@ mod tests {
             .unwrap();
 
         assert!(
-            whitenoise
-                .is_user_blocked(&account.pubkey, &blocked_target)
+            session
+                .mute_list()
+                .is_user_blocked(&blocked_target)
                 .await
                 .unwrap(),
             "inserted target should be reported as blocked"
         );
         assert!(
-            !whitenoise
-                .is_user_blocked(&account.pubkey, &other_target)
+            !session
+                .mute_list()
+                .is_user_blocked(&other_target)
                 .await
                 .unwrap(),
             "uninserted target should not be reported as blocked"
@@ -215,8 +163,9 @@ mod tests {
     async fn get_blocked_users_returns_empty_for_account_with_no_blocks() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
 
-        let blocked = whitenoise.get_blocked_users(&account).await.unwrap();
+        let blocked = session.mute_list().get_blocked_users().await.unwrap();
         assert!(blocked.is_empty());
     }
 
@@ -319,7 +268,7 @@ mod tests {
         let entries = vec![(target1, true), (target2, false)];
         session.mute_list().sync_and_emit(&entries).await.unwrap();
 
-        let blocked = whitenoise.get_blocked_users(&account).await.unwrap();
+        let blocked = session.mute_list().get_blocked_users().await.unwrap();
         assert_eq!(blocked.len(), 2);
         assert!(
             MuteListEntry::exists(&target1, &session.account_db)
@@ -380,7 +329,7 @@ mod tests {
 
         session.mute_list().sync_and_emit(&[]).await.unwrap();
 
-        let blocked = whitenoise.get_blocked_users(&account).await.unwrap();
+        let blocked = session.mute_list().get_blocked_users().await.unwrap();
         assert!(blocked.is_empty());
     }
 

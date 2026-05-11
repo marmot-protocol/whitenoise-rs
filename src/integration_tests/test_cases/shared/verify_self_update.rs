@@ -47,7 +47,6 @@ impl VerifySelfUpdateTestCase {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl TestCase for VerifySelfUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;
@@ -78,7 +77,11 @@ impl TestCase for VerifySelfUpdateTestCase {
                     let group_id = group_id.clone();
                     let account_name = account_name_owned.clone();
                     async move {
-                        let current_group = wn.group(&account, &group_id).await?;
+                        let current_group = wn
+                            .require_session(&account.pubkey)
+                            .unwrap()
+                            .groups()
+                            .get(&group_id)?;
                         if current_group.epoch >= min_epoch {
                             Ok(current_group.epoch)
                         } else {

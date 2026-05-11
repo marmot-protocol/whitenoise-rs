@@ -136,22 +136,21 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
     summary
 }
 
-#[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
     // Skip dormant accounts: maintenance reads/writes the per-account DB via
     // the session, so an account with no active session has nothing for the
     // scheduler to do this tick.
-    if whitenoise.session(&account.pubkey).is_none() {
+    let Some(session) = whitenoise.session(&account.pubkey) else {
         tracing::debug!(
             target: "whitenoise::scheduler::key_package_maintenance",
             "Account {} has no active session, skipping",
             account.pubkey.to_hex()
         );
         return MaintenanceResult::Skipped;
-    }
+    };
 
-    let packages = match whitenoise.fetch_all_key_packages_for_account(account).await {
+    let packages = match session.key_packages().fetch_all().await {
         Ok(packages) => packages,
         Err(WhitenoiseError::AccountMissingKeyPackageRelays) => {
             tracing::debug!(
@@ -301,7 +300,6 @@ async fn find_live_published_key_packages(
 }
 
 /// Publishes a new key package when the account has no usable local one.
-#[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
     tracing::info!(
@@ -310,7 +308,11 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
         account.pubkey.to_hex()
     );
 
-    match whitenoise.publish_key_package_for_account(account).await {
+    let Some(session) = whitenoise.session(&account.pubkey) else {
+        return MaintenanceResult::Skipped;
+    };
+
+    match session.key_packages().publish().await {
         Ok(()) => {
             tracing::info!(
                 target: "whitenoise::scheduler::key_package_maintenance",
@@ -329,7 +331,6 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
 /// If the account would be left with zero key packages after deletion, a new one is
 /// published first to avoid a gap. Otherwise, only the expired packages are deleted
 /// without republishing, since the account already has a valid package.
-#[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn rotate_expired_packages(
     whitenoise: &Whitenoise,
@@ -353,9 +354,13 @@ async fn rotate_expired_packages(
         non_expired_group_count
     );
 
+    let Some(session) = whitenoise.session(&account.pubkey) else {
+        return MaintenanceResult::Skipped;
+    };
+
     // Only publish a new key package if deleting the expired ones would leave zero packages
     if non_expired_group_count == 0 {
-        if let Err(e) = whitenoise.publish_key_package_for_account(account).await {
+        if let Err(e) = session.key_packages().publish().await {
             match e {
                 WhitenoiseError::AccountMissingKeyPackageRelays => {
                     return MaintenanceResult::Skipped;
@@ -372,8 +377,9 @@ async fn rotate_expired_packages(
     }
 
     // Delete expired key packages (don't delete MLS stored keys for now)
-    match whitenoise
-        .delete_key_packages_for_account(account, expired_events, false, 1)
+    match session
+        .key_packages()
+        .delete_batch(expired_events, false, 1)
         .await
     {
         Ok(deleted) => MaintenanceResult::RotatedExpired { deleted },
@@ -390,7 +396,6 @@ async fn rotate_expired_packages(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::key_packages::{
@@ -471,7 +476,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
         assert_eq!(
@@ -514,7 +522,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let after = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
         let live_after = find_live_published_key_packages(&whitenoise, &account, after)
@@ -534,7 +545,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
         assert_eq!(
@@ -567,7 +581,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let after = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
         let live_after = find_live_published_key_packages(&whitenoise, &account, after)
@@ -591,7 +608,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
         // create_identity publishes canonical (30443) + legacy (443) twins,
@@ -620,7 +640,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let packages = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
         // Original canonical (replaced — still 1) + original legacy + outdated legacy = 3.
@@ -643,7 +666,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let after = whitenoise
-            .fetch_all_key_packages_for_account(&account)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .key_packages()
+            .fetch_all()
             .await
             .unwrap();
         let live_after = find_live_published_key_packages(&whitenoise, &account, after)

@@ -40,7 +40,9 @@ async fn delete_all_relay_key_packages_for_test_setup(
     for round in 0..MAX_DELETE_ROUNDS {
         let key_packages = context
             .whitenoise
-            .fetch_all_key_packages_for_account(account)
+            .require_session(&account.pubkey)?
+            .key_packages()
+            .fetch_all()
             .await?;
 
         if key_packages.is_empty() {
@@ -51,12 +53,9 @@ async fn delete_all_relay_key_packages_for_test_setup(
         let delete_mls_stored_keys_this_round = delete_mls_stored_keys && round == 0;
         let deleted = context
             .whitenoise
-            .delete_key_packages_for_account(
-                account,
-                key_packages,
-                delete_mls_stored_keys_this_round,
-                1,
-            )
+            .require_session(&account.pubkey)?
+            .key_packages()
+            .delete_batch(key_packages, delete_mls_stored_keys_this_round, 1)
             .await?;
 
         total_deleted += deleted;
@@ -78,7 +77,9 @@ async fn delete_all_relay_key_packages_for_test_setup(
     // clear setup error into a flake.
     let remaining = context
         .whitenoise
-        .fetch_all_key_packages_for_account(account)
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .fetch_all()
         .await?;
     if !remaining.is_empty() {
         return Err(WhitenoiseError::Internal(format!(
@@ -273,7 +274,9 @@ where
             let account = account.clone();
             async move {
                 let key_packages = whitenoise
-                    .fetch_all_key_packages_for_account(&account)
+                    .require_session(&account.pubkey)?
+                    .key_packages()
+                    .fetch_all()
                     .await?;
 
                 if predicate(&key_packages) {
@@ -331,13 +334,9 @@ async fn publish_backdated_key_package(
 
     context
         .whitenoise
-        .track_published_key_package_for_testing(
-            &account.pubkey,
-            &key_package_data.hash_ref,
-            &event_id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-        )
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .track_published_for_testing(&key_package_data.hash_ref, &event_id.to_hex())
         .await?;
 
     tracing::debug!(
