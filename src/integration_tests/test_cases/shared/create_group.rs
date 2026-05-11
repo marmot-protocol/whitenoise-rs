@@ -34,7 +34,6 @@ impl CreateGroupTestCase {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl TestCase for CreateGroupTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!("Creating group '{}'...", self.group_name);
@@ -49,8 +48,10 @@ impl TestCase for CreateGroupTestCase {
 
         let test_group = context
             .whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                creator,
                 member_pubkeys,
                 NostrGroupConfigData::new(
                     self.group_name.clone(),

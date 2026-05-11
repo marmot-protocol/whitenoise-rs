@@ -5,7 +5,7 @@ use mdk_core::prelude::GroupId;
 
 /// Atomic test case for an account leaving a group via SelfRemove.
 ///
-/// Wraps [`crate::Whitenoise::leave_group`] so scenarios can orchestrate
+/// Wraps `AccountSession::groups().leave()` so scenarios can orchestrate
 /// voluntary departures the same way they orchestrate admin-driven removals
 /// via [`super::RemoveGroupMembersTestCase`].
 pub struct LeaveGroupTestCase {

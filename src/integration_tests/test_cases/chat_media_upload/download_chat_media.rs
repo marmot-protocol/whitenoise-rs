@@ -35,7 +35,6 @@ impl DownloadChatMediaTestCase {
 
 #[async_trait]
 impl TestCase for DownloadChatMediaTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Testing download_chat_media for group {} using account: {}",
@@ -75,13 +74,11 @@ impl TestCase for DownloadChatMediaTestCase {
 
         let uploaded_media = context
             .whitenoise
-            .upload_chat_media(
-                account,
-                &group.mls_group_id,
-                temp_path,
-                blossom_url.clone(),
-                options,
-            )
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .upload_chat_media(&group.mls_group_id, temp_path, blossom_url.clone(), options)
             .await?;
 
         drop(temp_file);
@@ -145,7 +142,11 @@ impl TestCase for DownloadChatMediaTestCase {
 
         let downloaded_media = context
             .whitenoise
-            .download_chat_media(account, &group.mls_group_id, &original_file_hash)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .download_chat_media(&group.mls_group_id, &original_file_hash)
             .await?;
 
         tracing::info!(
@@ -185,7 +186,11 @@ impl TestCase for DownloadChatMediaTestCase {
 
         let downloaded_again = context
             .whitenoise
-            .download_chat_media(account, &group.mls_group_id, &original_file_hash)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .download_chat_media(&group.mls_group_id, &original_file_hash)
             .await?;
 
         assert_eq!(

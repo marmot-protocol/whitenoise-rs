@@ -46,7 +46,6 @@ impl UploadAudioTestCase {
 
 #[async_trait]
 impl TestCase for UploadAudioTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Uploading MP3 audio for group {} using account: {}",
@@ -78,7 +77,11 @@ impl TestCase for UploadAudioTestCase {
 
         let media_file = context
             .whitenoise
-            .upload_chat_media(account, &group.mls_group_id, temp_path, blossom_url, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .upload_chat_media(&group.mls_group_id, temp_path, blossom_url, None)
             .await?;
 
         drop(temp_file);

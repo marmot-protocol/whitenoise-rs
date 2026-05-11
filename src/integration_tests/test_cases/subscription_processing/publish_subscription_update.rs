@@ -322,7 +322,6 @@ impl PublishSubscriptionUpdateTestCase {
     }
 
     /// Verify follow list processed into follows (account-based)
-    #[allow(deprecated)]
     async fn verify_follow_list(
         &self,
         context: &mut ScenarioContext,
@@ -335,12 +334,13 @@ impl PublishSubscriptionUpdateTestCase {
         };
 
         let account = context.get_account(account_name)?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
         let expected: HashSet<PublicKey> = expected_follows.iter().copied().collect();
 
         retry_until(
             Self::verification_retry_config(),
             || async {
-                let follows = context.whitenoise.follows(account).await?;
+                let follows = session.social().follows().await?;
                 let actual: HashSet<PublicKey> = follows.iter().map(|u| u.pubkey).collect();
 
                 if actual == expected {
@@ -364,7 +364,6 @@ impl PublishSubscriptionUpdateTestCase {
 
 #[async_trait]
 impl TestCase for PublishSubscriptionUpdateTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let has_metadata = self.metadata.is_some();
         let has_relay = self.new_relay_url.is_some();

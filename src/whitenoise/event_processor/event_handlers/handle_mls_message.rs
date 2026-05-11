@@ -998,7 +998,6 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use std::time::Duration;
 
@@ -1048,8 +1047,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1161,8 +1162,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1240,8 +1243,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1291,8 +1296,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1395,8 +1402,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1581,8 +1590,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1880,14 +1891,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         let dispatched = whitenoise
-            .dispatch_pending_token_response(&member_account, &group_id, request_event_id)
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .dispatch_pending_token_response(&group_id, request_event_id)
             .await
             .unwrap();
         assert!(dispatched);
@@ -1926,11 +1942,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         let response = build_token_list_response_rumor(
             admin_account.pubkey,
@@ -1949,14 +1967,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            !whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         let dispatched = whitenoise
-            .dispatch_pending_token_response(&member_account, &group_id, request_event_id)
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .dispatch_pending_token_response(&group_id, request_event_id)
             .await
             .unwrap();
         assert!(!dispatched);
@@ -2104,8 +2127,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -2182,8 +2207,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -2333,11 +2360,13 @@ mod tests {
             fake_event_id,
         );
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &fake_group_id,
-            &fake_event_id,
-        ));
+        assert!(
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(fake_group_id.clone(), fake_event_id))
+        );
 
         // Schedule with the same key hits the duplicate-dedup early-return;
         // the existing entry must remain intact.
@@ -2348,11 +2377,11 @@ mod tests {
         );
 
         assert!(
-            whitenoise.has_pending_token_response(
-                &member_account.pubkey,
-                &fake_group_id,
-                &fake_event_id,
-            ),
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(fake_group_id.clone(), fake_event_id)),
             "pending entry should still be present after duplicate request"
         );
     }
@@ -2384,20 +2413,23 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         // In tests the spawn delay is 0ms; wait for the spawned task to clear the entry.
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if !whitenoise.has_pending_token_response(
-                    &member_account.pubkey,
-                    &group_id,
-                    &request_event_id,
-                ) {
+                if !whitenoise
+                    .session(&member_account.pubkey)
+                    .unwrap()
+                    .pending_push_token_responses
+                    .contains_key(&(group_id.clone(), request_event_id))
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

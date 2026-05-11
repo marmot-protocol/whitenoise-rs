@@ -1075,7 +1075,6 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
@@ -1103,7 +1102,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
         whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -1156,7 +1158,10 @@ mod tests {
         );
 
         let group = whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -1217,7 +1222,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
         whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -1540,7 +1548,10 @@ mod tests {
         );
 
         whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -1574,7 +1585,10 @@ mod tests {
         );
 
         whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 

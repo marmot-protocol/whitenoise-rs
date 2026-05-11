@@ -1,6 +1,4 @@
-#[allow(deprecated)]
 mod key_package_lifecycle;
-#[allow(deprecated)]
 mod key_package_maintenance;
 mod verify_scheduler_running;
 

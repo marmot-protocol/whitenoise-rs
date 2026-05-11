@@ -1560,7 +1560,6 @@ async fn build_network_layer_from_follows(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::cached_graph_user::CachedGraphUser;
@@ -1865,7 +1864,10 @@ mod tests {
 
         // Now follow this user
         whitenoise
-            .follow_user(&account, &followed_keys.public_key())
+            .require_session(&account.pubkey)
+            .unwrap()
+            .social()
+            .follow_user(&followed_keys.public_key())
             .await
             .unwrap();
 
@@ -1911,12 +1913,15 @@ mod tests {
         cached2.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Follow both users
-        whitenoise
-            .follow_user(&account, &user1.public_key())
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .social()
+            .follow_user(&user1.public_key())
             .await
             .unwrap();
-        whitenoise
-            .follow_user(&account, &user2.public_key())
+        session
+            .social()
+            .follow_user(&user2.public_key())
             .await
             .unwrap();
 
@@ -2656,7 +2661,10 @@ mod tests {
 
         // Follow the user
         whitenoise
-            .follow_user(&account, &followed_keys.public_key())
+            .require_session(&account.pubkey)
+            .unwrap()
+            .social()
+            .follow_user(&followed_keys.public_key())
             .await
             .unwrap();
 
@@ -2774,7 +2782,10 @@ mod tests {
         // Give the searcher a follow so the graph is not empty
         let followed_pk = random_pk();
         whitenoise
-            .follow_user(&account, &followed_pk)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .social()
+            .follow_user(&followed_pk)
             .await
             .unwrap();
 

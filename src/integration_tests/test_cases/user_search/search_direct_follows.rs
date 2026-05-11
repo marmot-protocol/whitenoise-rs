@@ -32,10 +32,10 @@ impl SearchDirectFollowsTestCase {
 
 #[async_trait]
 impl TestCase for SearchDirectFollowsTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let account = context.get_account(&self.account_name)?;
         let searcher_pubkey = account.pubkey;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
 
         // Create a user the searcher will follow
         let followed_keys = Keys::generate();
@@ -51,10 +51,7 @@ impl TestCase for SearchDirectFollowsTestCase {
             .resolve_user_blocking(&followed_pubkey)
             .await?;
 
-        context
-            .whitenoise
-            .follow_user(account, &followed_pubkey)
-            .await?;
+        session.social().follow_user(&followed_pubkey).await?;
         tracing::info!(
             "Followed user {} ('{}')",
             &followed_pubkey.to_hex()[..8],

@@ -46,7 +46,6 @@ impl Scenario for AddMemberToStrictGroupRejectedScenario {
         &self.context
     }
 
-    #[allow(deprecated)]
     async fn run_scenario(&mut self) -> Result<(), WhitenoiseError> {
         // Three accounts: A creates the group with B (both modern, so LCD
         // fires `{SelfRemove}`); C is the legacy peer A later tries to invite.
@@ -122,7 +121,10 @@ impl Scenario for AddMemberToStrictGroupRejectedScenario {
         let result = self
             .context
             .whitenoise
-            .add_members_to_group(&creator_account, &group_id, vec![legacy_pubkey])
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .add_members(&group_id, vec![legacy_pubkey])
             .await;
 
         match result {

@@ -27,7 +27,6 @@ impl CreateDmTestCase {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl TestCase for CreateDmTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
@@ -42,8 +41,10 @@ impl TestCase for CreateDmTestCase {
 
         let dm_group = context
             .whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                creator,
                 vec![other.pubkey],
                 NostrGroupConfigData::new(
                     String::new(),

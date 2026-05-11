@@ -1,20 +1,14 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use mdk_core::prelude::*;
-use nostr_sdk::prelude::*;
 
 use crate::{
-    RelayType, perf_instrument, perf_span,
-    relay_control::ephemeral::KeyPackageLookup,
+    RelayType, perf_instrument,
     whitenoise::{
         Whitenoise,
         accounts::Account,
-        accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
-        group_information::GroupType,
-        key_packages::{marmot_key_package_capabilities, validate_fetched_member_key_package},
         relays::Relay,
         shared::SharedServices,
         users::User,
@@ -33,8 +27,7 @@ pub use required_proposals::{
     GroupCapabilityUpgradeStatus, RequiredProposalUpgradability, RequiredProposalUpgradeStatus,
 };
 pub(crate) use required_proposals::{
-    KeyPackageCapabilities, MlsExtensionId, find_member_missing_required_proposal,
-    project_group_capability_upgrade_status,
+    KeyPackageCapabilities, MlsExtensionId, project_group_capability_upgrade_status,
 };
 
 impl SharedServices {
@@ -88,153 +81,6 @@ impl Whitenoise {
     /// Resolves a single member for group creation: finds or creates the user record,
     /// syncs relay lists for new users, fetches and validates the key package.
     ///
-    /// Returns the user record, the resolved key-package event, and the
-    /// projected [`KeyPackageCapabilities`]. The capability projection is
-    /// computed once at the validation boundary so callers can fold it (e.g.
-    /// `create_group` counts legacy peers) without re-walking the event's tags.
-    async fn resolve_member_key_package(
-        &self,
-        pk: &PublicKey,
-    ) -> Result<(User, Event, KeyPackageCapabilities)> {
-        let (user, created) = User::find_or_create_by_pubkey(pk, &self.shared.database).await?;
-        if created && let Err(e) = user.update_relay_lists(&self.shared).await {
-            tracing::warn!(
-                target: "whitenoise::groups",
-                "Failed to update relay lists for new user {}: {}",
-                user.pubkey,
-                e
-            );
-        }
-
-        let _kp_fetch = perf_span!("groups::fetch_key_package");
-        let lookup = user.key_package_lookup(&self.shared).await?;
-        drop(_kp_fetch);
-
-        let event = match lookup {
-            KeyPackageLookup::Found(event) => event,
-            // The consumer-side baseline validator no longer treats missing
-            // capability advertisements (notably SelfRemove) as `Incompatible`
-            // — only genuine malformations do. The
-            // `KeyPackageMissingSelfRemove` error variant survives because
-            // `add_members_to_group`'s strict-add path still produces it.
-            KeyPackageLookup::Incompatible { error } => {
-                return Err(WhitenoiseError::IncompatibleKeyPackage {
-                    member_pubkey: *pk,
-                    reason: error.to_string(),
-                });
-            }
-            KeyPackageLookup::NotFound => {
-                return Err(WhitenoiseError::MdkCoreError(mdk_core::Error::KeyPackage(
-                    "Does not exist".to_owned(),
-                )));
-            }
-        };
-
-        validate_fetched_member_key_package(&event, pk)?;
-
-        let capabilities = marmot_key_package_capabilities(&event);
-
-        Ok((user, event, capabilities))
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().create_group() instead."
-    )]
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    pub async fn create_group(
-        &self,
-        creator_account: &Account,
-        member_pubkeys: Vec<PublicKey>,
-        config: NostrGroupConfigData,
-        group_type: Option<GroupType>,
-    ) -> Result<group_types::Group> {
-        let session = self
-            .session(&creator_account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session
-            .groups()
-            .create_group(member_pubkeys, config, group_type)
-            .await
-    }
-
-    #[deprecated(since = "0.0.0", note = "Use AccountSession::groups().all() instead.")]
-    pub async fn groups(
-        &self,
-        account: &Account,
-        active_filter: bool,
-    ) -> Result<Vec<group_types::Group>> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.groups().all(active_filter)
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().visible() instead."
-    )]
-    pub async fn visible_groups(&self, account: &Account) -> Result<Vec<GroupWithMembership>> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.groups().visible().await
-    }
-
-    #[deprecated(since = "0.0.0", note = "Use AccountSession::groups().get() instead.")]
-    pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.groups().get(group_id)
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().members() instead."
-    )]
-    pub async fn group_members(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<Vec<PublicKey>> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.groups().members(group_id)
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().relays() instead."
-    )]
-    pub async fn group_relays(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<BTreeSet<RelayUrl>> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.groups().relays(group_id)
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().admins() instead."
-    )]
-    pub async fn group_admins(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<Vec<PublicKey>> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.groups().admins(group_id)
-    }
-
     /// Returns the set of MLS proposal types required by the group's
     /// `RequiredCapabilities` extension, projected onto the whitenoise mirror
     /// enum [`RequiredProposal`].
@@ -382,318 +228,6 @@ impl Whitenoise {
 
         Ok(())
     }
-
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    async fn ensure_account_is_group_admin(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let admins = self.group_admins(account, group_id).await?;
-        if !admins.contains(&account.pubkey) {
-            return Err(WhitenoiseError::AccountNotAuthorized);
-        }
-
-        Ok(())
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().add_members() instead."
-    )]
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    pub async fn add_members_to_group(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        members: Vec<PublicKey>,
-    ) -> Result<()> {
-        self.ensure_account_is_group_admin(account, group_id)
-            .await?;
-
-        let mut key_package_events: Vec<Event> = Vec::new();
-        let signer = self.get_signer_for_account(account)?;
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let mut users = Vec::new();
-        let mut member_caps: Vec<(PublicKey, KeyPackageCapabilities)> =
-            Vec::with_capacity(members.len());
-
-        // Resolve key packages for all members. The third tuple element is the
-        // per-member capability projection used by the pre-check below.
-        for pk in members.iter() {
-            let (user, event, caps) = self.resolve_member_key_package(pk).await?;
-            key_package_events.push(event);
-            users.push(user);
-            member_caps.push((*pk, caps));
-        }
-
-        // Pre-validate each invitee's advertised proposals against the group's
-        // `RequiredCapabilities` BEFORE invoking MDK so we can attribute the
-        // rejection to the offending member. MDK's typed error
-        // (`InviteeMissingRequiredProposal`) is a unit variant carrying no
-        // attribution; we keep it as defense-in-depth via
-        // `map_mdk_add_members_error`.
-        //
-        // Only pre-check proposals we model explicitly. `RequiredProposal::Unknown`
-        // is a unit variant: distinct unmodelled MLS proposal codepoints all
-        // collapse to the same value on both sides of the comparison, so a set
-        // difference on `Unknown` would yield false negatives (a group requiring
-        // proposal X and a member advertising only proposal Y both project to
-        // `{Unknown}`, masking the mismatch). MDK's leaf-node validation is
-        // authoritative for those cases — `map_mdk_add_members_error` translates
-        // its `InviteeMissingRequiredProposal` into the same defense-in-depth
-        // error path.
-        let required = self.group_required_proposals(account, group_id).await?;
-        let modeled_required: BTreeSet<RequiredProposal> = required
-            .iter()
-            .copied()
-            .filter(|p| !matches!(p, RequiredProposal::Unknown))
-            .collect();
-        if !modeled_required.is_empty()
-            && let Some((member_pubkey, missing)) =
-                find_member_missing_required_proposal(&member_caps, &modeled_required)
-        {
-            return Err(match missing {
-                RequiredProposal::SelfRemove => {
-                    WhitenoiseError::KeyPackageMissingSelfRemove { member_pubkey }
-                }
-                other => WhitenoiseError::GroupRejectedMember {
-                    member_pubkey: Some(member_pubkey),
-                    reason: format!("does not advertise {other:?}"),
-                },
-            });
-        }
-
-        let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
-        let _mls_add = perf_span!("groups::mls_add_members");
-        let update_result = mdk
-            .add_members(group_id, &key_package_events)
-            .map_err(map_mdk_add_members_error)?;
-        drop(_mls_add);
-
-        let evolution_event = update_result.evolution_event;
-        let welcome_rumors = match update_result.welcome_rumors {
-            None => {
-                return Err(WhitenoiseError::MdkCoreError(mdk_core::Error::Group(
-                    "Missing welcome message".to_owned(),
-                )));
-            }
-            Some(wr) => wr,
-        };
-
-        if welcome_rumors.len() != users.len() {
-            return Err(WhitenoiseError::Internal(
-                "Welcome rumours are missing for some of the members".to_string(),
-            ));
-        }
-
-        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
-            .await?;
-
-        for (welcome_rumor, user) in welcome_rumors.iter().zip(users) {
-            let key_package_event_id =
-                welcome_rumor
-                    .tags
-                    .event_ids()
-                    .next()
-                    .ok_or(WhitenoiseError::Internal(
-                        "No event ID found in welcome rumor".to_string(),
-                    ))?;
-
-            let member_pubkey = key_package_events
-                .iter()
-                .find(|event| event.id == *key_package_event_id)
-                .map(|event| event.pubkey)
-                .ok_or(WhitenoiseError::Internal(
-                    "No public key found in key package event".to_string(),
-                ))?;
-
-            let one_month_future = Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
-
-            let relays_to_use = self
-                .shared
-                .resolve_member_delivery_relays(
-                    &user,
-                    account,
-                    "whitenoise::accounts::groups::add_members_to_group",
-                )
-                .await?;
-
-            let relay_urls = Relay::urls(&relays_to_use);
-
-            self.shared
-                .relay_control
-                .publish_welcome(
-                    &member_pubkey,
-                    welcome_rumor.clone(),
-                    &[Tag::expiration(one_month_future)],
-                    account.pubkey,
-                    &relay_urls,
-                    signer.clone(),
-                )
-                .await
-                .map_err(WhitenoiseError::from)?;
-        }
-
-        Ok(())
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().remove_members() instead."
-    )]
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    pub async fn remove_members_from_group(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        members: Vec<PublicKey>,
-    ) -> Result<()> {
-        self.ensure_account_is_group_admin(account, group_id)
-            .await?;
-
-        let (relay_urls, evolution_event) = {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-            let update_result = mdk.remove_members(group_id, &members)?;
-            (relay_urls, update_result.evolution_event)
-        };
-
-        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
-            .await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().update_group_data() instead."
-    )]
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    pub async fn update_group_data(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        group_data: NostrGroupDataUpdate,
-    ) -> Result<()> {
-        self.ensure_account_is_group_admin(account, group_id)
-            .await?;
-
-        let (relay_urls, evolution_event) = {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-            let update_result = mdk.update_group_data(group_id, group_data)?;
-            (relay_urls, update_result.evolution_event)
-        };
-
-        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
-            .await?;
-        self.background_refresh_account_group_subscriptions(account);
-        Ok(())
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().self_demote() instead."
-    )]
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    pub async fn self_demote(&self, account: &Account, group_id: &GroupId) -> Result<()> {
-        self.ensure_account_is_group_admin(account, group_id)
-            .await?;
-
-        let (relay_urls, evolution_event) = {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-            let update_result = mdk.self_demote(group_id)?;
-            (relay_urls, update_result.evolution_event)
-        };
-
-        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
-            .await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().leave() instead."
-    )]
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        let account_group = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            group_id,
-            &session.account_db.inner.pool,
-        )
-        .await?
-        .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        if account_group.is_removed() {
-            return Err(WhitenoiseError::AlreadyDepartedFromGroup);
-        }
-
-        let (relay_urls, evolution_event) = {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-            let update_result = mdk.leave_group(group_id)?;
-            (relay_urls, update_result.evolution_event)
-        };
-
-        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
-            .await?;
-
-        // Optimistic local update is best-effort after publish success.
-        // When the auto-committed removal commit arrives later,
-        // mark_as_removed() will converge the local state regardless.
-        #[allow(deprecated)]
-        if let Err(error) = self.mark_as_left(account, group_id).await {
-            tracing::warn!(
-                target: "whitenoise::groups",
-                account_pubkey = %account.pubkey,
-                group_id = %hex::encode(group_id.as_slice()),
-                "SelfRemove published but failed to mark local departure: {error}",
-            );
-        }
-
-        self.background_refresh_account_group_subscriptions(account);
-
-        Ok(())
-    }
-}
-
-/// Defense-in-depth mapping for `mdk.add_members` errors.
-///
-/// `add_members_to_group` pre-validates each invitee's
-/// [`KeyPackageCapabilities`] against the group's
-/// [`Whitenoise::group_required_proposals`] before invoking MDK, so an
-/// `InviteeMissingRequiredProposal` from MDK means the pre-check missed an
-/// edge case (e.g. an `openmls` enforcement rule that diverges from our
-/// projection). We surface it as
-/// [`WhitenoiseError::GroupRejectedMember`] with no member attribution
-/// (the MDK variant is a unit, no payload) and emit a `warn!` so the gap
-/// is visible in logs.
-///
-/// All other MDK errors keep their pre-existing `WhitenoiseError::from`
-/// pass-through.
-fn map_mdk_add_members_error(err: mdk_core::Error) -> WhitenoiseError {
-    match err {
-        mdk_core::Error::InviteeMissingRequiredProposal => {
-            tracing::warn!(
-                target: "whitenoise::accounts::groups::add_members",
-                "MDK rejected add despite passing pre-validation; pre-check has a gap"
-            );
-            WhitenoiseError::GroupRejectedMember {
-                member_pubkey: None,
-                reason: "invitee KeyPackage is missing a proposal type required by the group"
-                    .to_string(),
-            }
-        }
-        other => WhitenoiseError::from(other),
-    }
 }
 
 fn map_mdk_capability_upgrade_error(err: mdk_core::Error) -> WhitenoiseError {
@@ -726,20 +260,22 @@ fn map_mdk_capability_upgrade_error(err: mdk_core::Error) -> WhitenoiseError {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::Whitenoise;
+    use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::database::media_files::MediaFile;
-    use crate::whitenoise::group_information::GroupInformation;
+    use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
     use crate::whitenoise::test_utils::*;
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
     use nostr_blossom::bud02::BlobDescriptor;
-    use nostr_sdk::RelayUrl;
+    use nostr_sdk::FromBech32;
+    use nostr_sdk::prelude::Url;
     use nostr_sdk::prelude::hashes::Hash as _;
     use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
+    use nostr_sdk::{EventBuilder, Keys, PublicKey, RelayUrl, Timestamp};
 
     fn mock_blossom_url(server: &mockito::Server) -> Url {
         let socket_address = server.socket_address();
@@ -871,12 +407,10 @@ mod tests {
         let config = create_nostr_group_config_data(admin_pubkeys.clone());
         // Create the group
         let result = whitenoise
-            .create_group(
-                creator_account,
-                member_pubkeys.clone(),
-                config.clone(),
-                None,
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys.clone(), config.clone(), None)
             .await;
 
         // Assert the group was created successfully
@@ -916,8 +450,10 @@ mod tests {
 
         // Verify group members can be retrieved
         let members = whitenoise
-            .group_members(creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)
             .unwrap();
         assert_eq!(members.len(), member_pubkeys.len() + 1); // +1 for creator
         assert!(
@@ -934,8 +470,10 @@ mod tests {
 
         // Verify group admins can be retrieved
         let admins = whitenoise
-            .group_admins(creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .admins(&group.mls_group_id)
             .unwrap();
         assert_eq!(admins.len(), admin_pubkeys.len());
         for admin_pk in &admin_pubkeys {
@@ -975,7 +513,10 @@ mod tests {
     ) {
         let config = create_nostr_group_config_data(admin_pubkeys.clone());
         let result = whitenoise
-            .create_group(creator_account, member_pubkeys, config.clone(), None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config.clone(), None)
             .await;
 
         // Should fail because groups need at least one admin
@@ -1000,7 +541,10 @@ mod tests {
     ) {
         let config = create_nostr_group_config_data(admin_pubkeys);
         let result = whitenoise
-            .create_group(creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await;
 
         // Should fail because key package doesn't exist for the member
@@ -1016,7 +560,10 @@ mod tests {
     ) {
         let config = create_nostr_group_config_data(admin_pubkeys);
         let result = whitenoise
-            .create_group(creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await;
 
         // Should fail because admin must be a member
@@ -1054,7 +601,10 @@ mod tests {
         let mut config = create_nostr_group_config_data(admin_pubkeys.clone());
         config.name = "".to_string();
         let result = whitenoise
-            .create_group(creator_account, member_pubkeys.clone(), config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys.clone(), config, None)
             .await;
 
         assert!(result.is_ok(), "Error {:?}", result.unwrap_err());
@@ -1074,8 +624,10 @@ mod tests {
 
         // Verify both participants are admins (standard for DM groups)
         let admins = whitenoise
-            .group_admins(creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .admins(&group.mls_group_id)
             .unwrap();
         assert_eq!(admins.len(), 2, "DirectMessage group should have 2 admins");
         assert!(
@@ -1089,8 +641,10 @@ mod tests {
 
         // Verify membership
         let members = whitenoise
-            .group_members(creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)
             .unwrap();
         assert_eq!(
             members.len(),
@@ -1123,19 +677,19 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys.clone());
         let group = whitenoise
-            .create_group(
-                &creator_account,
-                initial_member_pubkeys.clone(),
-                config,
-                None,
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(initial_member_pubkeys.clone(), config, None)
             .await
             .unwrap();
 
         // Verify initial membership
         let members = whitenoise
-            .group_members(&creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)
             .unwrap();
         assert_eq!(members.len(), 3); // creator + 2 initial members
 
@@ -1147,11 +701,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let add_result = whitenoise
-            .add_members_to_group(
-                &creator_account,
-                &group.mls_group_id,
-                new_member_pubkeys.clone(),
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .add_members(&group.mls_group_id, new_member_pubkeys.clone())
             .await;
         assert!(
             add_result.is_ok(),
@@ -1161,8 +714,10 @@ mod tests {
 
         // Verify new membership count
         let updated_members = whitenoise
-            .group_members(&creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)
             .unwrap();
         assert_eq!(updated_members.len(), 5); // creator + 2 initial + 2 new
         for new_member_pk in &new_member_pubkeys {
@@ -1176,11 +731,10 @@ mod tests {
         // Remove one member
         let member_to_remove = vec![initial_member_pubkeys[0]];
         let remove_result = whitenoise
-            .remove_members_from_group(
-                &creator_account,
-                &group.mls_group_id,
-                member_to_remove.clone(),
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .remove_members(&group.mls_group_id, member_to_remove.clone())
             .await;
         assert!(
             remove_result.is_ok(),
@@ -1190,8 +744,10 @@ mod tests {
 
         // Verify final membership
         let final_members = whitenoise
-            .group_members(&creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)
             .unwrap();
         assert_eq!(final_members.len(), 4); // creator + 1 remaining initial + 2 new
         assert!(
@@ -1213,7 +769,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys.clone());
         let group = whitenoise
-            .create_group(&creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
 
@@ -1231,11 +790,10 @@ mod tests {
         };
 
         let update_result = whitenoise
-            .update_group_data(
-                &creator_account,
-                &group.mls_group_id,
-                new_group_data.clone(),
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group.mls_group_id, new_group_data.clone())
             .await;
         assert!(
             update_result.is_ok(),
@@ -1244,7 +802,12 @@ mod tests {
         );
 
         // Verify the group data was updated
-        let updated_groups = whitenoise.groups(&creator_account, true).await.unwrap();
+        let updated_groups = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .all(true)
+            .unwrap();
         let updated_group = updated_groups
             .iter()
             .find(|g| g.mls_group_id == group.mls_group_id)
@@ -1273,12 +836,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
         let group = whitenoise
-            .create_group(
-                &creator_account,
-                vec![new_admin_pubkey, other_member_pubkey],
-                config,
-                None,
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![new_admin_pubkey, other_member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1294,21 +855,19 @@ mod tests {
             nostr_group_id: None,
         };
         whitenoise
-            .update_group_data(
-                &creator_account,
-                &group.mls_group_id,
-                transfer_admin_rights_update,
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group.mls_group_id, transfer_admin_rights_update)
             .await
             .unwrap();
 
         let new_account = whitenoise.create_identity().await.unwrap();
         let add_members_result = whitenoise
-            .add_members_to_group(
-                &creator_account,
-                &group.mls_group_id,
-                vec![new_account.pubkey],
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .add_members(&group.mls_group_id, vec![new_account.pubkey])
             .await;
         assert!(
             matches!(
@@ -1320,11 +879,10 @@ mod tests {
         );
 
         let remove_members_result = whitenoise
-            .remove_members_from_group(
-                &creator_account,
-                &group.mls_group_id,
-                vec![other_member_pubkey],
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .remove_members(&group.mls_group_id, vec![other_member_pubkey])
             .await;
         assert!(
             matches!(
@@ -1347,7 +905,10 @@ mod tests {
             nostr_group_id: None,
         };
         let update_result = whitenoise
-            .update_group_data(&creator_account, &group.mls_group_id, update)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group.mls_group_id, update)
             .await;
         assert!(
             matches!(update_result, Err(WhitenoiseError::AccountNotAuthorized)),
@@ -1607,16 +1168,29 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let _group = whitenoise
-            .create_group(&creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
 
         // Test getting all groups
-        let all_groups = whitenoise.groups(&creator_account, false).await.unwrap();
+        let all_groups = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .all(false)
+            .unwrap();
         assert!(!all_groups.is_empty(), "Should have at least one group");
 
         // Test getting only active groups
-        let active_groups = whitenoise.groups(&creator_account, true).await.unwrap();
+        let active_groups = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .all(true)
+            .unwrap();
         assert!(
             !active_groups.is_empty(),
             "Should have at least one active group"
@@ -1645,7 +1219,10 @@ mod tests {
         // Create group normally (this auto-accepts)
         let config = create_nostr_group_config_data(vec![account.pubkey]);
         let group = whitenoise
-            .create_group(account, member_pubkeys, config, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
 
@@ -1683,25 +1260,43 @@ mod tests {
         // - group_declined: user_confirmation = Some(false)
 
         let (ag_accepted, _) = whitenoise
-            .get_or_create_account_group(&account, &group_accepted.mls_group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_accepted.mls_group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         ag_accepted.accept(&whitenoise).await.unwrap();
 
         // Just create the record - stays pending (NULL) by default
         whitenoise
-            .get_or_create_account_group(&account, &group_pending.mls_group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_pending.mls_group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let (ag_declined, _) = whitenoise
-            .get_or_create_account_group(&account, &group_declined.mls_group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_declined.mls_group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         ag_declined.decline(&whitenoise).await.unwrap();
 
         // Get visible groups - should return accepted + pending, not declined
-        let mut visible = whitenoise.visible_groups(&account).await.unwrap();
+        let mut visible = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .visible()
+            .await
+            .unwrap();
 
         assert_eq!(visible.len(), 2);
 
@@ -1726,8 +1321,10 @@ mod tests {
 
         // Regular group (non-empty name → GroupType::Group)
         let regular_group = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![account.pubkey]),
                 None,
@@ -1740,7 +1337,10 @@ mod tests {
             create_nostr_group_config_data(vec![account.pubkey, members[1].0.pubkey]);
         dm_config.name = "".to_string();
         let dm_group = whitenoise
-            .create_group(&account, vec![members[1].0.pubkey], dm_config, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![members[1].0.pubkey], dm_config, None)
             .await
             .unwrap();
 
@@ -1783,13 +1383,21 @@ mod tests {
                 .await;
 
         let (ag_accepted, _) = whitenoise
-            .get_or_create_account_group(&account, &group_accepted.mls_group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_accepted.mls_group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         ag_accepted.accept(&whitenoise).await.unwrap();
 
         let (ag_declined, _) = whitenoise
-            .get_or_create_account_group(&account, &group_declined.mls_group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_declined.mls_group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         ag_declined.decline(&whitenoise).await.unwrap();
@@ -1816,8 +1424,10 @@ mod tests {
 
         // One regular group, one DM
         let regular_group = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![account.pubkey]),
                 None,
@@ -1829,7 +1439,10 @@ mod tests {
             create_nostr_group_config_data(vec![account.pubkey, members[1].0.pubkey]);
         dm_config.name = "".to_string();
         let _dm = whitenoise
-            .create_group(&account, vec![members[1].0.pubkey], dm_config, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![members[1].0.pubkey], dm_config, None)
             .await
             .unwrap();
 
@@ -1863,19 +1476,19 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys.clone());
         let created_group = whitenoise
-            .create_group(
-                &creator_account,
-                member_pubkeys.clone(),
-                config.clone(),
-                None,
-            )
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys.clone(), config.clone(), None)
             .await
             .unwrap();
 
         // Test: Successfully retrieve the created group
         let retrieved_group = whitenoise
-            .group(&creator_account, &created_group.mls_group_id)
-            .await;
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .get(&created_group.mls_group_id);
 
         assert!(
             retrieved_group.is_ok(),
@@ -1891,7 +1504,11 @@ mod tests {
 
         // Test: Attempt to retrieve non-existent group
         let fake_group_id = GroupId::from_slice(&[255u8; 32]);
-        let result = whitenoise.group(&creator_account, &fake_group_id).await;
+        let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .get(&fake_group_id);
 
         assert!(result.is_err(), "Expected error for non-existent group");
         match result.unwrap_err() {
@@ -1919,20 +1536,28 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey, member_pubkeys[0]];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, member_pubkeys.clone(), config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys.clone(), config, None)
             .await
             .unwrap();
 
         // Verify initial membership
         let initial_members = whitenoise
-            .group_members(&creator_account, &group.mls_group_id)
-            .await
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)
             .unwrap();
         assert_eq!(initial_members.len(), 3); // creator + 2 members
 
         // Creator must self-demote before leaving (MIP-03: admins cannot SelfRemove)
         whitenoise
-            .self_demote(&creator_account, &group.mls_group_id)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .self_demote(&group.mls_group_id)
             .await
             .expect("self_demote should succeed (another admin exists)");
 
@@ -1941,7 +1566,10 @@ mod tests {
         // to have access to the group. For this test, we use the creator who
         // has immediate access to the group.
         let leave_result = whitenoise
-            .leave_group(&creator_account, &group.mls_group_id)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .leave(&group.mls_group_id)
             .await;
 
         assert!(
@@ -1957,7 +1585,10 @@ mod tests {
 
         // A second leave attempt must be rejected — the account already departed
         let second_leave = whitenoise
-            .leave_group(&creator_account, &group.mls_group_id)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .leave(&group.mls_group_id)
             .await;
         assert!(
             matches!(second_leave, Err(WhitenoiseError::AlreadyDepartedFromGroup)),
@@ -1966,7 +1597,6 @@ mod tests {
         );
     }
 
-    #[allow(deprecated)]
     #[tokio::test]
     async fn test_upload_group_image() {
         use tempfile::NamedTempFile;
@@ -1999,7 +1629,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
 
@@ -2020,8 +1653,11 @@ mod tests {
             ..Default::default()
         };
         let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
             .upload_group_image(
-                &creator_account,
                 &group.mls_group_id,
                 temp_path,
                 Some(blossom_url),
@@ -2056,7 +1692,10 @@ mod tests {
         };
 
         let update_result = whitenoise
-            .update_group_data(&creator_account, &group.mls_group_id, update)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group.mls_group_id, update)
             .await;
 
         assert!(
@@ -2066,7 +1705,12 @@ mod tests {
         );
 
         // Verify the group data was updated
-        let updated_groups = whitenoise.groups(&creator_account, true).await.unwrap();
+        let updated_groups = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .all(true)
+            .unwrap();
         let updated_group = updated_groups
             .iter()
             .find(|g| g.mls_group_id == group.mls_group_id)
@@ -2079,7 +1723,11 @@ mod tests {
         // Verify the image was cached immediately after upload by retrieving it
         // (should be instant since it's cached)
         let cached_path = whitenoise
-            .get_group_image_path(&creator_account, &group.mls_group_id)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .get_group_image_path(&group.mls_group_id)
             .await
             .unwrap();
 
@@ -2122,7 +1770,6 @@ mod tests {
         );
     }
 
-    #[allow(deprecated)]
     #[tokio::test]
     async fn test_sync_group_image_cache() {
         use std::time::Duration;
@@ -2157,7 +1804,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
 
@@ -2179,8 +1829,11 @@ mod tests {
             ..Default::default()
         };
         let (hash, key, nonce) = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
             .upload_group_image(
-                &creator_account,
                 &group.mls_group_id,
                 temp_path,
                 Some(blossom_url),
@@ -2203,7 +1856,10 @@ mod tests {
         };
 
         whitenoise
-            .update_group_data(&creator_account, &group.mls_group_id, update)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group.mls_group_id, update)
             .await
             .unwrap();
 
@@ -2212,7 +1868,11 @@ mod tests {
 
         // Verify the creator can retrieve the cached image
         let cached_path_opt = whitenoise
-            .get_group_image_path(&creator_account, &group.mls_group_id)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .get_group_image_path(&group.mls_group_id)
             .await
             .unwrap();
 
@@ -2237,7 +1897,11 @@ mod tests {
 
         // Verify subsequent access returns the same cached path (instant)
         let cached_again = whitenoise
-            .get_group_image_path(&creator_account, &group.mls_group_id)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .get_group_image_path(&group.mls_group_id)
             .await
             .unwrap();
 
@@ -2249,7 +1913,6 @@ mod tests {
         );
     }
 
-    #[allow(deprecated)]
     #[tokio::test]
     async fn test_upload_chat_media() {
         use tempfile::NamedTempFile;
@@ -2283,7 +1946,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
 
@@ -2303,8 +1969,11 @@ mod tests {
             ..Default::default()
         };
         let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
             .upload_chat_media(
-                &creator_account,
                 &group.mls_group_id,
                 temp_path,
                 Some(blossom_url),
@@ -2389,7 +2058,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, member_pubkeys, config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
 
@@ -2406,8 +2078,11 @@ mod tests {
             ..Default::default()
         };
         let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
             .upload_chat_media(
-                &creator_account,
                 &group.mls_group_id,
                 temp_path,
                 Some(blossom_url),
@@ -2472,58 +2147,6 @@ mod tests {
         );
     }
 
-    // ── publish_event_with_retry tests ──────────────────────────────────
-
-    #[tokio::test]
-    async fn test_publish_event_with_retry_succeeds() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        // Use a real account so event tracking succeeds after relay acceptance
-        let account = whitenoise.create_identity().await.unwrap();
-        let signer = whitenoise.get_signer_for_account(&account).unwrap();
-        let event = EventBuilder::text_note("retry-test-success")
-            .sign(&signer)
-            .await
-            .unwrap();
-        let relay_urls = vec![RelayUrl::parse("ws://localhost:8080").unwrap()];
-
-        let result = whitenoise
-            .publish_event_with_retry(event, &account.pubkey, &relay_urls)
-            .await;
-        assert!(
-            result.is_ok(),
-            "publish_event_with_retry should succeed against a reachable relay: {:?}",
-            result.unwrap_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_publish_event_with_retry_fails_after_retries() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        let keys = Keys::generate();
-        let event = EventBuilder::text_note("retry-test-failure")
-            .sign_with_keys(&keys)
-            .unwrap();
-        // Use loopback IPs so connection refusal is instant (no DNS lookup).
-        let unreachable = vec![
-            RelayUrl::parse("ws://127.0.0.1:1").unwrap(),
-            RelayUrl::parse("ws://127.0.0.1:2").unwrap(),
-        ];
-
-        // Pause time so exponential backoff sleeps complete without burning
-        // real seconds.  The whitenoise + relay setup above ran with real time.
-        tokio::time::pause();
-        let result = whitenoise
-            .publish_event_with_retry(event, &keys.public_key(), &unreachable)
-            .await;
-        tokio::time::resume();
-        assert!(
-            result.is_err(),
-            "publish_event_with_retry should fail when no relay accepts the event"
-        );
-    }
-
     // ── Ordering tests: publish failure must not advance local state ─────
     //
     // These tests call the actual production methods (add_members_to_group,
@@ -2551,7 +2174,10 @@ mod tests {
         // Create with real relays so welcome messages succeed
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, member_pks, config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pks, config, None)
             .await
             .unwrap();
 
@@ -2572,7 +2198,10 @@ mod tests {
             nostr_group_id: None,
         };
         whitenoise
-            .update_group_data(&creator, &group.mls_group_id, relay_swap)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group.mls_group_id, relay_swap)
             .await
             .unwrap();
 
@@ -2585,7 +2214,12 @@ mod tests {
         let (group, creator, _existing) = create_group_with_unreachable_relays(&whitenoise).await;
         let group_id = &group.mls_group_id;
 
-        let members_before = whitenoise.group_members(&creator, group_id).await.unwrap();
+        let members_before = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .members(group_id)
+            .unwrap();
 
         // Prepare a new member with a key package on the real relay
         let new_members = setup_multiple_test_accounts(&whitenoise, 1).await;
@@ -2596,13 +2230,21 @@ mod tests {
         // Call the actual production method — it will fail at publish
         // because the group's relays are now unreachable.
         let result = whitenoise
-            .add_members_to_group(&creator, group_id, vec![new_pk])
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .add_members(group_id, vec![new_pk])
             .await;
         tokio::time::resume();
         assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: group membership is unchanged (merge did not happen)
-        let members_after = whitenoise.group_members(&creator, group_id).await.unwrap();
+        let members_after = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .members(group_id)
+            .unwrap();
         assert_eq!(
             members_before.len(),
             members_after.len(),
@@ -2622,20 +2264,33 @@ mod tests {
         let group_id = &group.mls_group_id;
         let member_to_remove = existing[0].0.pubkey;
 
-        let members_before = whitenoise.group_members(&creator, group_id).await.unwrap();
+        let members_before = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .members(group_id)
+            .unwrap();
         assert!(members_before.contains(&member_to_remove));
 
         // Pause time so backoff sleeps complete instantly; resume before DB reads.
         tokio::time::pause();
         // Call the actual production method — fails at publish
         let result = whitenoise
-            .remove_members_from_group(&creator, group_id, vec![member_to_remove])
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .remove_members(group_id, vec![member_to_remove])
             .await;
         tokio::time::resume();
         assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: member is still in the group (merge did not happen)
-        let members_after = whitenoise.group_members(&creator, group_id).await.unwrap();
+        let members_after = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .members(group_id)
+            .unwrap();
         assert_eq!(
             members_before.len(),
             members_after.len(),
@@ -2653,7 +2308,12 @@ mod tests {
         let (group, creator, _existing) = create_group_with_unreachable_relays(&whitenoise).await;
         let group_id = &group.mls_group_id;
 
-        let group_before = whitenoise.group(&creator, group_id).await.unwrap();
+        let group_before = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .get(group_id)
+            .unwrap();
 
         // Pause time so backoff sleeps complete instantly; resume before DB reads.
         tokio::time::pause();
@@ -2670,13 +2330,21 @@ mod tests {
             nostr_group_id: None,
         };
         let result = whitenoise
-            .update_group_data(&creator, group_id, new_data)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(group_id, new_data)
             .await;
         tokio::time::resume();
         assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: group data is unchanged (merge did not happen)
-        let group_after = whitenoise.group(&creator, group_id).await.unwrap();
+        let group_after = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .get(group_id)
+            .unwrap();
         assert_eq!(
             group_before.name, group_after.name,
             "Group name should be unchanged when publish fails"
@@ -2695,7 +2363,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
         let group = whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -2853,41 +2524,5 @@ mod tests {
         let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::OwnLeafNotFound);
 
         assert!(matches!(mapped, WhitenoiseError::Internal(_)));
-    }
-
-    #[test]
-    fn map_invitee_missing_required_proposal_yields_group_rejected_member() {
-        // Defense-in-depth: if MDK still rejects an `add_members` call after
-        // our pre-check passed, the typed unit variant
-        // `InviteeMissingRequiredProposal` (no member attribution) maps to
-        // `WhitenoiseError::GroupRejectedMember { member_pubkey: None, .. }`.
-        let mapped = map_mdk_add_members_error(mdk_core::Error::InviteeMissingRequiredProposal);
-
-        match mapped {
-            WhitenoiseError::GroupRejectedMember {
-                member_pubkey,
-                reason,
-            } => {
-                assert_eq!(member_pubkey, None);
-                assert!(
-                    !reason.is_empty(),
-                    "GroupRejectedMember reason must be non-empty for FFI rendering"
-                );
-            }
-            other => panic!("expected GroupRejectedMember, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn map_other_mdk_errors_passes_through_unchanged() {
-        // Non-`InviteeMissingRequiredProposal` MDK errors keep their existing
-        // `WhitenoiseError::from` mapping (variant `MdkCoreError`).
-        let mapped =
-            map_mdk_add_members_error(mdk_core::Error::Group("some unrelated error".to_owned()));
-
-        assert!(
-            matches!(mapped, WhitenoiseError::MdkCoreError(_)),
-            "expected MdkCoreError pass-through, got: {mapped:?}"
-        );
     }
 }

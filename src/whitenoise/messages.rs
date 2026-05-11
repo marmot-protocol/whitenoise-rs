@@ -325,7 +325,6 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use std::time::Duration;
 
@@ -353,7 +352,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -450,7 +452,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -555,7 +560,10 @@ mod tests {
         let admin_pubkeys = vec![creator_account.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -625,8 +633,10 @@ mod tests {
 
         // Create a group
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -726,8 +736,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -801,8 +813,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -881,8 +895,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -959,8 +975,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -1024,7 +1042,10 @@ mod tests {
         let admin_pubkeys = vec![creator.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1104,7 +1125,10 @@ mod tests {
         let admin_pubkeys = vec![creator.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1165,7 +1189,10 @@ mod tests {
         let admin_pubkeys = vec![creator.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1200,7 +1227,10 @@ mod tests {
         let admin_pubkeys = vec![creator.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1338,8 +1368,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -1453,8 +1485,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -1514,8 +1548,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -1615,8 +1651,10 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member.pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -1695,7 +1733,10 @@ mod tests {
         let admin_pubkeys = vec![creator.pubkey];
         let config = create_nostr_group_config_data(admin_pubkeys);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1785,7 +1826,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1878,7 +1922,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -1970,7 +2017,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -2106,7 +2156,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -2195,7 +2248,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member_pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_pubkey], config, None)
             .await
             .unwrap();
 
@@ -2325,8 +2381,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -2361,8 +2419,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -2392,8 +2452,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -2425,7 +2487,10 @@ mod tests {
 
         // Mark the first message as read — 2 messages remain unread
         whitenoise
-            .mark_message_read(&creator, &sent_ids[0])
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&sent_ids[0])
             .await
             .unwrap();
 
@@ -2455,8 +2520,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -2480,7 +2547,10 @@ mod tests {
             last_id = Some(msg.message.id);
         }
         whitenoise
-            .mark_message_read(&creator, &last_id.unwrap())
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&last_id.unwrap())
             .await
             .unwrap();
 
@@ -2510,8 +2580,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -2557,8 +2629,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -2589,8 +2663,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,
@@ -2614,7 +2690,10 @@ mod tests {
             last_id = Some(msg.message.id);
         }
         whitenoise
-            .mark_message_read(&creator, &last_id.unwrap())
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&last_id.unwrap())
             .await
             .unwrap();
 
@@ -2644,8 +2723,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator.pubkey]),
                 None,

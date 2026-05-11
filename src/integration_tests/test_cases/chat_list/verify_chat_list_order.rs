@@ -34,7 +34,8 @@ impl TestCase for VerifyChatListOrderTestCase {
         );
 
         let account = context.get_account(&self.account_name)?;
-        let chat_list = context.whitenoise.get_chat_list(account).await?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+        let chat_list = session.chat_list().active().await?;
 
         // Build the expected group IDs in order
         let expected_group_ids: Vec<_> = self

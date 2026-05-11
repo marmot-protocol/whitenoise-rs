@@ -33,7 +33,6 @@ impl RemoveGroupMembersTestCase {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl TestCase for RemoveGroupMembersTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
@@ -47,17 +46,18 @@ impl TestCase for RemoveGroupMembersTestCase {
         // Get initial member count for verification
         let initial_members = context
             .whitenoise
-            .group_members(admin_account, &self.group_id)
-            .await?;
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&self.group_id)?;
 
         // Remove members from the group
         let remove_result = context
             .whitenoise
-            .remove_members_from_group(
-                admin_account,
-                &self.group_id,
-                self.member_pubkeys_to_remove.clone(),
-            )
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .groups()
+            .remove_members(&self.group_id, self.member_pubkeys_to_remove.clone())
             .await;
 
         // Handle expected failure vs success cases
@@ -92,8 +92,10 @@ impl TestCase for RemoveGroupMembersTestCase {
             || async {
                 let members = context
                     .whitenoise
-                    .group_members(admin_account, &self.group_id)
-                    .await?;
+                    .require_session(&admin_account.pubkey)
+                    .unwrap()
+                    .groups()
+                    .members(&self.group_id)?;
 
                 if members.len() == expected_count {
                     // Verify each removed member is no longer in the group

@@ -14,7 +14,6 @@ use crate::whitenoise::{
     accounts::Account,
     accounts_groups::AccountGroup,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
-    error::{Result, WhitenoiseError},
     group_information::{GroupInformation, GroupType},
     message_aggregator::ChatMessageSummary,
     users::User,
@@ -237,52 +236,7 @@ pub(crate) fn sort_chat_list(items: &mut [ChatListItem]) {
     items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 }
 
-#[allow(deprecated)]
 impl Whitenoise {
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::chat_list().active() instead."
-    )]
-    #[perf_instrument("chat_list")]
-    pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        self.require_session(&account.pubkey)?
-            .chat_list()
-            .active()
-            .await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::chat_list().archived() instead."
-    )]
-    #[perf_instrument("chat_list")]
-    pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        self.require_session(&account.pubkey)?
-            .chat_list()
-            .archived()
-            .await
-    }
-
-    /// Returns a single chat list item, or `GroupNotFound` if the group is
-    /// unknown to this account.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::chat_list().build_item() instead."
-    )]
-    #[perf_instrument("chat_list")]
-    pub async fn get_chat_list_item(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<ChatListItem> {
-        let session = self.require_session(&account.pubkey)?;
-        session
-            .chat_list()
-            .build_item(group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)
-    }
-
     /// Emit a chat list update with the given trigger for a specific account.
     ///
     /// Checks for subscribers on both active and archived channels first to avoid
@@ -467,17 +421,32 @@ impl Whitenoise {
     ///
     /// Groups without images return None (not an error).
     /// Download failures are logged but don't fail the batch.
-    #[allow(deprecated)]
     #[perf_instrument("chat_list")]
     pub(crate) async fn resolve_group_image_paths(
         &self,
         account: &Account,
         groups: &[group_types::Group],
     ) -> HashMap<GroupId, PathBuf> {
+        let session = match self.require_session(&account.pubkey) {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::chat_list",
+                    account_pubkey = %account.pubkey,
+                    "Failed to resolve group images because the account session is missing: {error}"
+                );
+                return HashMap::new();
+            }
+        };
         let futures = groups.iter().map(|group| {
             let group_id = group.mls_group_id.clone();
+            let session = session.clone();
             async move {
-                let result = self.resolve_group_image_path(account, group).await;
+                let result = session
+                    .groups()
+                    .media()
+                    .resolve_group_image_path(group)
+                    .await;
                 (group_id, result)
             }
         });
@@ -509,7 +478,6 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::aggregated_message::AggregatedMessage;
@@ -522,7 +490,13 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&account).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
         assert!(chat_list.is_empty());
     }
 
@@ -534,11 +508,20 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let _group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].group_type, GroupType::Group);
@@ -565,16 +548,20 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].group_type, GroupType::DirectMessage);
@@ -603,16 +590,20 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         // Should use display_name, not name
@@ -637,16 +628,20 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].name, Some("Bob Name".to_string()));
@@ -672,16 +667,20 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].name, Some("Fallback Name".to_string()));
@@ -700,28 +699,30 @@ mod tests {
         let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         config1.name = "First Group".to_string();
         let _group1 = whitenoise
-            .create_group(
-                &creator,
-                vec![member1.pubkey],
-                config1,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, Some(GroupType::Group))
             .await
             .unwrap();
 
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
         config2.name = "Second Group".to_string();
         let _group2 = whitenoise
-            .create_group(
-                &creator,
-                vec![member2.pubkey],
-                config2,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, Some(GroupType::Group))
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 2);
         assert!(chat_list.iter().all(|c| c.group_type == GroupType::Group));
@@ -738,7 +739,10 @@ mod tests {
         let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         config1.name = "First".to_string();
         let _group1 = whitenoise
-            .create_group(&creator, vec![member1.pubkey], config1, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -748,11 +752,20 @@ mod tests {
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
         config2.name = "Second".to_string();
         let _group2 = whitenoise
-            .create_group(&creator, vec![member2.pubkey], config2, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, None)
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 2);
         assert_eq!(chat_list[0].name, Some("Second".to_string()));
@@ -770,12 +783,10 @@ mod tests {
         let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         config1.name = "Old Message Group".to_string();
         let group1 = whitenoise
-            .create_group(
-                &creator,
-                vec![member1.pubkey],
-                config1,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, Some(GroupType::Group))
             .await
             .unwrap();
 
@@ -785,12 +796,10 @@ mod tests {
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
         config2.name = "New Message Group".to_string();
         let group2 = whitenoise
-            .create_group(
-                &creator,
-                vec![member2.pubkey],
-                config2,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, Some(GroupType::Group))
             .await
             .unwrap();
 
@@ -843,7 +852,13 @@ mod tests {
         .await
         .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 2);
         assert_eq!(chat_list[0].name, Some("New Message Group".to_string()));
@@ -860,20 +875,20 @@ mod tests {
 
         let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         let _group1 = whitenoise
-            .create_group(
-                &creator,
-                vec![member1.pubkey],
-                config1,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, Some(GroupType::Group))
             .await
             .unwrap();
 
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey, member2.pubkey]);
         config2.name = String::new();
         let _group2 = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator,
                 vec![member2.pubkey],
                 config2,
                 Some(GroupType::DirectMessage),
@@ -881,7 +896,13 @@ mod tests {
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 2);
         let group_count = chat_list
@@ -914,16 +935,20 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].group_type, GroupType::DirectMessage);
@@ -945,16 +970,20 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let _group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::Group))
             .await
             .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].group_type, GroupType::Group);
@@ -978,12 +1007,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::Group))
             .await
             .unwrap();
 
@@ -1013,7 +1040,13 @@ mod tests {
         .await
         .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 1);
         let last_msg = chat_list[0].last_message.as_ref().unwrap();
@@ -1032,12 +1065,10 @@ mod tests {
         let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         config1.name = "Old Message".to_string();
         let group1 = whitenoise
-            .create_group(
-                &creator,
-                vec![member1.pubkey],
-                config1,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, Some(GroupType::Group))
             .await
             .unwrap();
 
@@ -1046,12 +1077,10 @@ mod tests {
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
         config2.name = "No Message".to_string();
         let _group2 = whitenoise
-            .create_group(
-                &creator,
-                vec![member2.pubkey],
-                config2,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, Some(GroupType::Group))
             .await
             .unwrap();
 
@@ -1081,7 +1110,13 @@ mod tests {
         .await
         .unwrap();
 
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(chat_list.len(), 2);
         assert_eq!(chat_list[0].name, Some("No Message".to_string()));
@@ -1273,15 +1308,30 @@ mod tests {
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
             config.name = format!("Group {}", i);
             let group = whitenoise
-                .create_group(&creator, vec![member.pubkey], config, None)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
             groups.push(group);
         }
 
         // Fetch chat list multiple times - order should be stable
-        let list1 = whitenoise.get_chat_list(&creator).await.unwrap();
-        let list2 = whitenoise.get_chat_list(&creator).await.unwrap();
+        let list1 = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
+        let list2 = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(list1.len(), 3);
         assert_eq!(list2.len(), 3);
@@ -1302,7 +1352,10 @@ mod tests {
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
             config.name = format!("Group {}", i);
             let group = whitenoise
-                .create_group(&creator, vec![member.pubkey], config, None)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
             groups.push(group);
@@ -1338,8 +1391,20 @@ mod tests {
         }
 
         // Order should be stable when timestamps are identical
-        let list1 = whitenoise.get_chat_list(&creator).await.unwrap();
-        let list2 = whitenoise.get_chat_list(&creator).await.unwrap();
+        let list1 = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
+        let list2 = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
 
         assert_eq!(list1.len(), 3);
         for i in 0..3 {
@@ -1626,23 +1691,42 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
             .await
             .unwrap();
 
         // Initially unpinned
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
         assert_eq!(chat_list.len(), 1);
         assert!(chat_list[0].pin_order.is_none());
 
         // Pin the chat
         whitenoise
-            .set_chat_pin_order(&creator, &group.mls_group_id, Some(42))
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .set_pin_order(Some(42))
             .await
             .unwrap();
 
         // Verify pin_order is included
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].pin_order, Some(42));
     }
@@ -1657,7 +1741,10 @@ mod tests {
         let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         config1.name = "Group A".to_string();
         let group_a = whitenoise
-            .create_group(&creator, vec![member.pubkey], config1, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -1666,7 +1753,10 @@ mod tests {
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
         config2.name = "Group B".to_string();
         let group_b = whitenoise
-            .create_group(&creator, vec![member.pubkey], config2, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config2, None)
             .await
             .unwrap();
 
@@ -1675,28 +1765,51 @@ mod tests {
         let mut config3 = create_nostr_group_config_data(vec![creator.pubkey]);
         config3.name = "Group C".to_string();
         let _group_c = whitenoise
-            .create_group(&creator, vec![member.pubkey], config3, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config3, None)
             .await
             .unwrap();
 
         // Without pinning: C, B, A (by creation time, most recent first)
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
         assert_eq!(chat_list[0].name, Some("Group C".to_string()));
         assert_eq!(chat_list[1].name, Some("Group B".to_string()));
         assert_eq!(chat_list[2].name, Some("Group A".to_string()));
 
         // Pin Group A with low order, Group B with high order
         whitenoise
-            .set_chat_pin_order(&creator, &group_a.mls_group_id, Some(10))
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_a.mls_group_id)
+            .set_pin_order(Some(10))
             .await
             .unwrap();
         whitenoise
-            .set_chat_pin_order(&creator, &group_b.mls_group_id, Some(20))
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_b.mls_group_id)
+            .set_pin_order(Some(20))
             .await
             .unwrap();
 
         // After pinning: A (pin 10), B (pin 20), C (unpinned)
-        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let chat_list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
         assert_eq!(chat_list[0].name, Some("Group A".to_string()));
         assert_eq!(chat_list[1].name, Some("Group B".to_string()));
         assert_eq!(chat_list[2].name, Some("Group C".to_string()));
@@ -1710,29 +1823,51 @@ mod tests {
 
         let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         let group1 = whitenoise
-            .create_group(&creator, vec![member.pubkey], config1, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config1, None)
             .await
             .unwrap();
 
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
         config2.name = "Archived Group".to_string();
         let group2 = whitenoise
-            .create_group(&creator, vec![member.pubkey], config2, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config2, None)
             .await
             .unwrap();
 
         // Both visible before archiving
-        let list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
         assert_eq!(list.len(), 2);
 
         // Archive one group
         whitenoise
-            .archive_chat(&creator, &group2.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group2.mls_group_id)
+            .archive()
             .await
             .unwrap();
 
         // Only the unarchived group should remain
-        let list = whitenoise.get_chat_list(&creator).await.unwrap();
+        let list = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .active()
+            .await
+            .unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].mls_group_id, group1.mls_group_id);
     }
@@ -1745,29 +1880,51 @@ mod tests {
 
         let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
         let _group1 = whitenoise
-            .create_group(&creator, vec![member.pubkey], config1, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config1, None)
             .await
             .unwrap();
 
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
         config2.name = "Archived Group".to_string();
         let group2 = whitenoise
-            .create_group(&creator, vec![member.pubkey], config2, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config2, None)
             .await
             .unwrap();
 
         // No archived chats initially
-        let archived = whitenoise.get_archived_chat_list(&creator).await.unwrap();
+        let archived = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .archived()
+            .await
+            .unwrap();
         assert!(archived.is_empty());
 
         // Archive one group
         whitenoise
-            .archive_chat(&creator, &group2.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group2.mls_group_id)
+            .archive()
             .await
             .unwrap();
 
         // Only the archived group should appear
-        let archived = whitenoise.get_archived_chat_list(&creator).await.unwrap();
+        let archived = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .chat_list()
+            .archived()
+            .await
+            .unwrap();
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].mls_group_id, group2.mls_group_id);
         assert!(archived[0].archived_at.is_some());
@@ -1781,20 +1938,40 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
             .await
             .unwrap();
 
         // Archive then unarchive
         whitenoise
-            .archive_chat(&creator, &group.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .archive()
             .await
             .unwrap();
 
-        assert_eq!(whitenoise.get_chat_list(&creator).await.unwrap().len(), 0);
         assert_eq!(
             whitenoise
-                .get_archived_chat_list(&creator)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .chat_list()
+                .active()
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            whitenoise
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .chat_list()
+                .archived()
                 .await
                 .unwrap()
                 .len(),
@@ -1802,14 +1979,31 @@ mod tests {
         );
 
         whitenoise
-            .unarchive_chat(&creator, &group.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .unarchive()
             .await
             .unwrap();
 
-        assert_eq!(whitenoise.get_chat_list(&creator).await.unwrap().len(), 1);
+        assert_eq!(
+            whitenoise
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .chat_list()
+                .active()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
             whitenoise
-                .get_archived_chat_list(&creator)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .chat_list()
+                .archived()
                 .await
                 .unwrap()
                 .is_empty()
@@ -1824,7 +2018,10 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
             .await
             .unwrap();
 
@@ -1840,7 +2037,11 @@ mod tests {
 
         // Archive the chat
         whitenoise
-            .archive_chat(&creator, &group.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .archive()
             .await
             .unwrap();
 
@@ -1874,20 +2075,31 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
             .await
             .unwrap();
 
         // First archive
         let first = whitenoise
-            .archive_chat(&creator, &group.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .archive()
             .await
             .unwrap();
         let first_archived_at = first.archived_at.unwrap();
 
         // Second archive — should be a no-op
         let second = whitenoise
-            .archive_chat(&creator, &group.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .archive()
             .await
             .unwrap();
 
@@ -1907,13 +2119,20 @@ mod tests {
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
             .await
             .unwrap();
 
         // Unarchive a chat that was never archived — should be a no-op
         let result = whitenoise
-            .unarchive_chat(&creator, &group.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .unarchive()
             .await
             .unwrap();
 

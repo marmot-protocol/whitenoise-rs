@@ -1,4 +1,3 @@
-#[allow(deprecated)]
 pub mod create_accounts;
 pub mod create_group;
 pub mod create_legacy_peer_account;

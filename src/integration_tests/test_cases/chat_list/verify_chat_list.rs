@@ -43,7 +43,8 @@ impl TestCase for VerifyChatListTestCase {
         tracing::info!("Verifying chat list for account: {}", self.account_name);
 
         let account = context.get_account(&self.account_name)?;
-        let chat_list = context.whitenoise.get_chat_list(account).await?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+        let chat_list = session.chat_list().active().await?;
 
         // Count groups and DMs
         let group_count = chat_list

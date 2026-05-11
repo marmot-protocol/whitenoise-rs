@@ -45,7 +45,6 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use nostr_sdk::{EventBuilder, Keys, Kind, Tag};
 
@@ -74,7 +73,8 @@ mod tests {
         );
 
         // Cache must remain empty — the foreign event must not have been applied
-        let blocked = whitenoise.get_blocked_users(&account).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let blocked = session.mute_list().get_blocked_users().await.unwrap();
         assert!(
             blocked.is_empty(),
             "foreign mute list event must not modify the local cache"
