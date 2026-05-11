@@ -23,6 +23,10 @@ impl Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_wnd"))
             .args(["--data-dir", &data_dir.display().to_string()])
             .args(["--logs-dir", &logs_dir.display().to_string()])
+            .args([
+                "--discovery-relays",
+                "ws://localhost:8080,ws://localhost:7777",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -148,6 +152,23 @@ pub(crate) async fn poll_until(
         assert!(Instant::now() < deadline, "{timeout_msg}");
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Wait for a daemon to report a valid published key package for `pubkey` (up to 30s).
+///
+/// Used to cover the asynchronous publish that happens after `create-identity`
+/// returns. Without it, callers can race ahead and try to pull the key package
+/// before it has reached the relays.
+#[allow(dead_code)] // used by cli_relay_control_e2e.rs but not cli_e2e.rs
+pub(crate) async fn wait_for_key_package(socket: &PathBuf, pubkey: &str) {
+    let msg = format!("did not see a valid key package for {pubkey} within 30s");
+    poll_until(Duration::from_secs(30), &msg, || {
+        wn(socket, &["keys", "check", pubkey])
+            .get("status")
+            .and_then(|status| status.as_str())
+            == Some("valid")
+    })
+    .await;
 }
 
 /// Wait for a daemon to see at least one group (up to 60s).

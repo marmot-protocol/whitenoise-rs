@@ -13,9 +13,8 @@ use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
     accounts_groups::AccountGroup,
-    aggregated_message::AggregatedMessage,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
-    error::Result,
+    error::{Result, WhitenoiseError},
     group_information::{GroupInformation, GroupType},
     message_aggregator::ChatMessageSummary,
     users::User,
@@ -264,138 +263,30 @@ impl Whitenoise {
             .await
     }
 
-    /// Builds a single ChatListItem for a specific group.
-    ///
-    /// Called from the emit path which runs inside `tokio::spawn`. Cannot
-    /// delegate to session ops without hitting the compiler recursion limit
-    /// (the extra async indirection pushes h2/hyper trait evaluation past 128).
-    ///
-    /// NOTE: This implementation resolves DM peers via MDK group membership,
-    /// while `ChatListOps::build_item` uses `AccountGroup::find_dm_peers_for_account`
-    /// (batch SQL). The two paths can diverge in edge cases where MDK membership
-    /// and the DB are transiently inconsistent. Tracked for removal in phase 15
-    /// (session-scoped event dispatch) when emit paths use session directly.
+    /// Returns a single chat list item, or `GroupNotFound` if the group is
+    /// unknown to this account.
     #[deprecated(
         since = "0.0.0",
         note = "Use AccountSession::chat_list().build_item() instead."
     )]
     #[perf_instrument("chat_list")]
-    pub(crate) async fn build_chat_list_item(
+    pub async fn get_chat_list_item(
         &self,
         account: &Account,
         group_id: &GroupId,
-    ) -> Result<Option<ChatListItem>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let Some(group) = mdk.get_group(group_id)? else {
-            return Ok(None);
-        };
-
-        let group_info =
-            match GroupInformation::find_by_mls_group_id(group_id, &self.shared.database).await {
-                Ok(info) => info,
-                Err(_) => return Ok(None),
-            };
-
+    ) -> Result<ChatListItem> {
         let session = self.require_session(&account.pubkey)?;
-        let account_group = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            group_id,
-            &session.account_db.inner.pool,
-        )
-        .await?;
-        let Some(account_group) = account_group else {
-            return Ok(None);
-        };
-        if !account_group.is_visible() {
-            return Ok(None);
-        }
-
-        let (dm_peer_pubkey, dm_other_user) = if group_info.group_type == GroupType::DirectMessage {
-            let members: Vec<PublicKey> = mdk.get_members(group_id)?.into_iter().collect();
-            let other_pk = members.iter().find(|pk| *pk != &account.pubkey).copied();
-            match other_pk {
-                Some(pk) => {
-                    let user = User::find_by_pubkey(&pk, &self.shared.database).await.ok();
-                    (Some(pk), user)
-                }
-                None => (None, None),
-            }
-        } else {
-            (None, None)
-        };
-
-        let last_message_summary = AggregatedMessage::find_last_by_group_ids(
-            std::slice::from_ref(group_id),
-            &session.account_db.inner,
-        )
-        .await?
-        .into_iter()
-        .next()
-        .filter(|s| account_group.is_message_visible(s.created_at));
-
-        let last_message = if let Some(mut summary) = last_message_summary {
-            let author_user = User::find_by_pubkey(&summary.author, &self.shared.database)
-                .await
-                .ok();
-            summary.author_display_name = resolve_display_name(author_user.as_ref());
-            Some(summary)
-        } else {
-            None
-        };
-
-        let name = resolve_chat_name(&group, &group_info.group_type, dm_other_user.as_ref());
-        let (group_image_path, group_image_url) = match group_info.group_type {
-            GroupType::Group => {
-                let path = self
-                    .resolve_group_image_path(account, &group)
-                    .await
-                    .ok()
-                    .flatten();
-                (path, None)
-            }
-            GroupType::DirectMessage => {
-                let url = dm_other_user
-                    .as_ref()
-                    .and_then(|u| u.metadata.picture.as_ref().map(|url| url.to_string()));
-                (None, url)
-            }
-        };
-
-        let cleared_ms = account_group
-            .chat_cleared_at
-            .map(|dt| dt.timestamp_millis());
-        let unread_count = AggregatedMessage::count_unread_for_group(
-            group_id,
-            account_group.last_read_message_id.as_ref(),
-            &session.account_db.inner,
-            cleared_ms,
-        )
-        .await?;
-
-        Ok(Some(ChatListItem {
-            mls_group_id: group_id.clone(),
-            name,
-            group_type: group_info.group_type,
-            created_at: group_info.created_at,
-            group_image_path,
-            group_image_url,
-            last_message,
-            pending_confirmation: account_group.is_pending(),
-            welcomer_pubkey: account_group.welcomer_pubkey,
-            unread_count,
-            pin_order: account_group.pin_order,
-            dm_peer_pubkey,
-            archived_at: account_group.archived_at,
-            removed_at: account_group.removed_at,
-            self_removed: account_group.self_removed,
-            muted_until: account_group.muted_until,
-        }))
+        session
+            .chat_list()
+            .build_item(group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)
     }
 
     /// Emit a chat list update with the given trigger for a specific account.
     ///
     /// Checks for subscribers on both active and archived channels first to avoid
-    /// expensive `build_chat_list_item` calls. Errors are logged but don't affect the caller.
+    /// expensive `build_item` calls. Errors are logged but don't affect the caller.
     #[perf_instrument("chat_list")]
     pub(crate) async fn emit_chat_list_update(
         &self,
@@ -485,12 +376,12 @@ impl Whitenoise {
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        let account = match Account::find_by_pubkey(pubkey, &self.shared.database).await {
-            Ok(acc) => acc,
+        let session = match self.require_session(pubkey) {
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::chat_list_streaming",
-                    "Failed to find account {} for chat list update: {}",
+                    "Failed to find session for {} during chat list update: {}",
                     pubkey,
                     e
                 );
@@ -504,7 +395,7 @@ impl Whitenoise {
             .archived_chat_list_stream_manager
             .has_subscribers(pubkey);
 
-        match self.build_chat_list_item(&account, group_id).await {
+        match session.chat_list().build_item(group_id).await {
             Ok(Some(item)) => {
                 let update = ChatListUpdate { trigger, item };
                 match trigger {
@@ -1196,144 +1087,6 @@ mod tests {
         assert_eq!(chat_list[0].name, Some("No Message".to_string()));
         assert_eq!(chat_list[1].name, Some("Old Message".to_string()));
         assert!(chat_list.iter().all(|c| !c.pending_confirmation));
-    }
-
-    #[tokio::test]
-    async fn test_build_chat_list_item_returns_none_for_nonexistent_group() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-
-        let nonexistent_group_id = mdk_core::prelude::GroupId::from_slice(&[99; 32]);
-        let result = whitenoise
-            .build_chat_list_item(&account, &nonexistent_group_id)
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_build_chat_list_item_returns_valid_item() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
-
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
-        let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
-            .await
-            .unwrap();
-
-        let result = whitenoise
-            .build_chat_list_item(&creator, &group.mls_group_id)
-            .await
-            .unwrap();
-
-        assert!(result.is_some());
-        let item = result.unwrap();
-        assert_eq!(item.mls_group_id, group.mls_group_id);
-        assert_eq!(item.name, Some("Test group".to_string()));
-        assert_eq!(item.group_type, GroupType::Group);
-        assert!(item.last_message.is_none());
-        assert!(!item.pending_confirmation);
-        assert!(item.welcomer_pubkey.is_none());
-        // Groups should not have dm_peer_pubkey
-        assert!(item.dm_peer_pubkey.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_build_chat_list_item_with_last_message() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
-
-        // Set author display name
-        let mut user = User::find_by_pubkey(&creator.pubkey, &whitenoise.shared.database)
-            .await
-            .unwrap();
-        user.metadata = user.metadata.display_name("Alice");
-        user.save(&whitenoise.shared.database).await.unwrap();
-
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
-        let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
-            .await
-            .unwrap();
-
-        let msg = ChatMessage {
-            id: format!("{:0>64}", "1"),
-            author: creator.pubkey,
-            content: "Hello World".to_string(),
-            created_at: Timestamp::now(),
-            tags: nostr_sdk::Tags::new(),
-            is_reply: false,
-            reply_to_id: None,
-            is_deleted: false,
-            content_tokens: vec![],
-            reactions: Default::default(),
-            kind: 9,
-            media_attachments: vec![],
-            delivery_status: None,
-        };
-        let session = whitenoise.session(&creator.pubkey).unwrap();
-        AggregatedMessage::insert_message(
-            &msg,
-            &group.mls_group_id,
-            &creator.pubkey,
-            &session.account_db.inner,
-        )
-        .await
-        .unwrap();
-
-        let result = whitenoise
-            .build_chat_list_item(&creator, &group.mls_group_id)
-            .await
-            .unwrap();
-
-        assert!(result.is_some());
-        let item = result.unwrap();
-        assert!(item.last_message.is_some());
-        let last_msg = item.last_message.unwrap();
-        assert_eq!(last_msg.content, "Hello World");
-        assert_eq!(last_msg.author_display_name, Some("Alice".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_build_chat_list_item_dm_resolves_other_user_name() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
-
-        // Set other user's display name
-        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
-            .await
-            .unwrap();
-        user.metadata = Metadata::new().display_name("Bob");
-        user.save(&whitenoise.shared.database).await.unwrap();
-
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
-        config.name = String::new();
-        let group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
-            .await
-            .unwrap();
-
-        let result = whitenoise
-            .build_chat_list_item(&creator, &group.mls_group_id)
-            .await
-            .unwrap();
-
-        assert!(result.is_some());
-        let item = result.unwrap();
-        assert_eq!(item.group_type, GroupType::DirectMessage);
-        assert_eq!(item.name, Some("Bob".to_string()));
-        // DM should have the other user's pubkey
-        assert_eq!(item.dm_peer_pubkey, Some(member.pubkey));
     }
 
     #[test]

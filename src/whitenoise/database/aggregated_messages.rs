@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::{GroupId, message_types::Message};
 use nostr_sdk::prelude::*;
+use sqlx::Row;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::nostr_manager::parser::SerializableToken;
@@ -1039,16 +1040,18 @@ impl AggregatedMessage {
         message_id: &str,
         group_id: &GroupId,
         deletion_event_id: &str,
+        target_author: &PublicKey,
         database: &Database,
     ) -> Result<()> {
         sqlx::query(
             "UPDATE aggregated_messages
              SET deletion_event_id = ?
-             WHERE message_id = ? AND mls_group_id = ? AND kind IN (7, 9)",
+             WHERE message_id = ? AND mls_group_id = ? AND kind IN (7, 9) AND author = ?",
         )
         .bind(deletion_event_id)
         .bind(message_id)
         .bind(group_id.as_slice())
+        .bind(target_author.to_hex())
         .execute(&database.pool)
         .await?;
 
@@ -1319,43 +1322,84 @@ impl AggregatedMessage {
         database: &Database,
         chat_cleared_at_ms: Option<i64>,
     ) -> Result<usize> {
-        let count: i64 = match read_marker {
-            Some(message_id) => {
-                // Count messages after the read marker's timestamp
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM aggregated_messages am
-                     WHERE am.mls_group_id = ?
-                       AND am.kind = 9
-                       AND am.deletion_event_id IS NULL
-                       AND am.created_at > COALESCE(
-                           (SELECT created_at FROM aggregated_messages
-                            WHERE message_id = ? AND mls_group_id = ?),
-                           0
-                       )
-                       AND am.created_at > COALESCE(?, 0)",
-                )
-                .bind(group_id.as_slice())
-                .bind(message_id.to_hex())
-                .bind(group_id.as_slice())
-                .bind(chat_cleared_at_ms)
-                .fetch_one(&database.pool)
-                .await?
-            }
-            None => {
-                // No read marker = all messages are unread
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM aggregated_messages
-                     WHERE mls_group_id = ?
-                       AND kind = 9
-                       AND deletion_event_id IS NULL
-                       AND created_at > COALESCE(?, 0)",
-                )
-                .bind(group_id.as_slice())
-                .bind(chat_cleared_at_ms)
-                .fetch_one(&database.pool)
-                .await?
-            }
-        };
+        Self::count_unread_for_group_filtered(
+            group_id,
+            read_marker,
+            database,
+            chat_cleared_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Count chat-list-visible unread messages for a group.
+    ///
+    /// This is the same unread projection as `count_unread_for_group`, except it
+    /// excludes messages authored by users blocked by `account_pubkey`.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn count_visible_unread_for_group(
+        group_id: &GroupId,
+        read_marker: Option<&EventId>,
+        account_pubkey: &PublicKey,
+        database: &Database,
+        chat_cleared_at_ms: Option<i64>,
+    ) -> Result<usize> {
+        Self::count_unread_for_group_filtered(
+            group_id,
+            read_marker,
+            database,
+            chat_cleared_at_ms,
+            Some(account_pubkey),
+        )
+        .await
+    }
+
+    async fn count_unread_for_group_filtered(
+        group_id: &GroupId,
+        read_marker: Option<&EventId>,
+        database: &Database,
+        chat_cleared_at_ms: Option<i64>,
+        account_pubkey: Option<&PublicKey>,
+    ) -> Result<usize> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT COUNT(*) FROM aggregated_messages am
+             WHERE am.mls_group_id = ",
+        );
+        qb.push_bind(group_id.as_slice());
+        qb.push(
+            " AND am.kind = 9
+              AND am.deletion_event_id IS NULL",
+        );
+
+        if let Some(message_id) = read_marker {
+            qb.push(
+                " AND am.created_at > COALESCE(
+                    (SELECT created_at FROM aggregated_messages
+                     WHERE message_id = ",
+            );
+            qb.push_bind(message_id.to_hex());
+            qb.push(" AND mls_group_id = ");
+            qb.push_bind(group_id.as_slice());
+            qb.push("), 0)");
+        }
+
+        qb.push(" AND am.created_at > COALESCE(");
+        qb.push_bind(chat_cleared_at_ms);
+        qb.push(", 0)");
+
+        if account_pubkey.is_some() {
+            // mute_list is per-account so account scoping is implicit.
+            // The Option<&PublicKey> parameter acts as a feature toggle:
+            // Some = filter blocked authors, None = no filter.
+            qb.push(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM mute_list ml
+                    WHERE ml.muted_pubkey = am.author
+                )",
+            );
+        }
+
+        let count: i64 = qb.build_query_scalar().fetch_one(&database.pool).await?;
 
         Ok(count as usize)
     }
@@ -1371,8 +1415,26 @@ impl AggregatedMessage {
         group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
         database: &Database,
     ) -> Result<HashMap<GroupId, usize>> {
-        use sqlx::Row;
+        Self::count_unread_for_groups_filtered(group_markers, database, None).await
+    }
 
+    /// Count chat-list-visible unread messages for multiple groups.
+    ///
+    /// Excludes messages authored by users blocked by `account_pubkey`.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn count_visible_unread_for_groups(
+        group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
+        account_pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<HashMap<GroupId, usize>> {
+        Self::count_unread_for_groups_filtered(group_markers, database, Some(account_pubkey)).await
+    }
+
+    async fn count_unread_for_groups_filtered(
+        group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
+        database: &Database,
+        account_pubkey: Option<&PublicKey>,
+    ) -> Result<HashMap<GroupId, usize>> {
         if group_markers.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1441,17 +1503,33 @@ impl AggregatedMessage {
              WHERE am.mls_group_id IN (",
         );
 
-        let mut sep = qb.separated(", ");
-        for group_id in &all_group_ids {
-            sep.push_bind(group_id);
+        {
+            let mut sep = qb.separated(", ");
+            for group_id in &all_group_ids {
+                sep.push_bind(group_id);
+            }
         }
-        sep.push_unseparated(
+
+        qb.push(
             ") AND am.kind = 9 \
              AND am.deletion_event_id IS NULL \
              AND am.created_at > COALESCE(mt.created_at, 0) \
-             AND am.created_at > COALESCE(ct.cleared_at, 0) \
-             GROUP BY am.mls_group_id",
+             AND am.created_at > COALESCE(ct.cleared_at, 0)",
         );
+
+        if account_pubkey.is_some() {
+            // mute_list is per-account so account scoping is implicit.
+            // The Option<&PublicKey> parameter acts as a feature toggle:
+            // Some = filter blocked authors, None = no filter.
+            qb.push(
+                " AND NOT EXISTS ( \
+                    SELECT 1 FROM mute_list ml \
+                    WHERE ml.muted_pubkey = am.author \
+                )",
+            );
+        }
+
+        qb.push(" GROUP BY am.mls_group_id");
 
         let rows = qb.build().fetch_all(&database.pool).await?;
 
@@ -1526,17 +1604,18 @@ impl AggregatedMessage {
             .collect())
     }
 
-    /// Find orphaned deletions targeting a specific message
-    /// Returns the event IDs of deletions (kind 5) that reference the target message_id
-    /// Uses json_each to properly parse the tags array
+    /// Find orphaned deletions targeting a specific message.
+    /// Returns deletions (kind 5) that reference the target `message_id`.
+    /// Callers must check `author` before applying — only deletions whose
+    /// author matches the target's author are valid.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_orphaned_deletions(
         message_id: &str,
         group_id: &GroupId,
         database: &Database,
-    ) -> Result<Vec<EventId>> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT am.message_id FROM aggregated_messages am
+    ) -> Result<Vec<AggregatedMessage>> {
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "SELECT * FROM aggregated_messages am
              WHERE am.kind = 5
                AND am.mls_group_id = ?
                AND EXISTS (
@@ -1551,9 +1630,9 @@ impl AggregatedMessage {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(ids
+        Ok(rows
             .into_iter()
-            .filter_map(|id| EventId::from_hex(&id).ok())
+            .map(AggregatedMessageRow::into_aggregated_message)
             .collect())
     }
 
@@ -1866,7 +1945,7 @@ mod tests {
 
         // Mark as deleted - need a valid 64-char hex ID
         let deletion_event_id = format!("{:0>64}", "abc123");
-        AggregatedMessage::mark_deleted(&message.id, &group_id, &deletion_event_id, db)
+        AggregatedMessage::mark_deleted(&message.id, &group_id, &deletion_event_id, &author, db)
             .await
             .unwrap();
 
@@ -2119,6 +2198,7 @@ mod tests {
             &msg_deleted.id,
             &group_with_deletion,
             &format!("{:0>64}", "del"),
+            &author,
             db,
         )
         .await
@@ -2301,9 +2381,15 @@ mod tests {
             .unwrap();
 
         // Delete msg2
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &format!("{:0>64}", "del"), db)
-            .await
-            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &msg2.id,
+            &group_id,
+            &format!("{:0>64}", "del"),
+            &author,
+            db,
+        )
+        .await
+        .unwrap();
 
         let count = AggregatedMessage::count_unread_for_group(&group_id, None, db, None)
             .await
@@ -2697,9 +2783,15 @@ mod tests {
         }
 
         // Delete msg2
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &format!("{:0>64}", "del"), db)
-            .await
-            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &msg2.id,
+            &group_id,
+            &format!("{:0>64}", "del"),
+            &author,
+            db,
+        )
+        .await
+        .unwrap();
 
         let input = vec![(group_id.clone(), None, None)];
         let result = AggregatedMessage::count_unread_for_groups(&input, db)
@@ -2818,10 +2910,10 @@ mod tests {
         let del_id = format!("{:0>64x}", 0xde1182u64);
 
         // Mark both as deleted by the same deletion event
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, db)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, &author, db)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, db)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, &author, db)
             .await
             .unwrap();
 
@@ -2872,10 +2964,10 @@ mod tests {
         let del_a = format!("{:0>64x}", 0xde1au64);
         let del_b = format!("{:0>64x}", 0xde1bu64);
 
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, db)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, &author, db)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, db)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, &author, db)
             .await
             .unwrap();
 
@@ -2939,7 +3031,7 @@ mod tests {
 
         // Now mark the reaction as deleted
         let del_id = format!("{:0>64x}", 0xde1186u64);
-        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, db)
+        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, &author, db)
             .await
             .unwrap();
 
@@ -3878,7 +3970,7 @@ mod tests {
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, db)
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &author, db)
             .await
             .unwrap();
 
@@ -3932,7 +4024,7 @@ mod tests {
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, db)
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &author, db)
             .await
             .unwrap();
 

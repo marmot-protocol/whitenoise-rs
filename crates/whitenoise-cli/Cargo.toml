@@ -26,6 +26,7 @@ whitenoise = { path = "../..", features = ["cli", "integration-tests"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 
+
 [[bin]]
 name = "wn"
 path = "src/bin/wn.rs"

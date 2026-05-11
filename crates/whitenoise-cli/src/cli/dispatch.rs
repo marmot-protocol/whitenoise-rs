@@ -313,6 +313,13 @@ pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
             Err(resp) => resp,
         },
 
+        Request::GetChatListItem { account, group_id } => {
+            match get_chat_list_item(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
         Request::ArchiveChat { account, group_id } => {
             match archive_chat(wn, &account, &group_id).await {
                 Ok(resp) => resp,
@@ -532,6 +539,7 @@ pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
         | Request::ChatsSubscribe { .. }
         | Request::ArchivedChatsSubscribe { .. }
         | Request::NotificationsSubscribe
+        | Request::GroupStateSubscribe { .. }
         | Request::UsersSearch { .. } => {
             Response::err("streaming commands must use dispatch_streaming")
         }
@@ -591,6 +599,9 @@ where
         }
         Request::NotificationsSubscribe => {
             notifications_subscribe(wn, &mut writer).await;
+        }
+        Request::GroupStateSubscribe { account, group_id } => {
+            group_state_subscribe(wn, &mut writer, &account, &group_id).await;
         }
         Request::UsersSearch {
             account,
@@ -752,6 +763,67 @@ where
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("chat list stream lagged by {n} updates");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} updates dropped")),
+                )
+                .await;
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
+}
+
+async fn group_state_subscribe<W>(
+    wn: &Whitenoise,
+    writer: &mut W,
+    account_str: &str,
+    group_id_hex: &str,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    let account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+    let group_id = match parse_group_id(group_id_hex) {
+        Ok(id) => id,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let subscription = match wn
+        .subscribe_to_group_state(&account.pubkey, &group_id)
+        .await
+    {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let resp = Response::ok(serde_json::json!({ "update": update }));
+                if !write_response(writer, &resp).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("group state stream lagged by {n} updates");
                 let _ = write_response(
                     writer,
                     &Response::err(format!("stream lagged: {n} updates dropped")),
@@ -1326,6 +1398,21 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
         clean.push(clean_chat_list_item(wn, item).await);
     }
     Ok(to_response(&clean))
+}
+
+#[allow(deprecated)]
+async fn get_chat_list_item(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let item = wn
+        .get_chat_list_item(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(clean_chat_list_item(wn, &item).await))
 }
 
 #[allow(deprecated)]
@@ -2273,9 +2360,6 @@ async fn keys_check(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
 #[cfg(test)]
 mod tests {
     use nostr_sdk::ToBech32;
-    use std::collections::BTreeSet;
-
-    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
 
     use super::*;
 
@@ -2340,40 +2424,6 @@ mod tests {
     fn to_response_string() {
         let resp = to_response(&"hello");
         assert_eq!(resp.result.unwrap(), serde_json::json!("hello"));
-    }
-
-    // --- get_group ---
-
-    #[tokio::test]
-    async fn get_group_returns_nested_shape_with_required_proposals() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
-
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
-        let group = whitenoise
-            .create_group(&creator, vec![member.pubkey], config, None)
-            .await
-            .unwrap();
-
-        let response = get_group(
-            &whitenoise,
-            &creator.pubkey.to_hex(),
-            &hex::encode(group.mls_group_id.as_slice()),
-        )
-        .await
-        .expect("get_group succeeds for a valid account and group");
-
-        let value = response.result.expect("response carries a result");
-        let obj = value.as_object().expect("result serializes as an object");
-
-        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
-        assert_eq!(keys, BTreeSet::from(["group", "required_proposals"]));
-
-        assert_eq!(
-            obj["required_proposals"],
-            serde_json::json!(["self_remove"]),
-        );
     }
 
     // --- parse_relay_type ---

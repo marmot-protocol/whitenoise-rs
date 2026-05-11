@@ -118,6 +118,8 @@ pub enum Request {
     // Chat list
     #[serde(rename = "chats_list")]
     ChatsList { account: String },
+    #[serde(rename = "get_chat_list_item")]
+    GetChatListItem { account: String, group_id: String },
     #[serde(rename = "archive_chat")]
     ArchiveChat { account: String, group_id: String },
     #[serde(rename = "unarchive_chat")]
@@ -297,6 +299,8 @@ pub enum Request {
     ArchivedChatsSubscribe { account: String },
     #[serde(rename = "notifications_subscribe")]
     NotificationsSubscribe,
+    #[serde(rename = "group_state_subscribe")]
+    GroupStateSubscribe { account: String, group_id: String },
 
     // Debug
     #[serde(rename = "debug_relay_control_state")]
@@ -371,6 +375,7 @@ impl Request {
                 | Self::ChatsSubscribe { .. }
                 | Self::ArchivedChatsSubscribe { .. }
                 | Self::NotificationsSubscribe
+                | Self::GroupStateSubscribe { .. }
                 | Self::UsersSearch { .. }
         )
     }
@@ -439,6 +444,26 @@ mod tests {
             parsed,
             Request::RelaysList { account, relay_type }
             if account == "npub1abc" && relay_type.is_none()
+        ));
+    }
+
+    #[test]
+    fn group_state_subscribe_is_streaming() {
+        let req = Request::GroupStateSubscribe {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        assert!(req.is_streaming());
+    }
+
+    #[test]
+    fn group_state_subscribe_wire_format_round_trips() {
+        let wire = r#"{"method":"group_state_subscribe","params":{"account":"npub1abc","group_id":"abcd1234"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GroupStateSubscribe { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
         ));
     }
 
@@ -521,6 +546,25 @@ mod tests {
         let serialized = serde_json::to_string(&duration).unwrap();
         let deserialized: MuteDuration = serde_json::from_str(&serialized).unwrap();
         assert_eq!(duration, deserialized);
+    }
+
+    #[test]
+    fn get_chat_list_item_roundtrip() {
+        let req = Request::GetChatListItem {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"method":"get_chat_list_item","params":{"account":"npub1abc","group_id":"abcd1234"}}"#
+        );
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GetChatListItem { account, group_id }
+                if account == "npub1abc" && group_id == "abcd1234"
+        ));
     }
 
     #[test]

@@ -87,6 +87,9 @@ pub use whitenoise::chat_list_streaming::{
     ChatListSubscription, ChatListUpdate, ChatListUpdateTrigger,
 };
 
+// Group state streaming
+pub use whitenoise::group_state_streaming::{GroupStateSubscription, GroupStateUpdate};
+
 // User streaming
 pub use whitenoise::user_streaming::{UserSubscription, UserUpdate, UserUpdateTrigger};
 

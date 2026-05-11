@@ -744,7 +744,13 @@ impl Whitenoise {
 
         for target_id in target_ids {
             if let Some(update) = self
-                .apply_single_deletion(account_pubkey, &target_id, &deletion.id, group_id)
+                .apply_single_deletion(
+                    account_pubkey,
+                    &deletion.pubkey,
+                    &target_id,
+                    &deletion.id,
+                    group_id,
+                )
                 .await?
             {
                 updates.push(update);
@@ -755,9 +761,14 @@ impl Whitenoise {
     }
 
     /// Apply deletion to a single target, returning the appropriate update.
+    ///
+    /// Only authors may delete their own reactions or messages. Deletions whose
+    /// `deletion_author` does not match the target row's `author` are skipped
+    /// with a warning so a malicious peer can't wipe other members' content.
     async fn apply_single_deletion(
         &self,
         account_pubkey: &PublicKey,
+        deletion_author: &PublicKey,
         target_id: &str,
         deletion_event_id: &EventId,
         group_id: &GroupId,
@@ -771,6 +782,17 @@ impl Whitenoise {
             AggregatedMessage::find_reaction_by_id(target_id, group_id, &session.account_db.inner)
                 .await?
         {
+            if &reaction.author != deletion_author {
+                tracing::warn!(
+                    target: "whitenoise::cache",
+                    deletion_author = %deletion_author.to_hex(),
+                    target_author = %reaction.author.to_hex(),
+                    target_id = target_id,
+                    "Ignoring deletion whose author does not match reaction author"
+                );
+                return Ok(None);
+            }
+
             let parent_update = self
                 .remove_reaction_from_parent(account_pubkey, &reaction, group_id)
                 .await?;
@@ -778,6 +800,7 @@ impl Whitenoise {
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
+                deletion_author,
                 &session.account_db.inner,
             )
             .await?;
@@ -793,25 +816,30 @@ impl Whitenoise {
         )
         .await?
         {
+            if &msg.author != deletion_author {
+                tracing::warn!(
+                    target: "whitenoise::cache",
+                    deletion_author = %deletion_author.to_hex(),
+                    target_author = %msg.author.to_hex(),
+                    target_id = target_id,
+                    "Ignoring deletion whose author does not match message author"
+                );
+                return Ok(None);
+            }
+
             msg.is_deleted = true;
             AggregatedMessage::mark_deleted(
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
+                deletion_author,
                 &session.account_db.inner,
             )
             .await?;
             return Ok(Some((UpdateTrigger::MessageDeleted, msg)));
         }
 
-        // Unknown target - still mark for audit trail (orphaned deletion)
-        AggregatedMessage::mark_deleted(
-            target_id,
-            group_id,
-            &deletion_event_id.to_string(),
-            &session.account_db.inner,
-        )
-        .await?;
+        // Unknown target — orphan; reconciliation happens when the target arrives.
         Ok(None)
     }
 
@@ -939,13 +967,27 @@ impl Whitenoise {
             .await?;
         }
 
-        // Apply orphaned deletions
-        for deletion_event_id in orphaned_deletions {
+        // Apply orphaned deletions, but only those whose author matches the
+        // target message author. Cross-author deletions never legitimately
+        // apply and would let a malicious peer wipe other members' content.
+        for deletion in orphaned_deletions {
+            if deletion.author != message.author {
+                tracing::warn!(
+                    target: "whitenoise::cache",
+                    deletion_author = %deletion.author.to_hex(),
+                    target_author = %message.author.to_hex(),
+                    target_id = %message.id,
+                    "Ignoring orphaned deletion whose author does not match message author"
+                );
+                continue;
+            }
+
             message.is_deleted = true;
             AggregatedMessage::mark_deleted(
                 &message.id,
                 group_id,
-                &deletion_event_id.to_string(),
+                &deletion.event_id.to_string(),
+                &deletion.author,
                 &session.account_db.inner,
             )
             .await?;
@@ -1263,10 +1305,18 @@ mod tests {
             .unwrap();
         let group_id = &group.mls_group_id;
 
-        // Create a message ID that doesn't exist yet (simulating out-of-order delivery)
-        let future_message_id = EventId::all_zeros();
+        // Build the message first so MDK can stamp a valid content-hash id,
+        // then tag the orphaned reaction at that id.
+        let mut actual_message = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Late message".to_string(),
+        );
+        actual_message.ensure_id();
+        let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
-        // Send reaction to non-existent message (orphaned reaction)
         let mut orphaned_reaction = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -1298,15 +1348,6 @@ mod tests {
             "Should have one orphaned reaction"
         );
 
-        // Now send the actual message with the matching ID
-        let mut actual_message = UnsignedEvent::new(
-            creator_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Late message".to_string(),
-        );
-        actual_message.id = Some(future_message_id);
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
@@ -1368,7 +1409,17 @@ mod tests {
             .unwrap();
         let group_id = &group.mls_group_id;
 
-        let future_message_id = EventId::all_zeros();
+        // Build the target first so MDK can stamp a valid content-hash id,
+        // then tag the orphaned reactions at that id.
+        let mut actual_message = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Target message".to_string(),
+        );
+        actual_message.ensure_id();
+        let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
         // Send a VALID orphaned reaction
         let mut valid_reaction = UnsignedEvent::new(
@@ -1404,15 +1455,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Now send the target message - this should succeed despite invalid orphaned reaction
-        let mut actual_message = UnsignedEvent::new(
-            creator_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Target message".to_string(),
-        );
-        actual_message.id = Some(future_message_id);
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise

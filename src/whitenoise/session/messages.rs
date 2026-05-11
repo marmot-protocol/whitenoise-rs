@@ -382,7 +382,7 @@ impl<'a> MessageOpsForGroup<'a> {
     ) -> Result<()> {
         let media_files = crate::whitenoise::media_files::MediaFile::find_by_group(
             &self.session.account_db.inner.pool,
-            self.db(),
+            &self.session.shared.database,
             self.pubkey(),
             self.group_id,
         )
@@ -503,13 +503,25 @@ impl<'a> MessageOpsForGroup<'a> {
                     .await?;
                     self.emit(UpdateTrigger::ReactionRemoved, parent);
                 }
-                AggregatedMessage::mark_deleted(target_id, self.group_id, &deletion_id, self.db())
-                    .await?;
+                AggregatedMessage::mark_deleted(
+                    target_id,
+                    self.group_id,
+                    &deletion_id,
+                    self.pubkey(),
+                    self.db(),
+                )
+                .await?;
                 continue;
             }
 
-            AggregatedMessage::mark_deleted(target_id, self.group_id, &deletion_id, self.db())
-                .await?;
+            AggregatedMessage::mark_deleted(
+                target_id,
+                self.group_id,
+                &deletion_id,
+                self.pubkey(),
+                self.db(),
+            )
+            .await?;
 
             if let Some(mut msg) =
                 AggregatedMessage::find_by_id(target_id, self.group_id, self.pubkey(), self.db())
