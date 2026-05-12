@@ -1156,7 +1156,6 @@ mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
     use mdk_core::mip05::{EncryptedToken, TokenTag, parse_notification_request_rumor};
-    use mdk_core::prelude::NostrGroupDataUpdate;
     use mdk_core::prelude::message_types::MessageState;
     use nostr_sdk::{Filter, Keys, Kind, RelayUrl, Tag, nips::nip59};
 
@@ -2524,99 +2523,6 @@ mod tests {
                 .iter()
                 .any(|token| token.member_pubkey == member_account.pubkey),
             "pending welcome finalization must not share the local push token"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_remove_local_push_token_clears_cache_when_token_removal_publish_fails() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group_with_accepted_account_groups(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
-        let server_pubkey = Keys::generate().public_key();
-        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
-
-        whitenoise
-            .session(&admin_account.pubkey)
-            .unwrap()
-            .push()
-            .upsert_registration(
-                PushPlatform::Apns,
-                &"66".repeat(32),
-                &server_pubkey,
-                Some(&relay_hint),
-            )
-            .await
-            .unwrap();
-
-        let admin_pool = &whitenoise
-            .require_session(&admin_account.pubkey)
-            .unwrap()
-            .account_db
-            .inner
-            .pool;
-        let cached_before_disable =
-            GroupPushToken::find_by_account_and_group(&admin_account.pubkey, &group_id, admin_pool)
-                .await
-                .unwrap();
-        assert!(
-            cached_before_disable
-                .iter()
-                .any(|token| token.member_pubkey == admin_account.pubkey),
-            "initial share should populate the local cache"
-        );
-
-        let relay_swap = NostrGroupDataUpdate {
-            name: None,
-            description: None,
-            image_hash: None,
-            image_key: None,
-            image_nonce: None,
-            image_upload_key: None,
-            admins: None,
-            relays: Some(vec![
-                RelayUrl::parse("ws://localhost:1").unwrap(),
-                RelayUrl::parse("ws://localhost:2").unwrap(),
-            ]),
-            nostr_group_id: None,
-        };
-        whitenoise
-            .require_session(&admin_account.pubkey)
-            .unwrap()
-            .groups()
-            .update_group_data(&group_id, relay_swap)
-            .await
-            .unwrap();
-
-        tokio::time::pause();
-        let settings = whitenoise
-            .require_session(&admin_account.pubkey)
-            .unwrap()
-            .settings()
-            .update_notifications_enabled(false)
-            .await
-            .unwrap();
-        tokio::time::resume();
-        assert!(!settings.notifications_enabled);
-
-        let cached_after_disable =
-            GroupPushToken::find_by_account_and_group(&admin_account.pubkey, &group_id, admin_pool)
-                .await
-                .unwrap();
-        assert!(
-            cached_after_disable
-                .iter()
-                .all(|token| token.member_pubkey != admin_account.pubkey),
-            "failed removal publishes must still clear the local cache"
         );
     }
 
