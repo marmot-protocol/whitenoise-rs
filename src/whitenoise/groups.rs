@@ -27,7 +27,8 @@ pub use required_proposals::{
     GroupCapabilityUpgradeStatus, RequiredProposalUpgradability, RequiredProposalUpgradeStatus,
 };
 pub(crate) use required_proposals::{
-    KeyPackageCapabilities, MlsExtensionId, project_group_capability_upgrade_status,
+    KeyPackageCapabilities, MlsExtensionId, find_member_missing_required_proposal,
+    project_group_capability_upgrade_status,
 };
 
 impl SharedServices {
