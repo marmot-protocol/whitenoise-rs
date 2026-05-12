@@ -205,6 +205,14 @@ impl From<u16> for RequiredProposal {
 /// [`KeyPackageCapabilities::proposals`] do not cover `required` (along with
 /// the first missing proposal).
 ///
+/// This powers `Whitenoise::add_members_to_group`'s per-member pre-check —
+/// a fold over data already produced by `resolve_member_key_package`. The
+/// helper is extracted so the routing logic (which selects between
+/// [`crate::WhitenoiseError::KeyPackageMissingSelfRemove`] and
+/// [`crate::WhitenoiseError::GroupRejectedMember`] based on the missing
+/// proposal) stays trivially testable without spinning up a Whitenoise
+/// instance.
+///
 /// Iteration order over `members` is preserved; iteration over each member's
 /// missing proposals is `BTreeSet`-ordered (deterministic for tests).
 /// Returns `None` when every member's proposals cover `required`.

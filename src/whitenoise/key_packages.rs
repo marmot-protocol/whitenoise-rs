@@ -1080,6 +1080,27 @@ mod tests {
         account
     }
 
+    /// Persists an `External` account and registers a session with no signer attached.
+    /// Used to exercise operations that should fail because the signer is missing.
+    async fn register_session_without_signer(
+        whitenoise: &std::sync::Arc<Whitenoise>,
+    ) -> Account {
+        let mut account = create_local_account_struct();
+        account.id = None;
+        account.account_type = AccountType::External;
+        let account = account
+            .save(&whitenoise.shared.database)
+            .await
+            .expect("Should save account");
+        let session = std::sync::Arc::new(
+            crate::whitenoise::session::AccountSession::from_account(&account, whitenoise)
+                .await
+                .unwrap(),
+        );
+        whitenoise.account_manager.insert_session(session);
+        account
+    }
+
     /// Creates a persisted account with a key package relay, stored keys, and
     /// a registered session.
     async fn create_account_with_relay(whitenoise: &std::sync::Arc<Whitenoise>) -> Account {
@@ -2002,8 +2023,9 @@ mod tests {
     async fn test_delete_legacy_key_packages_without_signer_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Account without keys in secrets store — signer resolution fails
-        let account = create_local_account_struct();
+        // External account with no external signer registered: session exists,
+        // but the inner signer slot is None so signer-dependent ops must fail.
+        let account = register_session_without_signer(&whitenoise).await;
 
         let result = whitenoise
             .require_session(&account.pubkey)
@@ -2198,8 +2220,9 @@ mod tests {
     async fn test_delete_single_key_package_without_signer_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Local account without stored keys — signer resolution fails
-        let account = create_local_account_struct();
+        // External account with no external signer registered: session exists,
+        // but the inner signer slot is None so signer-dependent ops must fail.
+        let account = register_session_without_signer(&whitenoise).await;
         let event_id = EventId::all_zeros();
 
         let result = whitenoise
