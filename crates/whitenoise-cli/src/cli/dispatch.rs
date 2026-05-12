@@ -13,7 +13,6 @@ use whitenoise::{
 use super::protocol::{MuteDuration, Request, Response};
 
 /// Route a request to the appropriate `Whitenoise` method and produce a response.
-#[allow(deprecated)]
 pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
     match req {
         Request::Ping => Response::ok(serde_json::json!("pong")),
@@ -148,9 +147,12 @@ pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
         },
 
         Request::VisibleGroups { account } => match find_account(wn, &account).await {
-            Ok(acct) => match wn.visible_groups(&acct).await {
-                Ok(groups) => to_response(&groups),
-                Err(e) => Response::err(e.to_string()),
+            Ok(acct) => match require_session(wn, &acct.pubkey) {
+                Ok(session) => match session.membership().visible_groups().await {
+                    Ok(groups) => to_response(&groups),
+                    Err(e) => Response::err(e.to_string()),
+                },
+                Err(resp) => resp,
             },
             Err(resp) => resp,
         },
@@ -967,6 +969,14 @@ fn parse_pubkey(s: &str) -> Result<PublicKey, Response> {
     PublicKey::parse(s).map_err(|e| Response::err(format!("invalid pubkey '{s}': {e}")))
 }
 
+fn require_session(
+    wn: &Whitenoise,
+    pubkey: &PublicKey,
+) -> Result<std::sync::Arc<whitenoise::whitenoise::session::AccountSession>, Response> {
+    wn.session(pubkey)
+        .ok_or_else(|| Response::err(whitenoise::WhitenoiseError::AccountNotFound.to_string()))
+}
+
 async fn find_account(wn: &Whitenoise, pubkey_str: &str) -> Result<whitenoise::Account, Response> {
     let pk = parse_pubkey(pubkey_str)?;
     let accounts = wn
@@ -996,7 +1006,6 @@ fn cli_group_relay_urls() -> Vec<RelayUrl> {
         .collect()
 }
 
-#[allow(deprecated)]
 async fn create_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -1021,15 +1030,15 @@ async fn create_group(
         vec![account.pubkey], // admins — creator only
     );
 
-    let group = wn
-        .create_group(&account, member_pubkeys, config, None)
+    let group = require_session(wn, &account.pubkey)?
+        .groups()
+        .create_group(member_pubkeys, config, None)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
     Ok(to_response(&group))
 }
 
-#[allow(deprecated)]
 async fn add_members(
     wn: &Whitenoise,
     account_str: &str,
@@ -1043,7 +1052,9 @@ async fn add_members(
         .map(|s| parse_pubkey(s))
         .collect::<Result<Vec<_>, _>>()?;
 
-    wn.add_members_to_group(&account, &group_id, members)
+    require_session(wn, &account.pubkey)?
+        .groups()
+        .add_members(&group_id, members)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1056,7 +1067,6 @@ struct GroupShowResponse {
     required_proposals: Vec<RequiredProposal>,
 }
 
-#[allow(deprecated)]
 async fn get_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -1064,9 +1074,9 @@ async fn get_group(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let group = wn
-        .group(&account, &group_id)
-        .await
+    let group = require_session(wn, &account.pubkey)?
+        .groups()
+        .get(&group_id)
         .map_err(|e| Response::err(e.to_string()))?;
     let required_proposals = wn
         .group_required_proposals(&account, &group_id)
@@ -1080,7 +1090,6 @@ async fn get_group(
     }))
 }
 
-#[allow(deprecated)]
 async fn group_pubkey_list(
     wn: &Whitenoise,
     account_str: &str,
@@ -1089,10 +1098,11 @@ async fn group_pubkey_list(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
+    let session = require_session(wn, &account.pubkey)?;
     let pubkeys = if admins_only {
-        wn.group_admins(&account, &group_id).await
+        session.groups().admins(&group_id)
     } else {
-        wn.group_members(&account, &group_id).await
+        session.groups().members(&group_id)
     }
     .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1107,7 +1117,6 @@ async fn group_pubkey_list(
     Ok(to_response(&members))
 }
 
-#[allow(deprecated)]
 async fn group_relay_list(
     wn: &Whitenoise,
     account_str: &str,
@@ -1115,16 +1124,15 @@ async fn group_relay_list(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let relays = wn
-        .group_relays(&account, &group_id)
-        .await
+    let relays = require_session(wn, &account.pubkey)?
+        .groups()
+        .relays(&group_id)
         .map_err(|e| Response::err(e.to_string()))?;
 
     let urls: Vec<&str> = relays.iter().map(|r| r.as_str()).collect();
     Ok(to_response(&urls))
 }
 
-#[allow(deprecated)]
 async fn remove_members(
     wn: &Whitenoise,
     account_str: &str,
@@ -1138,14 +1146,15 @@ async fn remove_members(
         .map(|s| parse_pubkey(s))
         .collect::<Result<Vec<_>, _>>()?;
 
-    wn.remove_members_from_group(&account, &group_id, members)
+    require_session(wn, &account.pubkey)?
+        .groups()
+        .remove_members(&group_id, members)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn leave_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -1153,13 +1162,14 @@ async fn leave_group(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    wn.leave_group(&account, &group_id)
+    require_session(wn, &account.pubkey)?
+        .groups()
+        .leave(&group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn self_demote(
     wn: &Whitenoise,
     account_str: &str,
@@ -1167,13 +1177,14 @@ async fn self_demote(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    wn.self_demote(&account, &group_id)
+    require_session(wn, &account.pubkey)?
+        .groups()
+        .self_demote(&group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn rename_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -1183,17 +1194,19 @@ async fn rename_group(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let update = NostrGroupDataUpdate::new().name(name);
-    wn.update_group_data(&account, &group_id, update)
+    require_session(wn, &account.pubkey)?
+        .groups()
+        .update_group_data(&group_id, update)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn group_invites(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    let groups = wn
-        .visible_groups(&account)
+    let groups = require_session(wn, &account.pubkey)?
+        .membership()
+        .visible_groups()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1211,11 +1224,11 @@ async fn respond_to_invite(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    #[allow(deprecated)]
+    let session = require_session(wn, &account.pubkey)?;
     let ag = if accept {
-        wn.accept_account_group(&account, &group_id).await
+        session.membership().for_group(&group_id).accept().await
     } else {
-        wn.decline_account_group(&account, &group_id).await
+        session.membership().for_group(&group_id).decline().await
     }
     .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1280,11 +1293,11 @@ async fn profile_update(
     Ok(to_response(&metadata))
 }
 
-#[allow(deprecated)]
 async fn follows_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    let users = wn
-        .follows(&account)
+    let users = require_session(wn, &account.pubkey)?
+        .social()
+        .follows()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1304,7 +1317,6 @@ enum FollowAction {
     Remove,
 }
 
-#[allow(deprecated)]
 async fn follows_mutate(
     wn: &Whitenoise,
     account_str: &str,
@@ -1313,15 +1325,15 @@ async fn follows_mutate(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let pubkey = parse_pubkey(pubkey_str)?;
+    let session = require_session(wn, &account.pubkey)?;
     match action {
-        FollowAction::Add => wn.follow_user(&account, &pubkey).await,
-        FollowAction::Remove => wn.unfollow_user(&account, &pubkey).await,
+        FollowAction::Add => session.social().follow_user(&pubkey).await,
+        FollowAction::Remove => session.social().unfollow_user(&pubkey).await,
     }
     .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn follows_check(
     wn: &Whitenoise,
     account_str: &str,
@@ -1329,14 +1341,14 @@ async fn follows_check(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let pubkey = parse_pubkey(pubkey_str)?;
-    let following = wn
-        .is_following_user(&account, &pubkey)
+    let following = require_session(wn, &account.pubkey)?
+        .social()
+        .is_following(&pubkey)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "following": following })))
 }
 
-#[allow(deprecated)]
 async fn block_user(
     wn: &Whitenoise,
     account_str: &str,
@@ -1344,13 +1356,14 @@ async fn block_user(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let pubkey = parse_pubkey(pubkey_str)?;
-    wn.block_user(&account, &pubkey)
+    require_session(wn, &account.pubkey)?
+        .mute_list()
+        .block_user(&pubkey)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn unblock_user(
     wn: &Whitenoise,
     account_str: &str,
@@ -1358,17 +1371,19 @@ async fn unblock_user(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let pubkey = parse_pubkey(pubkey_str)?;
-    wn.unblock_user(&account, &pubkey)
+    require_session(wn, &account.pubkey)?
+        .mute_list()
+        .unblock_user(&pubkey)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn blocked_users(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    let entries = wn
-        .get_blocked_users(&account)
+    let entries = require_session(wn, &account.pubkey)?
+        .mute_list()
+        .get_blocked_users()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1385,11 +1400,11 @@ async fn blocked_users(wn: &Whitenoise, account_str: &str) -> Result<Response, R
     Ok(Response::ok(serde_json::json!({ "blocked_users": list })))
 }
 
-#[allow(deprecated)]
 async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    let items = wn
-        .get_chat_list(&account)
+    let items = require_session(wn, &account.pubkey)?
+        .chat_list()
+        .active()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1400,7 +1415,6 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
     Ok(to_response(&clean))
 }
 
-#[allow(deprecated)]
 async fn get_chat_list_item(
     wn: &Whitenoise,
     account_str: &str,
@@ -1408,14 +1422,27 @@ async fn get_chat_list_item(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let item = wn
-        .get_chat_list_item(&account, &group_id)
+    let session = require_session(wn, &account.pubkey)?;
+    let chat_list = session.chat_list();
+    let active = chat_list
+        .active()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
+    let item = if let Some(it) = active.into_iter().find(|it| it.mls_group_id == group_id) {
+        it
+    } else {
+        let archived = chat_list
+            .archived()
+            .await
+            .map_err(|e| Response::err(e.to_string()))?;
+        archived
+            .into_iter()
+            .find(|it| it.mls_group_id == group_id)
+            .ok_or_else(|| Response::err(whitenoise::WhitenoiseError::GroupNotFound.to_string()))?
+    };
     Ok(Response::ok(clean_chat_list_item(wn, &item).await))
 }
 
-#[allow(deprecated)]
 async fn archive_chat(
     wn: &Whitenoise,
     account_str: &str,
@@ -1423,13 +1450,15 @@ async fn archive_chat(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    wn.archive_chat(&account, &group_id)
+    require_session(wn, &account.pubkey)?
+        .membership()
+        .for_group(&group_id)
+        .archive()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn unarchive_chat(
     wn: &Whitenoise,
     account_str: &str,
@@ -1437,13 +1466,15 @@ async fn unarchive_chat(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    wn.unarchive_chat(&account, &group_id)
+    require_session(wn, &account.pubkey)?
+        .membership()
+        .for_group(&group_id)
+        .unarchive()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn mute_chat(
     wn: &Whitenoise,
     account_str: &str,
@@ -1452,13 +1483,15 @@ async fn mute_chat(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    wn.mute_chat(&account, &group_id, duration)
+    require_session(wn, &account.pubkey)?
+        .membership()
+        .for_group(&group_id)
+        .mute(duration)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn unmute_chat(
     wn: &Whitenoise,
     account_str: &str,
@@ -1466,17 +1499,20 @@ async fn unmute_chat(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    wn.unmute_chat(&account, &group_id)
+    require_session(wn, &account.pubkey)?
+        .membership()
+        .for_group(&group_id)
+        .unmute()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn archived_chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    let items = wn
-        .get_archived_chat_list(&account)
+    let items = require_session(wn, &account.pubkey)?
+        .chat_list()
+        .archived()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -2019,7 +2055,6 @@ async fn unreact_to_message(
     Ok(to_response(&result))
 }
 
-#[allow(deprecated)]
 async fn upload_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -2031,8 +2066,10 @@ async fn upload_media(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    let media_file = wn
-        .upload_chat_media(&account, &group_id, file_path, None, None)
+    let media_file = require_session(wn, &account.pubkey)?
+        .groups()
+        .media()
+        .upload_chat_media(&group_id, file_path, None, None)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -2099,7 +2136,6 @@ fn build_imeta_tag(media_file: &whitenoise::MediaFile) -> Result<nostr_sdk::Tag,
         .map_err(|e| Response::err(format!("failed to create imeta tag: {e}")))
 }
 
-#[allow(deprecated)]
 async fn download_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -2116,15 +2152,16 @@ async fn download_media(
             Response::err(format!("file hash must be 32 bytes (got {})", v.len()))
         })?;
 
-    let media_file = wn
-        .download_chat_media(&account, &group_id, &hash_bytes)
+    let media_file = require_session(wn, &account.pubkey)?
+        .groups()
+        .media()
+        .download_chat_media(&group_id, &hash_bytes)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
     Ok(to_response(&media_file))
 }
 
-#[allow(deprecated)]
 async fn list_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -2133,8 +2170,10 @@ async fn list_media(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    let files = wn
-        .get_media_files_for_group(&account, &group_id)
+    let files = require_session(wn, &account.pubkey)?
+        .groups()
+        .media()
+        .get_media_files_for_group(&group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -2204,7 +2243,6 @@ async fn debug_ratchet_tree(
     })))
 }
 
-#[allow(deprecated)]
 async fn promote_admin(
     wn: &Whitenoise,
     account_str: &str,
@@ -2215,17 +2253,19 @@ async fn promote_admin(
     let group_id = parse_group_id(group_id_hex)?;
     let target_pk = parse_pubkey(pubkey_str)?;
 
-    let members = wn
-        .group_members(&account, &group_id)
-        .await
+    let session = require_session(wn, &account.pubkey)?;
+
+    let members = session
+        .groups()
+        .members(&group_id)
         .map_err(|e| Response::err(e.to_string()))?;
     if !members.contains(&target_pk) {
         return Err(Response::err("user is not a group member"));
     }
 
-    let mut admins = wn
-        .group_admins(&account, &group_id)
-        .await
+    let mut admins = session
+        .groups()
+        .admins(&group_id)
         .map_err(|e| Response::err(e.to_string()))?;
 
     if admins.contains(&target_pk) {
@@ -2235,14 +2275,15 @@ async fn promote_admin(
 
     // Authorization (caller must be admin) is enforced by update_group_data.
     let update = NostrGroupDataUpdate::new().admins(admins);
-    wn.update_group_data(&account, &group_id, update)
+    session
+        .groups()
+        .update_group_data(&group_id, update)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn demote_admin(
     wn: &Whitenoise,
     account_str: &str,
@@ -2253,9 +2294,11 @@ async fn demote_admin(
     let group_id = parse_group_id(group_id_hex)?;
     let target_pk = parse_pubkey(pubkey_str)?;
 
-    let admins = wn
-        .group_admins(&account, &group_id)
-        .await
+    let session = require_session(wn, &account.pubkey)?;
+
+    let admins = session
+        .groups()
+        .admins(&group_id)
         .map_err(|e| Response::err(e.to_string()))?;
 
     if !admins.contains(&target_pk) {
@@ -2268,18 +2311,20 @@ async fn demote_admin(
 
     // Authorization (caller must be admin) is enforced by update_group_data.
     let update = NostrGroupDataUpdate::new().admins(admins);
-    wn.update_group_data(&account, &group_id, update)
+    session
+        .groups()
+        .update_group_data(&group_id, update)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn keys_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    let packages = wn
-        .fetch_all_key_packages_for_account(&account)
+    let packages = require_session(wn, &account.pubkey)?
+        .key_packages()
+        .fetch_all()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -2295,16 +2340,16 @@ async fn keys_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Respo
     Ok(Response::ok(serde_json::json!({ "key_packages": items })))
 }
 
-#[allow(deprecated)]
 async fn keys_publish(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    wn.publish_key_package_for_account(&account)
+    require_session(wn, &account.pubkey)?
+        .key_packages()
+        .publish()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-#[allow(deprecated)]
 async fn keys_delete(
     wn: &Whitenoise,
     account_str: &str,
@@ -2313,18 +2358,19 @@ async fn keys_delete(
     let account = find_account(wn, account_str).await?;
     let event_id = nostr_sdk::EventId::from_hex(event_id_hex)
         .map_err(|e| Response::err(format!("invalid event ID: {e}")))?;
-    let deleted = wn
-        .delete_key_package_for_account(&account, &event_id, true)
+    let deleted = require_session(wn, &account.pubkey)?
+        .key_packages()
+        .delete(&event_id, true)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "deleted": deleted })))
 }
 
-#[allow(deprecated)]
 async fn keys_delete_all(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
-    let count = wn
-        .delete_legacy_key_packages_for_account(&account)
+    let count = require_session(wn, &account.pubkey)?
+        .key_packages()
+        .delete_legacy()
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "deleted_count": count })))
