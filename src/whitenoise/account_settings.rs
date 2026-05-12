@@ -4,8 +4,6 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{Whitenoise, accounts::Account, error::WhitenoiseError};
-
 /// User-configurable settings scoped to a single account.
 ///
 /// A default row is created lazily on first access. When no row exists in the
@@ -19,55 +17,7 @@ pub struct AccountSettings {
     pub updated_at: DateTime<Utc>,
 }
 
-#[allow(deprecated)]
-impl Whitenoise {
-    /// Sets the notification preference for `account` and returns the updated settings.
-    ///
-    /// Disabling notifications here does not clear any locally stored push
-    /// registration. MIP-05 sharing/removal decisions are handled separately by
-    /// the push-notifications subsystem.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::settings().update_notifications_enabled() for DB ops; \
-                this facade also handles push-token reconciliation."
-    )]
-    pub async fn update_notifications_enabled(
-        &self,
-        account: &Account,
-        enabled: bool,
-    ) -> Result<AccountSettings, WhitenoiseError> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        let settings = session
-            .settings()
-            .update_notifications_enabled(enabled)
-            .await?;
-
-        let result = match enabled {
-            true => self.share_local_push_token_to_joined_groups(account).await,
-            false => {
-                self.remove_local_push_token_from_joined_groups(account)
-                    .await
-            }
-        };
-
-        if let Err(error) = result {
-            tracing::warn!(
-                target: "whitenoise::account_settings",
-                account = %account.pubkey.to_hex(),
-                enabled,
-                error = %error,
-                "Failed to reconcile shared push tokens after notification preference change"
-            );
-        }
-
-        Ok(settings)
-    }
-}
-
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use crate::whitenoise::test_utils::*;
 
@@ -75,25 +25,22 @@ mod tests {
     async fn test_account_settings_default_and_update() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
 
-        let settings = whitenoise
-            .session(&account.pubkey)
-            .unwrap()
-            .settings()
-            .get()
-            .await
-            .unwrap();
+        let settings = session.settings().get().await.unwrap();
         assert!(settings.notifications_enabled);
         assert_eq!(settings.account_pubkey, account.pubkey);
 
-        let settings = whitenoise
-            .update_notifications_enabled(&account, false)
+        let settings = session
+            .settings()
+            .update_notifications_enabled(false)
             .await
             .unwrap();
         assert!(!settings.notifications_enabled);
 
-        let settings = whitenoise
-            .update_notifications_enabled(&account, true)
+        let settings = session
+            .settings()
+            .update_notifications_enabled(true)
             .await
             .unwrap();
         assert!(settings.notifications_enabled);

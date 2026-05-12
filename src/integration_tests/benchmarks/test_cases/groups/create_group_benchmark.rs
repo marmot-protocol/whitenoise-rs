@@ -34,7 +34,6 @@ impl CreateGroupBenchmark {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl BenchmarkTestCase for CreateGroupBenchmark {
     async fn run_iteration(
         &self,
@@ -72,7 +71,10 @@ impl BenchmarkTestCase for CreateGroupBenchmark {
 
         context
             .whitenoise
-            .create_group(creator, member_pubkeys, config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await?;
 
         let duration = start.elapsed();

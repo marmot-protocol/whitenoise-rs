@@ -838,6 +838,22 @@ impl Whitenoise {
 
         init_timing::record("discovery_plane");
 
+        // Restore account sessions before any startup step that resolves a
+        // session by pubkey. `sync_message_cache_on_startup` reads per-account
+        // `aggregated_messages` via `session.account_db` (post phase-18e), so
+        // sessions must be populated first or it raises `AccountNotFound`.
+        // Migrations were already applied in lockstep across shared and every
+        // on-disk per-account file via `MIGRATOR.run_all` at the top of
+        // `Whitenoise::new`, so `run_account_migrations` here is a no-op for
+        // already-stamped versions. Only newly-created accounts (e.g. first
+        // login post-boot) need it to fire the bootstrap migration.
+        let _ = whitenoise
+            .account_manager
+            .restore_sessions(&whitenoise)
+            .await;
+
+        init_timing::record("session_restore");
+
         tracing::info!(
             target: "whitenoise::new",
             "Synchronizing message cache with MDK..."
@@ -906,20 +922,6 @@ impl Whitenoise {
         }
 
         init_timing::record("background_tasks");
-
-        // Restore account sessions for all persisted accounts before setting up
-        // subscriptions so that each account has an MDK instance ready.
-        // Migrations were already applied in lockstep across shared and every
-        // on-disk per-account file via `MIGRATOR.run_all` at the top of
-        // `Whitenoise::new`, so `run_account_migrations` here is a no-op for
-        // already-stamped versions. Only newly-created accounts (e.g. first
-        // login post-boot) need it to fire the bootstrap migration.
-        let _ = whitenoise
-            .account_manager
-            .restore_sessions(&whitenoise)
-            .await;
-
-        init_timing::record("session_restore");
 
         // Fetch events and setup subscriptions after event processing has started
         whitenoise.setup_all_subscriptions().await?;
@@ -1616,7 +1618,6 @@ pub mod test_utils {
         )
     }
 
-    #[allow(deprecated)]
     pub(crate) async fn setup_multiple_test_accounts(
         whitenoise: &Whitenoise,
         count: usize,
@@ -1633,7 +1634,10 @@ pub mod test_utils {
                 .await
                 .unwrap();
             whitenoise
-                .create_and_publish_key_package(&account, &key_package_relays)
+                .require_session(&account.pubkey)
+                .unwrap()
+                .key_packages()
+                .create_and_publish(&key_package_relays)
                 .await
                 .unwrap();
             accounts.push((account, keys));
@@ -1842,7 +1846,6 @@ pub mod test_utils {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     #[cfg(unix)]
     use std::ffi::OsString;
@@ -3397,7 +3400,11 @@ mod tests {
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
             whitenoise
-                .get_or_create_account_group(&account, &group_id, None)
+                .require_session(&account.pubkey)
+                .unwrap()
+                .membership()
+                .for_group(&group_id)
+                .get_or_create(None)
                 .await
                 .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
@@ -3603,7 +3610,11 @@ mod tests {
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
             whitenoise
-                .get_or_create_account_group(&account, &group_id, None)
+                .require_session(&account.pubkey)
+                .unwrap()
+                .membership()
+                .for_group(&group_id)
+                .get_or_create(None)
                 .await
                 .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
@@ -3677,7 +3688,11 @@ mod tests {
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
             whitenoise
-                .get_or_create_account_group(&account, &group_id, None)
+                .require_session(&account.pubkey)
+                .unwrap()
+                .membership()
+                .for_group(&group_id)
+                .get_or_create(None)
                 .await
                 .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
@@ -3790,7 +3805,11 @@ mod tests {
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
             whitenoise
-                .get_or_create_account_group(&account, &group_id, None)
+                .require_session(&account.pubkey)
+                .unwrap()
+                .membership()
+                .for_group(&group_id)
+                .get_or_create(None)
                 .await
                 .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
@@ -3961,7 +3980,10 @@ mod tests {
             // to the group plane
             let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
             whitenoise
-                .create_group(&creator_account, vec![member_pubkey], config, None)
+                .require_session(&creator_account.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member_pubkey], config, None)
                 .await
                 .unwrap();
 
@@ -4324,31 +4346,46 @@ mod tests {
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
             config.name = "Group A".to_string();
             let group_a = whitenoise
-                .create_group(&creator, vec![member.pubkey], config, None)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
             config.name = "Group B".to_string();
             let group_b = whitenoise
-                .create_group(&creator, vec![member.pubkey], config, None)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
             config.name = "Group C".to_string();
             let group_c = whitenoise
-                .create_group(&creator, vec![member.pubkey], config, None)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
             config.name = "Group D".to_string();
             let group_d = whitenoise
-                .create_group(&creator, vec![member.pubkey], config, None)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
             config.name = "Group E".to_string();
             let group_e = whitenoise
-                .create_group(&creator, vec![member.pubkey], config, None)
+                .require_session(&creator.pubkey)
+                .unwrap()
+                .groups()
+                .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
 

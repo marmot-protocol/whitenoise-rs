@@ -38,7 +38,6 @@ const NETWORK_FETCH_RETRIES: usize = 3;
 ///
 /// This is purely local data (MLS/MDK) — no network fetch required.
 #[perf_instrument("user_search")]
-#[allow(deprecated)]
 pub(super) async fn get_group_co_member_pubkeys(
     whitenoise: &Whitenoise,
     searcher_pubkey: &PublicKey,
@@ -91,7 +90,7 @@ pub(super) async fn get_group_co_member_pubkeys(
             continue;
         }
 
-        match whitenoise.group_members(&account, &ag.mls_group_id).await {
+        match session.groups().members(&ag.mls_group_id) {
             Ok(members) => {
                 co_members.extend(members.into_iter().filter(|pk| pk != searcher_pubkey));
             }
@@ -632,7 +631,6 @@ async fn fetch_events_with_retries(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
@@ -655,7 +653,13 @@ mod tests {
 
         let account = whitenoise.create_identity().await.unwrap();
         let target = Keys::generate().public_key();
-        whitenoise.follow_user(&account, &target).await.unwrap();
+        whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .social()
+            .follow_user(&target)
+            .await
+            .unwrap();
 
         let result = get_follows_batch(&whitenoise, &[account.pubkey]).await;
 
@@ -703,7 +707,10 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let account_follow = Keys::generate().public_key();
         whitenoise
-            .follow_user(&account, &account_follow)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .social()
+            .follow_user(&account_follow)
             .await
             .unwrap();
 

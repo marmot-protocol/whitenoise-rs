@@ -238,7 +238,6 @@ impl Whitenoise {
     /// - Subscription is established BEFORE fetching to capture concurrent updates
     /// - Any updates that arrived during fetch are merged into `initial_items`
     /// - The receiver only yields updates AFTER the initial snapshot
-    #[allow(deprecated)]
     #[perf_instrument("whitenoise")]
     pub async fn subscribe_to_chat_list(
         &self,
@@ -249,7 +248,11 @@ impl Whitenoise {
             .chat_list_stream_manager
             .subscribe(&account.pubkey);
 
-        let fetched_items = self.get_chat_list(account).await?;
+        let fetched_items = self
+            .require_session(&account.pubkey)?
+            .chat_list()
+            .active()
+            .await?;
 
         let mut items_map: HashMap<mdk_core::prelude::GroupId, chat_list::ChatListItem> =
             fetched_items
@@ -294,8 +297,7 @@ impl Whitenoise {
     /// Subscribe to archived chat list updates for a specific account.
     ///
     /// Same race-condition-free design as `subscribe_to_chat_list`, but uses
-    /// `get_archived_chat_list` and the archived stream manager.
-    #[allow(deprecated)]
+    /// the archived view and the archived stream manager.
     #[perf_instrument("whitenoise")]
     pub async fn subscribe_to_archived_chat_list(
         &self,
@@ -306,7 +308,11 @@ impl Whitenoise {
             .archived_chat_list_stream_manager
             .subscribe(&account.pubkey);
 
-        let fetched_items = self.get_archived_chat_list(account).await?;
+        let fetched_items = self
+            .require_session(&account.pubkey)?
+            .chat_list()
+            .archived()
+            .await?;
 
         let mut items_map: HashMap<mdk_core::prelude::GroupId, chat_list::ChatListItem> =
             fetched_items

@@ -18,7 +18,6 @@ use crate::{
     whitenoise::{
         aggregated_message::AggregatedMessage,
         database::Database,
-        error::WhitenoiseError,
         event_tracker::EventTracker,
         key_packages::{
             MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, REQUIRED_MLS_CIPHERSUITE_TAG,
@@ -107,7 +106,7 @@ pub(crate) enum MessagePublishResult {
 #[derive(Debug)]
 pub(crate) enum KeyPackageLookup {
     Found(Event),
-    Incompatible { error: WhitenoiseError },
+    Incompatible,
     NotFound,
 }
 
@@ -243,7 +242,7 @@ impl EphemeralPlane {
     ) -> Result<Option<Event>> {
         match self.fetch_user_key_package_lookup(pubkey, relays).await? {
             KeyPackageLookup::Found(event) => Ok(Some(event)),
-            KeyPackageLookup::Incompatible { .. } | KeyPackageLookup::NotFound => Ok(None),
+            KeyPackageLookup::Incompatible | KeyPackageLookup::NotFound => Ok(None),
         }
     }
 
@@ -857,12 +856,10 @@ impl EphemeralPlane {
             return KeyPackageLookup::Found(event);
         }
 
-        match incompatible
-            .into_iter()
-            .max_by_key(|(event, _)| (event.created_at, event.id))
-        {
-            Some((_event, error)) => KeyPackageLookup::Incompatible { error },
-            None => KeyPackageLookup::NotFound,
+        if incompatible.is_empty() {
+            KeyPackageLookup::NotFound
+        } else {
+            KeyPackageLookup::Incompatible
         }
     }
 }
@@ -914,7 +911,7 @@ impl EphemeralScope {
     ) -> Result<Option<Event>> {
         match self.fetch_user_key_package_lookup(pubkey, relays).await? {
             KeyPackageLookup::Found(event) => Ok(Some(event)),
-            KeyPackageLookup::Incompatible { .. } | KeyPackageLookup::NotFound => Ok(None),
+            KeyPackageLookup::Incompatible | KeyPackageLookup::NotFound => Ok(None),
         }
     }
 
@@ -1646,11 +1643,7 @@ mod tests {
             vec![incompatible.clone()],
         ));
 
-        assert!(matches!(
-            lookup,
-            KeyPackageLookup::Incompatible { error }
-                if matches!(error, WhitenoiseError::MissingEncodingTag)
-        ));
+        assert!(matches!(lookup, KeyPackageLookup::Incompatible));
     }
 
     #[test]

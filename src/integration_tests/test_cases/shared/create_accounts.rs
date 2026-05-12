@@ -41,7 +41,9 @@ impl TestCase for CreateAccountsTestCase {
                     let account = context.get_account(name)?;
                     let key_packages = context
                         .whitenoise
-                        .fetch_all_key_packages_for_account(account)
+                        .require_session(&account.pubkey)?
+                        .key_packages()
+                        .fetch_all()
                         .await?;
 
                     if key_packages.is_empty() {

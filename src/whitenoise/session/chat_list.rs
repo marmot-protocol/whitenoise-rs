@@ -304,9 +304,12 @@ impl<'a> ChatListOps<'a> {
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::Keys;
+    use nostr_sdk::{Keys, Metadata};
 
+    use crate::whitenoise::group_information::GroupType;
     use crate::whitenoise::session::test_helpers::test_session;
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
+    use crate::whitenoise::users::User;
 
     #[tokio::test]
     async fn active_returns_empty_for_new_session() {
@@ -338,5 +341,39 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_item_dm_resolves_other_user_name() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
+            .await
+            .unwrap();
+        user.metadata = Metadata::new().display_name("Bob");
+        user.save(&whitenoise.shared.database).await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let session = whitenoise.session(&creator.pubkey).unwrap();
+        let group = session
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
+            .await
+            .unwrap();
+
+        let item = session
+            .chat_list()
+            .build_item(&group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert!(item.is_some());
+        let item = item.unwrap();
+        assert_eq!(item.group_type, GroupType::DirectMessage);
+        assert_eq!(item.name, Some("Bob".to_string()));
+        assert_eq!(item.dm_peer_pubkey, Some(member.pubkey));
     }
 }

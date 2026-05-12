@@ -300,12 +300,23 @@ impl<'a> PushOps<'a> {
     pub(crate) async fn remove_local_token_from_joined_groups(&self) -> Result<()> {
         let groups = self.session.mdk.get_groups()?;
 
-        let failures: Vec<String> = stream::iter(groups.iter())
-            .map(|group| self.remove_token_from_single_group(&group.mls_group_id, group.state))
-            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
-            .filter_map(|r| async move { r.err() })
-            .collect()
-            .await;
+        // Pre-extract owned (GroupId, GroupState) so the async stream below does
+        // not borrow `&Group`. The borrow yields a closure type that only
+        // implements `Send` for a specific lifetime, not `for<'a>`, which
+        // breaks any caller crossed by flutter_rust_bridge's `wrap_async`.
+        let group_pairs: Vec<(GroupId, GroupState)> = groups
+            .iter()
+            .map(|g| (g.mls_group_id.clone(), g.state))
+            .collect();
+        let failures: Vec<String> =
+            stream::iter(group_pairs.into_iter())
+                .map(|(gid, state)| async move {
+                    self.remove_token_from_single_group(&gid, state).await
+                })
+                .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
+                .filter_map(|r| async move { r.err() })
+                .collect()
+                .await;
 
         if failures.is_empty() {
             Ok(())
@@ -405,17 +416,19 @@ impl<'a> PushOps<'a> {
     async fn share_token_to_joined_groups(&self, token_tag: &TokenTag) -> Result<()> {
         let groups = self.session.mdk.get_groups()?;
 
-        let failures: Vec<String> = stream::iter(groups.iter())
-            .map(|group| async move {
-                if !self
-                    .is_push_gossip_eligible(&group.mls_group_id, group.state)
-                    .await
-                {
+        // Same owned-iteration trick as `remove_local_token_from_joined_groups`
+        let group_pairs: Vec<(GroupId, GroupState)> = groups
+            .iter()
+            .map(|g| (g.mls_group_id.clone(), g.state))
+            .collect();
+        let failures: Vec<String> = stream::iter(group_pairs.into_iter())
+            .map(|(gid, state)| async move {
+                if !self.is_push_gossip_eligible(&gid, state).await {
                     return Ok(());
                 }
-                self.share_token_to_group(&group.mls_group_id, token_tag)
+                self.share_token_to_group(&gid, token_tag)
                     .await
-                    .map_err(|e| format!("{}: {e}", hex::encode(group.mls_group_id.as_slice())))
+                    .map_err(|e| format!("{}: {e}", hex::encode(gid.as_slice())))
             })
             .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
             .filter_map(|r| async move { r.err() })

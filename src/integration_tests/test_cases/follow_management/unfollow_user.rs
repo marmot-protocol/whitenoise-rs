@@ -20,7 +20,6 @@ impl UnfollowUserTestCase {
 
 #[async_trait]
 impl TestCase for UnfollowUserTestCase {
-    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Unfollowing user {} from account: {}",
@@ -29,20 +28,15 @@ impl TestCase for UnfollowUserTestCase {
         );
 
         let account = context.get_account(&self.follower_account_name)?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
 
         // Perform the unfollow operation
-        context
-            .whitenoise
-            .unfollow_user(account, &self.target_pubkey)
-            .await?;
+        session.social().unfollow_user(&self.target_pubkey).await?;
 
         // Wait for unfollow operation to be reflected in the system
         retry_default(
             || async {
-                let is_following = context
-                    .whitenoise
-                    .is_following_user(account, &self.target_pubkey)
-                    .await?;
+                let is_following = session.social().is_following(&self.target_pubkey).await?;
 
                 if !is_following {
                     Ok(())

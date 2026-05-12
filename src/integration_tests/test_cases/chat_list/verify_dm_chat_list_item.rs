@@ -36,7 +36,8 @@ impl TestCase for VerifyDmChatListItemTestCase {
         let account = context.get_account(&self.account_name)?;
         let expected_group = context.get_group(&self.dm_group_context_name)?;
         let other_user_account = context.get_account(&self.other_user_account_name)?;
-        let chat_list = context.whitenoise.get_chat_list(account).await?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+        let chat_list = session.chat_list().active().await?;
 
         let item = chat_list
             .iter()
