@@ -37,14 +37,17 @@ impl TestCase for DeleteDraftTestCase {
         let group = context.get_group(&self.group_name)?;
         let group_id = GroupId::from_slice(group.mls_group_id.as_slice());
 
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+        let drafts = session.drafts();
+
         if self.expect_precondition {
-            let loaded = context.whitenoise.load_draft(account, &group_id).await?;
+            let loaded = drafts.load(&group_id).await?;
             assert!(loaded.is_some(), "Draft should exist before deletion");
         }
 
-        context.whitenoise.delete_draft(account, &group_id).await?;
+        drafts.delete(&group_id).await?;
 
-        let loaded = context.whitenoise.load_draft(account, &group_id).await?;
+        let loaded = drafts.load(&group_id).await?;
         assert!(loaded.is_none(), "Draft should not exist after deletion");
 
         tracing::info!("✓ Draft deleted successfully");

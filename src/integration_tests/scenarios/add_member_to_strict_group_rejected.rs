@@ -26,12 +26,14 @@ use crate::integration_tests::{core::*, test_cases::shared::*};
 use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId, RequiredProposal};
 use crate::{Whitenoise, WhitenoiseError};
 
+use std::sync::Arc;
+
 pub struct AddMemberToStrictGroupRejectedScenario {
     context: ScenarioContext,
 }
 
 impl AddMemberToStrictGroupRejectedScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }
@@ -91,7 +93,7 @@ impl Scenario for AddMemberToStrictGroupRejectedScenario {
         let legacy_pubkey: PublicKey = legacy_account.pubkey;
 
         let legacy_relays = legacy_account
-            .key_package_relays(self.context.whitenoise)
+            .key_package_relays(&self.context.whitenoise.shared)
             .await?;
         if legacy_relays.is_empty() {
             return Err(WhitenoiseError::Internal(
@@ -119,7 +121,10 @@ impl Scenario for AddMemberToStrictGroupRejectedScenario {
         let result = self
             .context
             .whitenoise
-            .add_members_to_group(&creator_account, &group_id, vec![legacy_pubkey])
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .add_members(&group_id, vec![legacy_pubkey])
             .await;
 
         match result {

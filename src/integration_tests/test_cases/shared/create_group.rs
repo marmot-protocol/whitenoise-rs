@@ -48,8 +48,10 @@ impl TestCase for CreateGroupTestCase {
 
         let test_group = context
             .whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                creator,
                 member_pubkeys,
                 NostrGroupConfigData::new(
                     self.group_name.clone(),

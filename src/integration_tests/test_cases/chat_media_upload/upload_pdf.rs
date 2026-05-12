@@ -67,7 +67,11 @@ impl TestCase for UploadPdfTestCase {
 
         let media_file = context
             .whitenoise
-            .upload_chat_media(account, &group.mls_group_id, temp_path, blossom_url, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .upload_chat_media(&group.mls_group_id, temp_path, blossom_url, None)
             .await?;
 
         drop(temp_file);

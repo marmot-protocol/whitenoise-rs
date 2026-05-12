@@ -42,6 +42,7 @@ impl TestCase for SearchFollowsOfFollowsTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let account = context.get_account(&self.account_name)?;
         let searcher_pubkey = account.pubkey;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
 
         // --- Set up the social graph: Searcher → MiddleUser → TargetUser ---
 
@@ -78,10 +79,7 @@ impl TestCase for SearchFollowsOfFollowsTestCase {
             .await?;
 
         // Searcher follows MiddleUser
-        context
-            .whitenoise
-            .follow_user(account, &middle_pubkey)
-            .await?;
+        session.social().follow_user(&middle_pubkey).await?;
         tracing::info!(
             "Searcher {} follows MiddleUser {}",
             &searcher_pubkey.to_hex()[..8],

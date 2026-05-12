@@ -71,7 +71,10 @@ impl BenchmarkTestCase for CreateGroupBenchmark {
 
         context
             .whitenoise
-            .create_group(creator, member_pubkeys, config, None)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await?;
 
         let duration = start.elapsed();

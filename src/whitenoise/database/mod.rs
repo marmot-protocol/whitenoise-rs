@@ -1,17 +1,17 @@
 use std::{
     path::{Path, PathBuf},
-    sync::LazyLock,
     time::{Duration, SystemTime},
 };
 
 use mdk_sqlite_storage::EncryptionConfig;
 use sqlx::{
     ConnectOptions, SqlitePool,
-    migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
 
+pub mod account;
+pub mod account_db;
 mod encryption;
 
 pub mod account_settings;
@@ -33,11 +33,12 @@ pub mod push_registrations;
 pub mod relay_events;
 pub mod relay_status;
 pub mod relays;
+pub mod shared_db;
 pub mod user_relays;
 pub mod users;
 pub mod utils;
 
-pub static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| sqlx::migrate!("./db_migrations"));
+pub mod rust_migrations;
 
 pub(crate) const WHITENOISE_DB_KEY_ID: &str = encryption::WHITENOISE_DB_KEY_ID;
 
@@ -49,8 +50,6 @@ const DB_BUSY_TIMEOUT_MS: u32 = 5000;
 pub enum DatabaseError {
     #[error("SQLx error: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("Migration error: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
     #[error("File system error: {0}")]
     FileSystem(#[from] std::io::Error),
     #[error("Invalid timestamp: {timestamp} cannot be converted to DateTime")]
@@ -61,12 +60,16 @@ pub enum DatabaseError {
     Serialization(#[from] serde_json::Error),
     #[error("Search query did not return a position column for message {message_id}")]
     MissingSearchPosition { message_id: String },
+    #[error("User {0} has no database id; pass a persisted User from find_or_create_by_pubkey")]
+    MissingUserId(String),
     #[error("Database encryption key error: {0}")]
     EncryptionKey(String),
     #[error("Encrypted database {path} is missing keyring key {key_id}")]
     MissingEncryptionKey { path: String, key_id: String },
     #[error("Database encryption migration error: {0}")]
     EncryptionMigration(String),
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 impl DatabaseError {
@@ -94,8 +97,30 @@ pub struct Database {
 }
 
 impl Database {
+    /// Open or create the SQLite file at `db_path` and run the unified
+    /// migrator in shared-only mode (`account = None`).
+    ///
+    /// **Not safe for per-account DB files.** In shared-only mode the pool
+    /// passed here receives global migrations — including drop migrations
+    /// (e.g. m0037) that destroy tables which local migrations created.
+    /// Use `open_without_migrations` + `AccountDatabase::run_account_migrations`
+    /// for account DBs instead.
+    ///
+    /// **Not safe for the shared DB once the unified timeline contains local
+    /// migrations** (Phase 18c+): in shared-only mode the migrator skips
+    /// locals but advances past their version numbers, so any global drop
+    /// migration sitting after a local will fire before the local has run
+    /// for any account on disk. Use `open_without_migrations` +
+    /// `MIGRATOR.run_all` instead when there are accounts to migrate; the
+    /// latter walks every per-account DB in lockstep with shared.
+    ///
+    /// Safe to use for: fresh installs where shared has no data yet (drops
+    /// are no-ops on empty tables); test helpers that want a one-shot
+    /// fully-migrated shared-shape DB.
     pub async fn new(db_path: PathBuf) -> Result<Self, DatabaseError> {
-        Self::open(db_path, None).await
+        let db = Self::open_without_migrations(db_path, None).await?;
+        rust_migrations::MIGRATOR.run(&db.pool, None).await?;
+        Ok(db)
     }
 
     pub async fn new_encrypted(
@@ -126,12 +151,16 @@ impl Database {
     ) -> Result<Self, DatabaseError> {
         let encryption_config =
             encryption::prepare_sqlcipher_database(&db_path, keyring_service_id, key_id).await?;
-        let database = Self::open(db_path.clone(), Some(&encryption_config)).await?;
+        let database =
+            Self::open_without_migrations(db_path.clone(), Some(&encryption_config)).await?;
         encryption::cleanup_completed_migration(&db_path)?;
         Ok(database)
     }
 
-    async fn open(
+    /// Open or create the SQLite file at `db_path` without running any
+    /// migrations. Pair with `MIGRATOR.run_all` (or
+    /// `AccountDatabase::run_account_migrations`) to apply the timeline.
+    pub(crate) async fn open_without_migrations(
         db_path: PathBuf,
         encryption_config: Option<&EncryptionConfig>,
     ) -> Result<Self, DatabaseError> {
@@ -140,9 +169,6 @@ impl Database {
         }
 
         let pool = Self::create_connection_pool(&db_path, encryption_config).await?;
-
-        // Automatically run migrations
-        MIGRATOR.run(&pool).await?;
 
         Ok(Self {
             pool,
@@ -220,7 +246,7 @@ impl Database {
     /// This method is idempotent - it's safe to call multiple times.
     /// Only new migrations will be applied.
     pub async fn migrate_up(&self) -> Result<(), DatabaseError> {
-        MIGRATOR.run(&self.pool).await?;
+        rust_migrations::MIGRATOR.run(&self.pool, None).await?;
         Ok(())
     }
 
@@ -248,28 +274,32 @@ impl Database {
 
     /// Inner implementation of delete_all_data
     async fn delete_all_data_inner(&self) -> Result<(), DatabaseError> {
-        let mut txn = self.pool.begin().await?;
+        // Acquire a single connection so the PRAGMA and transaction share the
+        // same session. PRAGMA foreign_keys cannot be changed inside a
+        // transaction in SQLite, so we set it before BEGIN.
+        let mut conn = self.pool.acquire().await?;
 
-        // Disable foreign key constraints temporarily to allow deleting in any order
         sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&mut *txn)
+            .execute(&mut *conn)
             .await?;
+
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
         // Get all user tables (excluding SQLite system tables and migration tracking)
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master
              WHERE type='table'
              AND name NOT LIKE 'sqlite_%'
-             AND name != '_sqlx_migrations'",
+             AND name NOT IN ('_sqlx_migrations', '_rust_migrations')",
         )
-        .fetch_all(&mut *txn)
+        .fetch_all(&mut *conn)
         .await?;
 
         // Delete all rows from each table (preserves schema)
         for (table_name,) in &tables {
             let delete_query = format!("DELETE FROM {}", table_name);
             sqlx::query(sqlx::AssertSqlSafe(delete_query))
-                .execute(&mut *txn)
+                .execute(&mut *conn)
                 .await?;
         }
 
@@ -279,148 +309,87 @@ impl Database {
             // Ignore errors - table might not have auto-increment
             let _ = sqlx::query("DELETE FROM sqlite_sequence WHERE name = ?")
                 .bind(table_name)
-                .execute(&mut *txn)
+                .execute(&mut *conn)
                 .await;
         }
 
-        // Re-enable foreign key constraints
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *txn)
-            .await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
 
-        txn.commit().await?;
+        // Re-enable foreign key constraints.
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await?;
 
         Ok(())
     }
 
-    /// Deletes aggregated messages that all accounts have cleared.
+    /// Delete aggregated messages whose `created_at <= threshold`.
     ///
-    /// Only deletes messages whose `created_at` is at or before the minimum
-    /// `chat_cleared_at` across all accounts in the group, and only when
-    /// every account has set a `chat_cleared_at` value.
+    /// Intended for the per-account cleanup path: after `clear_chat` advances
+    /// this account's `chat_cleared_at`, the caller passes that timestamp here
+    /// to drop the now-invisible message rows from this account's per-account
+    /// DB. Cross-account coordination is irrelevant because each account owns
+    /// its own copy of `aggregated_messages` post-phase-18e.
     ///
-    /// Returns the number of rows deleted.
+    /// Pass `None` to make the call a no-op. Returns the number of rows
+    /// deleted.
     pub(crate) async fn try_cleanup_cleared_messages(
         &self,
         mls_group_id: &mdk_core::prelude::GroupId,
+        cleared_at_ms: Option<i64>,
     ) -> Result<u64, DatabaseError> {
-        retry_on_lock(|| self.try_cleanup_cleared_messages_inner(mls_group_id)).await
+        let Some(threshold) = cleared_at_ms else {
+            return Ok(0);
+        };
+        retry_on_lock(|| self.try_cleanup_cleared_messages_inner(mls_group_id, threshold)).await
     }
 
     async fn try_cleanup_cleared_messages_inner(
         &self,
         mls_group_id: &mdk_core::prelude::GroupId,
+        threshold: i64,
     ) -> Result<u64, DatabaseError> {
         let result = sqlx::query(
             "DELETE FROM aggregated_messages
-             WHERE mls_group_id = ?
-               AND created_at <= (
-                 SELECT MIN(chat_cleared_at) FROM accounts_groups
-                 WHERE mls_group_id = ?
-                 HAVING COUNT(*) = COUNT(chat_cleared_at)
-               )",
+             WHERE mls_group_id = ? AND created_at <= ?",
         )
         .bind(mls_group_id.as_slice())
-        .bind(mls_group_id.as_slice())
+        .bind(threshold)
         .execute(&self.pool)
         .await?;
 
         Ok(result.rows_affected())
     }
 
-    /// Delete all data for an account's association with a group.
+    /// Delete shared-DB data for a group when the last account leaves it.
     ///
-    /// Removes the per-account row and data (accounts_groups, drafts, push tokens,
-    /// media files). If no other accounts reference this group after the deletion,
-    /// also removes shared data (group_information, which cascades to
-    /// aggregated_messages and drafts).
-    ///
-    /// Returns `true` if shared group data was also deleted (i.e., this was the
-    /// last account).
-    pub(crate) async fn delete_chat_data(
+    /// All per-account data (accounts_groups, drafts, group_push_tokens,
+    /// media_references, aggregated_messages, message_delivery_status) lives
+    /// in per-account DBs and is removed by the caller. This method only
+    /// removes the shared `group_information` row (and anything still
+    /// cascading off it inside the shared DB).
+    pub(crate) async fn delete_shared_group_data(
         &self,
-        account_pubkey: &nostr_sdk::prelude::PublicKey,
         mls_group_id: &mdk_core::prelude::GroupId,
-    ) -> Result<bool, DatabaseError> {
-        retry_on_lock(|| self.delete_chat_data_inner(account_pubkey, mls_group_id)).await
+        is_last_account: bool,
+    ) -> Result<(), DatabaseError> {
+        if is_last_account {
+            retry_on_lock(|| self.delete_shared_group_data_inner(mls_group_id)).await
+        } else {
+            Ok(())
+        }
     }
 
-    async fn delete_chat_data_inner(
+    async fn delete_shared_group_data_inner(
         &self,
-        account_pubkey: &nostr_sdk::prelude::PublicKey,
         mls_group_id: &mdk_core::prelude::GroupId,
-    ) -> Result<bool, DatabaseError> {
-        let mut txn = self.pool.begin().await?;
-        let pubkey_hex = account_pubkey.to_hex();
+    ) -> Result<(), DatabaseError> {
+        sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
+            .bind(mls_group_id.as_slice())
+            .execute(&self.pool)
+            .await?;
 
-        // 1. Delete per-account data
-        sqlx::query(
-            "DELETE FROM accounts_groups
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pubkey_hex)
-        .bind(mls_group_id.as_slice())
-        .execute(&mut *txn)
-        .await?;
-
-        sqlx::query(
-            "DELETE FROM drafts
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pubkey_hex)
-        .bind(mls_group_id.as_slice())
-        .execute(&mut *txn)
-        .await?;
-
-        sqlx::query(
-            "DELETE FROM group_push_tokens
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pubkey_hex)
-        .bind(mls_group_id.as_slice())
-        .execute(&mut *txn)
-        .await?;
-
-        sqlx::query(
-            "DELETE FROM media_files
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pubkey_hex)
-        .bind(mls_group_id.as_slice())
-        .execute(&mut *txn)
-        .await?;
-
-        // 2. Check if any other accounts still reference this group
-        let (remaining,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM accounts_groups WHERE mls_group_id = ?")
-                .bind(mls_group_id.as_slice())
-                .fetch_one(&mut *txn)
-                .await?;
-
-        let last_account = remaining == 0;
-
-        if last_account {
-            // 3. Delete shared data (group_information cascades to
-            //    aggregated_messages and drafts via FK)
-            sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
-                .bind(mls_group_id.as_slice())
-                .execute(&mut *txn)
-                .await?;
-
-            sqlx::query("DELETE FROM group_push_tokens WHERE mls_group_id = ?")
-                .bind(mls_group_id.as_slice())
-                .execute(&mut *txn)
-                .await?;
-
-            sqlx::query("DELETE FROM media_files WHERE mls_group_id = ?")
-                .bind(mls_group_id.as_slice())
-                .execute(&mut *txn)
-                .await?;
-        }
-
-        txn.commit().await?;
-
-        Ok(last_account)
+        Ok(())
     }
 }
 
@@ -469,6 +438,7 @@ mod tests {
     use mdk_sqlite_storage::keyring;
     use tempfile::TempDir;
 
+    use super::rust_migrations;
     use crate::whitenoise::Whitenoise;
 
     const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -487,6 +457,25 @@ mod tests {
         file.read_exact(&mut header)
             .expect("Failed to read database header");
         header
+    }
+
+    async fn setup_account(db: &Database, pubkey_hex: &str) {
+        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
+            .bind(pubkey_hex)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
+            .bind(pubkey_hex)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
+            .bind(pubkey_hex)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
     }
 
     async fn create_test_db() -> (Database, TempDir) {
@@ -537,6 +526,10 @@ mod tests {
         let db = Database::new_encrypted(db_path.clone(), &service_id)
             .await
             .expect("Failed to create encrypted database");
+        rust_migrations::MIGRATOR
+            .run(&db.pool, None)
+            .await
+            .expect("Failed to run migrations");
 
         assert_eq!(db.path, db_path);
         assert!(db_path.exists());
@@ -607,12 +600,20 @@ mod tests {
         let db = Database::new_encrypted(db_path.clone(), &service_id)
             .await
             .expect("Failed to create encrypted database");
+        rust_migrations::MIGRATOR
+            .run(&db.pool, None)
+            .await
+            .expect("Failed to run migrations");
         setup_account(&db, &pubkey).await;
         drop(db);
 
         let reopened = Database::new_encrypted(db_path.clone(), &service_id)
             .await
             .expect("Failed to reopen encrypted database");
+        rust_migrations::MIGRATOR
+            .run(&reopened.pool, None)
+            .await
+            .expect("Failed to run migrations on reopen");
 
         let account_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
             .fetch_one(&reopened.pool)
@@ -805,6 +806,10 @@ mod tests {
         let db = Database::new_encrypted(db_path.clone(), &service_id)
             .await
             .expect("Failed to create encrypted database");
+        rust_migrations::MIGRATOR
+            .run(&db.pool, None)
+            .await
+            .expect("Failed to run migrations");
         setup_account(&db, &pubkey).await;
         drop(db);
         fs::rename(&db_path, &temp_path).expect("Failed to move encrypted database to temp");
@@ -812,6 +817,10 @@ mod tests {
         let recovered = Database::new_encrypted(db_path.clone(), &service_id)
             .await
             .expect("Failed to recover encrypted temp database");
+        rust_migrations::MIGRATOR
+            .run(&recovered.pool, None)
+            .await
+            .expect("Failed to run migrations on recovered");
         let account_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
             .fetch_one(&recovered.pool)
             .await
@@ -884,9 +893,9 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
 
-        // Check that the media_files table exists (from migration 0002)
+        // Check that the media_blobs table exists
         let result =
-            sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name='media_files'")
+            sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name='media_blobs'")
                 .fetch_optional(&db.pool)
                 .await;
 
@@ -944,10 +953,13 @@ mod tests {
             .await
             .expect("Failed to insert test account");
 
-        sqlx::query("INSERT INTO media_files (mls_group_id, account_pubkey, file_path, original_file_hash, encrypted_file_hash, mime_type, media_type, created_at) VALUES (x'deadbeef', 'test-pubkey', '/path/test.jpg', NULL, 'testhash', 'image/jpeg', 'test', 1234567890)")
+        sqlx::query("INSERT INTO media_blobs (encrypted_file_hash, file_path, mime_type, created_at) VALUES ('testhash', '/path/test.jpg', 'image/jpeg', 1234567890)")
             .execute(&db.pool)
             .await
-            .expect("Failed to insert test media file");
+            .expect("Failed to insert test media blob");
+
+        // media_references now lives in per-account DBs (moved by v29, dropped
+        // from shared by v30), so we only verify shared tables here.
 
         // Verify data exists
         let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
@@ -962,11 +974,11 @@ mod tests {
             .expect("Failed to count accounts");
         assert_eq!(account_count.0, 1);
 
-        let media_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_files")
+        let blob_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_blobs")
             .fetch_one(&db.pool)
             .await
-            .expect("Failed to count media files");
-        assert_eq!(media_count.0, 1);
+            .expect("Failed to count media blobs");
+        assert_eq!(blob_count.0, 1);
 
         // Delete all data
         let result = db.delete_all_data().await;
@@ -985,11 +997,11 @@ mod tests {
             .expect("Failed to count accounts after deletion");
         assert_eq!(account_count.0, 0);
 
-        let media_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_files")
+        let blob_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_blobs")
             .fetch_one(&db.pool)
             .await
-            .expect("Failed to count media files after deletion");
-        assert_eq!(media_count.0, 0);
+            .expect("Failed to count media blobs after deletion");
+        assert_eq!(blob_count.0, 0);
     }
 
     #[tokio::test]
@@ -1112,7 +1124,10 @@ mod tests {
 
         let table_names: Vec<String> = tables.into_iter().map(|t| t.0).collect();
         assert!(table_names.contains(&"accounts".to_string()));
-        assert!(table_names.contains(&"media_files".to_string()));
+        assert!(table_names.contains(&"media_blobs".to_string()));
+        // media_references was moved to per-account DBs (v29) and dropped
+        // from shared (v30), so it should NOT exist here.
+        assert!(!table_names.contains(&"media_references".to_string()));
         assert!(table_names.contains(&"app_settings".to_string()));
     }
 
@@ -1288,54 +1303,33 @@ mod tests {
         .unwrap();
     }
 
-    /// Sets up an account (user + account rows) so FK constraints are satisfied.
-    async fn setup_account(db: &Database, pubkey_hex: &str) {
-        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
-            .bind(pubkey_hex)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
-            .bind(pubkey_hex)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
-            .bind(pubkey_hex)
-            .bind(user_id)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-    }
-
-    /// Creates an accounts_groups row.
-    async fn setup_account_group(
-        db: &Database,
-        pubkey_hex: &str,
-        group_id: &mdk_core::prelude::GroupId,
-    ) -> i64 {
-        let now = chrono::Utc::now().timestamp_millis();
+    /// Creates the per-account-shape `aggregated_messages` table on a generic
+    /// test DB. Phase 18e moved this table out of the shared schema, so tests
+    /// that exercise per-account-DB methods (`try_cleanup_cleared_messages`)
+    /// must materialise the table themselves.
+    async fn setup_aggregated_messages_table(db: &Database) {
         sqlx::query(
-            "INSERT INTO accounts_groups
-             (account_pubkey, mls_group_id, user_confirmation, created_at, updated_at)
-             VALUES (?, ?, 1, ?, ?)",
+            "CREATE TABLE IF NOT EXISTS aggregated_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL,
+                mls_group_id BLOB NOT NULL,
+                author TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                tags JSONB NOT NULL,
+                reply_to_id TEXT,
+                deletion_event_id TEXT,
+                content_tokens JSONB NOT NULL,
+                reactions JSONB NOT NULL,
+                media_attachments JSONB NOT NULL,
+                content_normalized TEXT NOT NULL DEFAULT '',
+                UNIQUE(message_id, mls_group_id)
+            )",
         )
-        .bind(pubkey_hex)
-        .bind(group_id.as_slice())
-        .bind(now)
-        .bind(now)
         .execute(&db.pool)
         .await
         .unwrap();
-        let (id,): (i64,) = sqlx::query_as(
-            "SELECT id FROM accounts_groups WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(pubkey_hex)
-        .bind(group_id.as_slice())
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        id
     }
 
     /// Inserts a minimal aggregated_messages row.
@@ -1376,34 +1370,19 @@ mod tests {
     async fn test_try_cleanup_cleared_messages_deletes_when_all_accounts_cleared() {
         let (db, _temp) = create_test_db().await;
         let group_id = mdk_core::prelude::GroupId::from_slice(&[1; 32]);
-        let pk1 = "aa".repeat(32);
-        let pk2 = "bb".repeat(32);
 
         setup_group(&db, &group_id).await;
-        setup_account(&db, &pk1).await;
-        setup_account(&db, &pk2).await;
-        let ag1_id = setup_account_group(&db, &pk1, &group_id).await;
-        let ag2_id = setup_account_group(&db, &pk2, &group_id).await;
+        setup_aggregated_messages_table(&db).await;
 
         // Insert messages at times 100 and 200
         setup_message(&db, &group_id, &format!("{:0>64}", "1"), 100).await;
         setup_message(&db, &group_id, &format!("{:0>64}", "2"), 200).await;
 
-        // Both accounts clear at 150 -- should delete only the message at 100
-        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
-            .bind(150_i64)
-            .bind(ag1_id)
-            .execute(&db.pool)
+        // Both accounts cleared at 150 — should delete only the message at 100
+        let deleted = db
+            .try_cleanup_cleared_messages(&group_id, Some(150))
             .await
             .unwrap();
-        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
-            .bind(150_i64)
-            .bind(ag2_id)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-
-        let deleted = db.try_cleanup_cleared_messages(&group_id).await.unwrap();
         assert_eq!(deleted, 1, "only the message at t=100 should be deleted");
         assert_eq!(message_count(&db, &group_id).await, 1);
     }
@@ -1412,36 +1391,21 @@ mod tests {
     async fn test_try_cleanup_cleared_messages_respects_min() {
         let (db, _temp) = create_test_db().await;
         let group_id = mdk_core::prelude::GroupId::from_slice(&[2; 32]);
-        let pk1 = "cc".repeat(32);
-        let pk2 = "dd".repeat(32);
 
         setup_group(&db, &group_id).await;
-        setup_account(&db, &pk1).await;
-        setup_account(&db, &pk2).await;
-        let ag1_id = setup_account_group(&db, &pk1, &group_id).await;
-        let ag2_id = setup_account_group(&db, &pk2, &group_id).await;
+        setup_aggregated_messages_table(&db).await;
 
         // Messages at 100, 200, 300
         setup_message(&db, &group_id, &format!("{:0>64}", "a"), 100).await;
         setup_message(&db, &group_id, &format!("{:0>64}", "b"), 200).await;
         setup_message(&db, &group_id, &format!("{:0>64}", "c"), 300).await;
 
-        // Account 1 clears at 250, account 2 clears at 150
-        // MIN = 150, so only message at 100 should be deleted
-        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
-            .bind(250_i64)
-            .bind(ag1_id)
-            .execute(&db.pool)
+        // Account 1 cleared at 250, account 2 cleared at 150.
+        // Caller resolves MIN = 150, so only message at 100 should be deleted.
+        let deleted = db
+            .try_cleanup_cleared_messages(&group_id, Some(150))
             .await
             .unwrap();
-        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
-            .bind(150_i64)
-            .bind(ag2_id)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-
-        let deleted = db.try_cleanup_cleared_messages(&group_id).await.unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(message_count(&db, &group_id).await, 2);
     }
@@ -1450,26 +1414,16 @@ mod tests {
     async fn test_try_cleanup_cleared_messages_noop_when_not_all_cleared() {
         let (db, _temp) = create_test_db().await;
         let group_id = mdk_core::prelude::GroupId::from_slice(&[3; 32]);
-        let pk1 = "ee".repeat(32);
-        let pk2 = "ff".repeat(32);
 
         setup_group(&db, &group_id).await;
-        setup_account(&db, &pk1).await;
-        setup_account(&db, &pk2).await;
-        let ag1_id = setup_account_group(&db, &pk1, &group_id).await;
-        setup_account_group(&db, &pk2, &group_id).await;
-
+        setup_aggregated_messages_table(&db).await;
         setup_message(&db, &group_id, &format!("{:0>64}", "d"), 100).await;
 
-        // Only account 1 clears -- account 2 still has chat_cleared_at = NULL
-        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
-            .bind(200_i64)
-            .bind(ag1_id)
-            .execute(&db.pool)
+        // Not all accounts cleared — caller passes None
+        let deleted = db
+            .try_cleanup_cleared_messages(&group_id, None)
             .await
             .unwrap();
-
-        let deleted = db.try_cleanup_cleared_messages(&group_id).await.unwrap();
         assert_eq!(
             deleted, 0,
             "must not delete when some accounts have not cleared"
@@ -1478,21 +1432,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_chat_data_sole_account() {
+    async fn test_delete_shared_group_data_last_account() {
         let (db, _temp) = create_test_db().await;
         let group_id = mdk_core::prelude::GroupId::from_slice(&[4; 32]);
-        let pk1 = "11".repeat(32);
 
         setup_group(&db, &group_id).await;
-        setup_account(&db, &pk1).await;
-        setup_account_group(&db, &pk1, &group_id).await;
-        setup_message(&db, &group_id, &format!("{:0>64}", "e"), 100).await;
 
-        let pubkey = nostr_sdk::prelude::PublicKey::parse(&pk1).unwrap();
-        let was_last = db.delete_chat_data(&pubkey, &group_id).await.unwrap();
-        assert!(was_last, "sole account should return true");
+        // Delete shared data as last account.
+        db.delete_shared_group_data(&group_id, true).await.unwrap();
 
-        // Verify everything is gone
+        // Verify group_information is gone. Per-account aggregated_messages
+        // cleanup is the caller's responsibility (delete_chat) post phase 18e —
+        // this method only owns the shared-DB row.
         let (gi_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
                 .bind(group_id.as_slice())
@@ -1500,65 +1451,19 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(gi_count, 0);
-
-        let (ag_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM accounts_groups WHERE mls_group_id = ?")
-                .bind(group_id.as_slice())
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(ag_count, 0);
-
-        // Messages cascade from group_information delete
-        assert_eq!(message_count(&db, &group_id).await, 0);
     }
 
     #[tokio::test]
-    async fn test_delete_chat_data_multi_account() {
+    async fn test_delete_shared_group_data_not_last_account() {
         let (db, _temp) = create_test_db().await;
         let group_id = mdk_core::prelude::GroupId::from_slice(&[5; 32]);
-        let pk1 = "33".repeat(32);
-        let pk2 = "44".repeat(32);
 
         setup_group(&db, &group_id).await;
-        setup_account(&db, &pk1).await;
-        setup_account(&db, &pk2).await;
-        setup_account_group(&db, &pk1, &group_id).await;
-        setup_account_group(&db, &pk2, &group_id).await;
-        setup_message(&db, &group_id, &format!("{:0>64}", "f"), 100).await;
 
-        let pubkey1 = nostr_sdk::prelude::PublicKey::parse(&pk1).unwrap();
-        let pubkey2 = nostr_sdk::prelude::PublicKey::parse(&pk2).unwrap();
+        // Delete shared data as non-last account -- should be a no-op
+        db.delete_shared_group_data(&group_id, false).await.unwrap();
 
-        // Account 1 deletes -- shared data should remain
-        let was_last = db.delete_chat_data(&pubkey1, &group_id).await.unwrap();
-        assert!(!was_last, "first account should return false");
-
-        // A's row gone
-        let (ag1_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM accounts_groups
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pk1)
-        .bind(group_id.as_slice())
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(ag1_count, 0, "A's account_group must be deleted");
-
-        // B's row intact
-        let (ag2_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM accounts_groups
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pk2)
-        .bind(group_id.as_slice())
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(ag2_count, 1, "B's account_group must still exist");
-
-        // Shared data preserved
+        // Shared row preserved
         let (gi_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
                 .bind(group_id.as_slice())
@@ -1566,11 +1471,9 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(gi_count, 1);
-        assert_eq!(message_count(&db, &group_id).await, 1);
 
-        // Account 2 deletes -- everything should be gone
-        let was_last = db.delete_chat_data(&pubkey2, &group_id).await.unwrap();
-        assert!(was_last, "last account should return true");
+        // Now delete as last account -- shared row should be gone
+        db.delete_shared_group_data(&group_id, true).await.unwrap();
 
         let (gi_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
@@ -1579,6 +1482,5 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(gi_count, 0);
-        assert_eq!(message_count(&db, &group_id).await, 0);
     }
 }

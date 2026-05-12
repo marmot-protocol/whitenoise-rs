@@ -4,49 +4,46 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use nostr_sdk::{PublicKey, RelayUrl};
+use sqlx::SqlitePool;
 
-use super::{
-    Database,
-    utils::{parse_optional_timestamp, parse_timestamp},
-};
 use crate::perf_instrument;
 use crate::whitenoise::push_notifications::{PushPlatform, PushRegistration};
 
-impl<'r, R> sqlx::FromRow<'r, R> for PushRegistration
-where
-    R: sqlx::Row,
-    &'r str: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    Option<String>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    Option<i64>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
-        let account_pubkey_str: String = row.try_get("account_pubkey")?;
-        let account_pubkey =
-            PublicKey::parse(&account_pubkey_str).map_err(|error| sqlx::Error::ColumnDecode {
-                index: "account_pubkey".to_string(),
-                source: Box::new(error),
-            })?;
+/// Row carrier for `push_registrations` in the per-account DB.
+///
+/// The `account_pubkey` column no longer exists in the table; the caller
+/// supplies it separately and attaches it to the returned
+/// [`PushRegistration`].
+#[derive(sqlx::FromRow)]
+struct LocalPushRegRow {
+    platform: String,
+    raw_token: String,
+    server_pubkey: String,
+    relay_hint: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    last_shared_at: Option<i64>,
+}
 
-        let platform_str: String = row.try_get("platform")?;
+impl LocalPushRegRow {
+    fn into_push_registration(
+        self,
+        account_pubkey: PublicKey,
+    ) -> Result<PushRegistration, sqlx::Error> {
         let platform =
-            PushPlatform::from_str(&platform_str).map_err(|error| sqlx::Error::ColumnDecode {
+            PushPlatform::from_str(&self.platform).map_err(|error| sqlx::Error::ColumnDecode {
                 index: "platform".to_string(),
                 source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
             })?;
 
-        let raw_token: String = row.try_get("raw_token")?;
-
-        let server_pubkey_str: String = row.try_get("server_pubkey")?;
         let server_pubkey =
-            PublicKey::parse(&server_pubkey_str).map_err(|error| sqlx::Error::ColumnDecode {
+            PublicKey::parse(&self.server_pubkey).map_err(|error| sqlx::Error::ColumnDecode {
                 index: "server_pubkey".to_string(),
                 source: Box::new(error),
             })?;
 
-        let relay_hint_str: Option<String> = row.try_get("relay_hint")?;
-        let relay_hint = relay_hint_str
+        let relay_hint = self
+            .relay_hint
             .map(|value| {
                 RelayUrl::parse(&value).map_err(|error| sqlx::Error::ColumnDecode {
                     index: "relay_hint".to_string(),
@@ -55,14 +52,17 @@ where
             })
             .transpose()?;
 
-        let created_at = parse_timestamp(row, "created_at")?;
-        let updated_at = parse_timestamp(row, "updated_at")?;
-        let last_shared_at = parse_optional_timestamp(row, "last_shared_at")?;
+        let created_at = parse_timestamp_millis(self.created_at)?;
+        let updated_at = parse_timestamp_millis(self.updated_at)?;
+        let last_shared_at = self
+            .last_shared_at
+            .map(parse_timestamp_millis)
+            .transpose()?;
 
-        Ok(Self {
+        Ok(PushRegistration {
             account_pubkey,
             platform,
-            raw_token,
+            raw_token: self.raw_token,
             server_pubkey,
             relay_hint,
             created_at,
@@ -72,24 +72,44 @@ where
     }
 }
 
+fn parse_timestamp_millis(millis: i64) -> Result<chrono::DateTime<chrono::Utc>, sqlx::Error> {
+    chrono::DateTime::from_timestamp_millis(millis).ok_or_else(|| sqlx::Error::ColumnDecode {
+        index: "timestamp".to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid timestamp millis: {millis}"),
+        )),
+    })
+}
+
 impl PushRegistration {
+    /// Return the push registration for this account, if one exists.
+    ///
+    /// The per-account DB contains at most one row (no WHERE needed).
     #[perf_instrument("db::push_registrations")]
-    pub(crate) async fn find_by_account_pubkey(
+    pub(crate) async fn find(
         account_pubkey: &PublicKey,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let registration = sqlx::query_as::<_, Self>(
-            "SELECT *
+        let row = sqlx::query_as::<_, LocalPushRegRow>(
+            "SELECT platform, raw_token, server_pubkey, relay_hint,
+                    created_at, updated_at, last_shared_at
              FROM push_registrations
-             WHERE account_pubkey = ?",
+             WHERE id = 1",
         )
-        .bind(account_pubkey.to_hex())
-        .fetch_optional(&database.pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(registration)
+        match row {
+            Some(r) => Ok(Some(r.into_push_registration(*account_pubkey)?)),
+            None => Ok(None),
+        }
     }
 
+    /// Create or replace the push registration for this account.
+    ///
+    /// Uses `ON CONFLICT(id)` with a fixed sentinel id (1) to ensure at most
+    /// one row per account DB.
     #[perf_instrument("db::push_registrations")]
     pub(crate) async fn upsert(
         account_pubkey: &PublicKey,
@@ -97,13 +117,13 @@ impl PushRegistration {
         raw_token: &str,
         server_pubkey: &PublicKey,
         relay_hint: Option<&RelayUrl>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let now = Utc::now().timestamp_millis();
 
-        let registration = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalPushRegRow>(
             "INSERT INTO push_registrations (
-                 account_pubkey,
+                 id,
                  platform,
                  raw_token,
                  server_pubkey,
@@ -112,8 +132,8 @@ impl PushRegistration {
                  updated_at,
                  last_shared_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
-             ON CONFLICT(account_pubkey) DO UPDATE SET
+             VALUES (1, ?, ?, ?, ?, ?, ?, NULL)
+             ON CONFLICT(id) DO UPDATE SET
                  platform = excluded.platform,
                  raw_token = excluded.raw_token,
                  server_pubkey = excluded.server_pubkey,
@@ -134,33 +154,27 @@ impl PushRegistration {
                      THEN push_registrations.updated_at
                      ELSE excluded.updated_at
                  END
-             RETURNING *",
+             RETURNING platform, raw_token, server_pubkey, relay_hint,
+                       created_at, updated_at, last_shared_at",
         )
-        .bind(account_pubkey.to_hex())
         .bind(platform.as_str())
         .bind(raw_token)
         .bind(server_pubkey.to_hex())
         .bind(relay_hint.map(super::utils::normalize_relay_url))
         .bind(now)
         .bind(now)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(registration)
+        row.into_push_registration(*account_pubkey)
     }
 
+    /// Delete the push registration for this account.
     #[perf_instrument("db::push_registrations")]
-    pub(crate) async fn delete_by_account_pubkey(
-        account_pubkey: &PublicKey,
-        database: &Database,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "DELETE FROM push_registrations
-             WHERE account_pubkey = ?",
-        )
-        .bind(account_pubkey.to_hex())
-        .execute(&database.pool)
-        .await?;
+    pub(crate) async fn delete(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM push_registrations")
+            .execute(pool)
+            .await?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -170,25 +184,56 @@ impl PushRegistration {
 mod tests {
     use chrono::{DateTime, Utc};
     use nostr_sdk::{Keys, RelayUrl};
+    use sqlx::SqlitePool;
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+    async fn setup() -> (SqlitePool, PublicKey, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let pool = SqlitePool::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("account.db").display()
+        ))
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE push_registrations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform        TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
+                raw_token       TEXT NOT NULL CHECK (
+                    length(trim(raw_token, ' ' || char(9) || char(10) || char(13))) > 0
+                ),
+                server_pubkey   TEXT NOT NULL,
+                relay_hint      TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                last_shared_at  INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pubkey = Keys::generate().public_key();
+        (pool, pubkey, dir)
+    }
 
     #[tokio::test]
     async fn test_push_registration_upsert_and_replace() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let (pool, account_pubkey, _dir) = setup().await;
         let first_server = Keys::generate().public_key();
         let second_server = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://relay.push.example.com/").unwrap();
 
         let created = PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-a",
             &first_server,
             Some(&relay_hint),
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
@@ -201,12 +246,12 @@ mod tests {
         assert!(created.last_shared_at.is_none());
 
         let replaced = PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Fcm,
             "token-b",
             &second_server,
             None,
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
@@ -217,112 +262,83 @@ mod tests {
         assert_eq!(replaced.created_at, created.created_at);
         assert!(replaced.updated_at >= created.updated_at);
 
-        let stored =
-            PushRegistration::find_by_account_pubkey(&account.pubkey, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let stored = PushRegistration::find(&account_pubkey, &pool)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored, replaced);
     }
 
     #[tokio::test]
-    async fn test_push_registration_delete_and_account_scoping() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account_one = whitenoise.create_identity().await.unwrap();
-        let account_two = whitenoise.create_identity().await.unwrap();
+    async fn test_push_registration_delete() {
+        let (pool, account_pubkey, _dir) = setup().await;
         let server_pubkey = Keys::generate().public_key();
 
         PushRegistration::upsert(
-            &account_one.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-one",
             &server_pubkey,
             None,
-            &whitenoise.database,
-        )
-        .await
-        .unwrap();
-        PushRegistration::upsert(
-            &account_two.pubkey,
-            PushPlatform::Fcm,
-            "token-two",
-            &server_pubkey,
-            None,
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
 
-        let deleted =
-            PushRegistration::delete_by_account_pubkey(&account_one.pubkey, &whitenoise.database)
-                .await
-                .unwrap();
+        let deleted = PushRegistration::delete(&pool).await.unwrap();
         assert!(deleted);
 
-        let account_one_registration =
-            PushRegistration::find_by_account_pubkey(&account_one.pubkey, &whitenoise.database)
-                .await
-                .unwrap();
-        let account_two_registration =
-            PushRegistration::find_by_account_pubkey(&account_two.pubkey, &whitenoise.database)
-                .await
-                .unwrap();
-
-        assert!(account_one_registration.is_none());
-        assert_eq!(account_two_registration.unwrap().raw_token, "token-two");
+        let registration = PushRegistration::find(&account_pubkey, &pool)
+            .await
+            .unwrap();
+        assert!(registration.is_none());
     }
 
     #[tokio::test]
     async fn test_push_registration_upsert_preserves_or_clears_last_shared_at() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let (pool, account_pubkey, _dir) = setup().await;
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://relay.push.example.com").unwrap();
 
         PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
 
         let shared_at_ms = Utc::now().timestamp_millis();
-        sqlx::query(
-            "UPDATE push_registrations
-             SET last_shared_at = ?
-             WHERE account_pubkey = ?",
-        )
-        .bind(shared_at_ms)
-        .bind(account.pubkey.to_hex())
-        .execute(&whitenoise.database.pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE push_registrations SET last_shared_at = ?")
+            .bind(shared_at_ms)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let expected_shared_at = DateTime::from_timestamp_millis(shared_at_ms).unwrap();
 
         let no_op = PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
         assert_eq!(no_op.last_shared_at, Some(expected_shared_at));
 
         let changed = PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-b",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
@@ -331,55 +347,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_push_registration_upsert_preserves_or_advances_updated_at() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let (pool, account_pubkey, _dir) = setup().await;
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://relay.push.example.com").unwrap();
 
         PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
 
         let updated_at_ms = Utc::now().timestamp_millis() - 60_000;
-        sqlx::query(
-            "UPDATE push_registrations
-             SET updated_at = ?
-             WHERE account_pubkey = ?",
-        )
-        .bind(updated_at_ms)
-        .bind(account.pubkey.to_hex())
-        .execute(&whitenoise.database.pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE push_registrations SET updated_at = ?")
+            .bind(updated_at_ms)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let expected_updated_at = DateTime::from_timestamp_millis(updated_at_ms).unwrap();
 
         let no_op = PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
         assert_eq!(no_op.updated_at, expected_updated_at);
 
         let changed = PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "token-b",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap();
@@ -388,21 +398,100 @@ mod tests {
 
     #[tokio::test]
     async fn test_push_registration_upsert_rejects_whitespace_only_token_at_db_level() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let (pool, account_pubkey, _dir) = setup().await;
         let server_pubkey = Keys::generate().public_key();
 
         let error = PushRegistration::upsert(
-            &account.pubkey,
+            &account_pubkey,
             PushPlatform::Apns,
             "   ",
             &server_pubkey,
             None,
-            &whitenoise.database,
+            &pool,
         )
         .await
         .unwrap_err();
 
         assert!(matches!(error, sqlx::Error::Database(_)));
+    }
+
+    /// Two separate account DBs must be fully isolated: upserting or
+    /// deleting in one must not affect the other.
+    #[tokio::test]
+    async fn test_two_account_dbs_are_isolated() {
+        let dir = TempDir::new().unwrap();
+
+        // Account A
+        let pool_a = SqlitePool::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("account_a.db").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE push_registrations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform        TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
+                raw_token       TEXT NOT NULL,
+                server_pubkey   TEXT NOT NULL,
+                relay_hint      TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                last_shared_at  INTEGER
+            )",
+        )
+        .execute(&pool_a)
+        .await
+        .unwrap();
+
+        // Account B
+        let pool_b = SqlitePool::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("account_b.db").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE push_registrations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform        TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
+                raw_token       TEXT NOT NULL,
+                server_pubkey   TEXT NOT NULL,
+                relay_hint      TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                last_shared_at  INTEGER
+            )",
+        )
+        .execute(&pool_b)
+        .await
+        .unwrap();
+
+        let pk_a = Keys::generate().public_key();
+        let pk_b = Keys::generate().public_key();
+        let server = Keys::generate().public_key();
+
+        // Upsert into both
+        PushRegistration::upsert(&pk_a, PushPlatform::Apns, "tok-a", &server, None, &pool_a)
+            .await
+            .unwrap();
+        PushRegistration::upsert(&pk_b, PushPlatform::Fcm, "tok-b", &server, None, &pool_b)
+            .await
+            .unwrap();
+
+        // Delete from A
+        PushRegistration::delete(&pool_a).await.unwrap();
+
+        // B is unaffected
+        let b_reg = PushRegistration::find(&pk_b, &pool_b).await.unwrap();
+        assert!(
+            b_reg.is_some(),
+            "account B registration must survive A's delete"
+        );
+        assert_eq!(b_reg.unwrap().raw_token, "tok-b");
+
+        // A is gone
+        let a_reg = PushRegistration::find(&pk_a, &pool_a).await.unwrap();
+        assert!(a_reg.is_none(), "account A registration must be deleted");
     }
 }

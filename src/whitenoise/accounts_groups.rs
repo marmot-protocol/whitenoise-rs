@@ -7,10 +7,12 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::perf_instrument;
+use sqlx::SqlitePool;
+
 use crate::whitenoise::{
-    Whitenoise, accounts::Account, aggregated_message::AggregatedMessage,
-    chat_list_streaming::ChatListUpdateTrigger, database::Database, drafts::Draft,
-    error::WhitenoiseError, group_state_streaming::GroupStateUpdate,
+    Whitenoise, accounts::Account, chat_list_streaming::ChatListUpdateTrigger,
+    database::media_files::MediaFile, error::WhitenoiseError, group_information::GroupInformation,
+    push_notifications::GroupPushToken,
 };
 
 /// Represents the relationship between an account and an MLS group.
@@ -74,7 +76,7 @@ pub(crate) const MUTE_FOREVER: DateTime<Utc> = {
     }
 };
 
-/// Mute duration for [`Whitenoise::mute_chat`].
+/// Mute duration for `AccountSession::membership().for_group().mute()`.
 ///
 /// Use a preset variant for common durations or [`MuteDuration::Custom`] for an
 /// arbitrary expiry timestamp. All variants resolve to a future [`DateTime<Utc>`]
@@ -93,7 +95,7 @@ pub enum MuteDuration {
     #[serde(rename = "forever")]
     Forever,
     /// Arbitrary expiry timestamp for callers that need a duration not covered
-    /// by the preset variants. The timestamp must be in the future; [`Whitenoise::mute_chat`]
+    /// by the preset variants. The timestamp must be in the future; `AccountSession::membership().for_group().mute()`
     /// will return [`WhitenoiseError::InvalidInput`] if it is not.
     #[serde(rename = "custom")]
     Custom(DateTime<Utc>),
@@ -211,9 +213,9 @@ impl AccountGroup {
     pub(crate) async fn chat_cleared_at_ms(
         pubkey: &PublicKey,
         group_id: &GroupId,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Option<i64>, WhitenoiseError> {
-        let account_group = Self::find_by_account_and_group(pubkey, group_id, database)
+        let account_group = Self::find_by_account_and_group(pubkey, group_id, pool)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
         Ok(account_group
@@ -233,27 +235,15 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         dm_peer_pubkey: Option<&PublicKey>,
     ) -> Result<(Self, bool), WhitenoiseError> {
+        let session = whitenoise.require_session(account_pubkey)?;
         let (account_group, was_created) = Self::find_or_create(
             account_pubkey,
             mls_group_id,
             dm_peer_pubkey,
-            &whitenoise.database,
+            &session.account_db.inner.pool,
         )
         .await?;
         Ok((account_group, was_created))
-    }
-
-    /// Gets an AccountGroup for the given account and group, if it exists.
-    #[perf_instrument("account_groups")]
-    pub async fn get(
-        whitenoise: &Whitenoise,
-        account_pubkey: &PublicKey,
-        mls_group_id: &GroupId,
-    ) -> Result<Option<Self>, WhitenoiseError> {
-        let account_group =
-            Self::find_by_account_and_group(account_pubkey, mls_group_id, &whitenoise.database)
-                .await?;
-        Ok(account_group)
     }
 
     /// Gets all visible AccountGroups for the given account.
@@ -263,7 +253,9 @@ impl AccountGroup {
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let groups = Self::find_visible_for_account(account_pubkey, &whitenoise.database).await?;
+        let session = whitenoise.require_session(account_pubkey)?;
+        let groups =
+            Self::find_visible_for_account(account_pubkey, &session.account_db.inner.pool).await?;
         Ok(groups)
     }
 
@@ -273,15 +265,18 @@ impl AccountGroup {
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let groups = Self::find_pending_for_account(account_pubkey, &whitenoise.database).await?;
+        let session = whitenoise.require_session(account_pubkey)?;
+        let groups =
+            Self::find_pending_for_account(account_pubkey, &session.account_db.inner.pool).await?;
         Ok(groups)
     }
 
     /// Accepts this group invite by setting user_confirmation to true.
     #[perf_instrument("account_groups")]
     pub async fn accept(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
+        let session = whitenoise.require_session(&self.account_pubkey)?;
         let updated = self
-            .update_user_confirmation(true, &whitenoise.database)
+            .update_user_confirmation(true, &session.account_db.inner.pool)
             .await?;
         Ok(updated)
     }
@@ -297,9 +292,9 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         peer_pubkey: &PublicKey,
     ) -> Result<Option<GroupId>, WhitenoiseError> {
+        let session = whitenoise.require_session(account_pubkey)?;
         let group_id =
-            Self::find_dm_group_id_by_peer(account_pubkey, peer_pubkey, &whitenoise.database)
-                .await?;
+            Self::find_dm_group_id_by_peer(peer_pubkey, &session.account_db.inner.pool).await?;
         Ok(group_id)
     }
 
@@ -307,8 +302,9 @@ impl AccountGroup {
     /// The group will be hidden from the UI but remains in MLS.
     #[perf_instrument("account_groups")]
     pub async fn decline(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
+        let session = whitenoise.require_session(&self.account_pubkey)?;
         let updated = self
-            .update_user_confirmation(false, &whitenoise.database)
+            .update_user_confirmation(false, &session.account_db.inner.pool)
             .await?;
         Ok(updated)
     }
@@ -316,8 +312,9 @@ impl AccountGroup {
     /// Archives this chat by setting archived_at to the current time.
     #[perf_instrument("account_groups")]
     pub async fn archive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
+        let session = whitenoise.require_session(&self.account_pubkey)?;
         let updated = self
-            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .update_archived_at(Some(Utc::now()), &session.account_db.inner.pool)
             .await?;
         Ok(updated)
     }
@@ -325,7 +322,10 @@ impl AccountGroup {
     /// Unarchives this chat by clearing archived_at.
     #[perf_instrument("account_groups")]
     pub async fn unarchive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
-        let updated = self.update_archived_at(None, &whitenoise.database).await?;
+        let session = whitenoise.require_session(&self.account_pubkey)?;
+        let updated = self
+            .update_archived_at(None, &session.account_db.inner.pool)
+            .await?;
         Ok(updated)
     }
 
@@ -336,8 +336,9 @@ impl AccountGroup {
         until: DateTime<Utc>,
         whitenoise: &Whitenoise,
     ) -> Result<Self, WhitenoiseError> {
+        let session = whitenoise.require_session(&self.account_pubkey)?;
         let updated = self
-            .update_muted_until(Some(until), &whitenoise.database)
+            .update_muted_until(Some(until), &session.account_db.inner.pool)
             .await?;
         Ok(updated)
     }
@@ -345,7 +346,10 @@ impl AccountGroup {
     /// Unmutes this chat by clearing muted_until.
     #[perf_instrument("account_groups")]
     pub async fn unmute(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
-        let updated = self.update_muted_until(None, &whitenoise.database).await?;
+        let session = whitenoise.require_session(&self.account_pubkey)?;
+        let updated = self
+            .update_muted_until(None, &session.account_db.inner.pool)
+            .await?;
         Ok(updated)
     }
 
@@ -356,7 +360,8 @@ impl AccountGroup {
         &self,
         whitenoise: &Whitenoise,
     ) -> Result<Option<Self>, WhitenoiseError> {
-        self.mark_removed_atomic(&whitenoise.database)
+        let session = whitenoise.require_session(&self.account_pubkey)?;
+        self.mark_removed_atomic(&session.account_db.inner.pool)
             .await
             .map_err(WhitenoiseError::from)
     }
@@ -368,426 +373,14 @@ impl AccountGroup {
         &self,
         whitenoise: &Whitenoise,
     ) -> Result<Option<Self>, WhitenoiseError> {
-        self.mark_left_atomic(&whitenoise.database)
+        let session = whitenoise.require_session(&self.account_pubkey)?;
+        self.mark_left_atomic(&session.account_db.inner.pool)
             .await
             .map_err(WhitenoiseError::from)
     }
 }
 
 impl Whitenoise {
-    /// Gets or creates an AccountGroup for the given account and MLS group.
-    ///
-    /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
-    /// so it can be persisted for efficient lookups.
-    #[perf_instrument("account_groups")]
-    pub async fn get_or_create_account_group(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-        dm_peer_pubkey: Option<&PublicKey>,
-    ) -> Result<(AccountGroup, bool), WhitenoiseError> {
-        AccountGroup::get_or_create(self, &account.pubkey, mls_group_id, dm_peer_pubkey).await
-    }
-
-    /// Gets all visible AccountGroups for the given account.
-    #[perf_instrument("account_groups")]
-    pub async fn get_visible_account_groups(
-        &self,
-        account: &Account,
-    ) -> Result<Vec<AccountGroup>, WhitenoiseError> {
-        AccountGroup::visible_for_account(self, &account.pubkey).await
-    }
-
-    /// Gets all pending AccountGroups for the given account.
-    #[perf_instrument("account_groups")]
-    pub async fn get_pending_account_groups(
-        &self,
-        account: &Account,
-    ) -> Result<Vec<AccountGroup>, WhitenoiseError> {
-        AccountGroup::pending_for_account(self, &account.pubkey).await
-    }
-
-    /// Accepts a group invite for the given account and MLS group.
-    #[perf_instrument("account_groups")]
-    pub async fn accept_account_group(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-        let accepted = account_group.accept(self).await?;
-
-        // Best-effort: share the local push token now that the group is accepted.
-        if let Err(error) = self
-            .share_local_push_token_to_group(account, mls_group_id)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::accounts_groups",
-                account = %account.pubkey.to_hex(),
-                group = %hex::encode(mls_group_id.as_slice()),
-                error = %error,
-                "Failed to share local push token after accepting group"
-            );
-        }
-
-        Ok(accepted)
-    }
-
-    /// Declines a group invite for the given account and MLS group.
-    #[perf_instrument("account_groups")]
-    pub async fn decline_account_group(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-        let declined = account_group.decline(self).await?;
-
-        // Best-effort: remove any push token previously shared under the old behavior.
-        if let Err(error) = self
-            .remove_local_push_token_from_group(account, mls_group_id)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::accounts_groups",
-                account = %account.pubkey.to_hex(),
-                group = %hex::encode(mls_group_id.as_slice()),
-                error = %error,
-                "Failed to remove local push token after declining group"
-            );
-        }
-
-        Ok(declined)
-    }
-
-    /// Marks a message as read for the given account.
-    ///
-    /// Looks up the message to find its group, then atomically updates the
-    /// last_read_message_id only if the new message is newer than the current
-    /// read marker. This prevents regression when messages arrive out of order
-    /// or when the UI marks an older message as read after a newer one.
-    #[perf_instrument("account_groups")]
-    pub async fn mark_message_read(
-        &self,
-        account: &Account,
-        message_id: &EventId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let message = AggregatedMessage::find_by_message_id(message_id, &self.database)
-            .await?
-            .ok_or(WhitenoiseError::MessageNotFound)?;
-
-        let account_group = AccountGroup::get(self, &account.pubkey, &message.mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        // Atomic compare-and-update: only advances if newer
-        let message_created_at_ms = message.created_at.timestamp_millis();
-        if let Some(updated) = account_group
-            .update_last_read_if_newer(message_id, message_created_at_ms, &self.database)
-            .await?
-        {
-            return Ok(updated);
-        }
-
-        // Update was skipped (message not newer), return current state
-        Ok(account_group)
-    }
-
-    /// Gets the last read message ID for an account in a group.
-    #[perf_instrument("account_groups")]
-    pub async fn get_last_read_message_id(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<Option<EventId>, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
-        Ok(account_group.and_then(|ag| ag.last_read_message_id))
-    }
-
-    /// Sets the pin order for a chat.
-    ///
-    /// - `None` = unpin the chat
-    /// - `Some(n)` = pin the chat with order n (lower values appear first)
-    #[perf_instrument("account_groups")]
-    pub async fn set_chat_pin_order(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-        pin_order: Option<i64>,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let updated = account_group
-            .update_pin_order(pin_order, &self.database)
-            .await?;
-
-        Ok(updated)
-    }
-
-    /// Archives a chat for the given account.
-    ///
-    /// Idempotent: if already archived, returns the existing state unchanged.
-    #[perf_instrument("account_groups")]
-    pub async fn archive_chat(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        if account_group.is_archived() {
-            return Ok(account_group);
-        }
-
-        let updated = account_group.archive(self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatArchiveChanged,
-        )
-        .await;
-        Ok(updated)
-    }
-
-    /// Unarchives a chat for the given account.
-    ///
-    /// Idempotent: if not archived, returns the existing state unchanged.
-    #[perf_instrument("account_groups")]
-    pub async fn unarchive_chat(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        if !account_group.is_archived() {
-            return Ok(account_group);
-        }
-
-        let updated = account_group.unarchive(self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatArchiveChanged,
-        )
-        .await;
-        Ok(updated)
-    }
-
-    /// Mutes a chat for the given account for the specified duration.
-    ///
-    /// Re-muting with a different duration always overwrites the previous
-    /// `muted_until` value. Use [`MuteDuration::Forever`] to mute indefinitely.
-    /// Returns [`WhitenoiseError::InvalidInput`] if [`MuteDuration::Custom`] carries
-    /// a timestamp that is not in the future.
-    #[perf_instrument("account_groups")]
-    pub async fn mute_chat(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-        duration: MuteDuration,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let until = duration.to_expiry();
-        if until <= Utc::now() {
-            return Err(WhitenoiseError::InvalidInput(
-                "mute_chat: `until` must be in the future".to_string(),
-            ));
-        }
-
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let updated = account_group.mute(until, self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatMuteChanged,
-        )
-        .await;
-        Ok(updated)
-    }
-
-    /// Unmutes a chat for the given account.
-    ///
-    /// Always clears `muted_until` and emits `ChatMuteChanged`, even if the
-    /// mute has already expired. This ensures an explicit "Unmute" action is
-    /// immediate rather than waiting for the background cleanup task.
-    #[perf_instrument("account_groups")]
-    pub async fn unmute_chat(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let updated = account_group.unmute(self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatMuteChanged,
-        )
-        .await;
-        Ok(updated)
-    }
-
-    /// Marks a group as voluntarily departed for the given account.
-    ///
-    /// Idempotent. Emits [`ChatListUpdateTrigger::LeftGroup`] when the row changes.
-    #[perf_instrument("account_groups")]
-    pub(crate) async fn mark_as_left(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let Some(updated) = account_group.mark_left(self).await? else {
-            // Already departed (left or removed) — reload current state.
-            let current = AccountGroup::get(self, &account.pubkey, mls_group_id)
-                .await?
-                .ok_or(WhitenoiseError::GroupNotFound)?;
-            return Ok(current);
-        };
-
-        self.emit_chat_list_update(account, mls_group_id, ChatListUpdateTrigger::LeftGroup)
-            .await;
-        self.group_state_stream_manager.emit(
-            &account.pubkey,
-            mls_group_id,
-            GroupStateUpdate::LeftGroup,
-        );
-
-        Ok(updated)
-    }
-
-    /// Marks a group as removed for the given account.
-    ///
-    /// Idempotent. Emits [`ChatListUpdateTrigger::RemovedFromGroup`] when the row changes.
-    #[perf_instrument("account_groups")]
-    pub(crate) async fn mark_as_removed(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let Some(updated) = account_group.mark_removed(self).await? else {
-            // Another task won the atomic update — reload the current row so
-            // we return the persisted removed_at rather than the stale pre-load value.
-            let current = AccountGroup::get(self, &account.pubkey, mls_group_id)
-                .await?
-                .ok_or(WhitenoiseError::GroupNotFound)?;
-            return Ok(current);
-        };
-
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::RemovedFromGroup,
-        )
-        .await;
-        self.group_state_stream_manager.emit(
-            &account.pubkey,
-            mls_group_id,
-            GroupStateUpdate::RemovedFromGroup,
-        );
-
-        Ok(updated)
-    }
-
-    /// Returns the group ID of the latest DM group between the account and the
-    /// given peer, or `None` if no DM group exists between them.
-    #[perf_instrument("account_groups")]
-    pub async fn get_dm_group_with_peer(
-        &self,
-        account: &Account,
-        peer_pubkey: &PublicKey,
-    ) -> Result<Option<GroupId>, WhitenoiseError> {
-        AccountGroup::find_latest_dm_group_with_peer(self, &account.pubkey, peer_pubkey).await
-    }
-
-    /// Clears all messages from this account's view by setting a per-account
-    /// timestamp floor. Messages at or before the current time are hidden.
-    ///
-    /// The group remains in the chat list with no visible messages. This is a
-    /// local-only operation with no protocol-level side effects.
-    ///
-    /// Works correctly in multi-account scenarios: each account's
-    /// `chat_cleared_at` is independent. Messages are only physically deleted
-    /// when all accounts sharing the group have cleared.
-    #[perf_instrument("account_groups")]
-    pub async fn clear_chat(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<(), WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        account_group
-            .clear_chat_state(Utc::now(), &self.database)
-            .await?;
-
-        if let Err(e) = Draft::delete(&account.pubkey, group_id, &self.database).await {
-            tracing::warn!(
-                target: "whitenoise::accounts_groups",
-                "Failed to delete draft during clear_chat: {}",
-                e
-            );
-        }
-
-        if let Err(e) = self.database.try_cleanup_cleared_messages(group_id).await {
-            tracing::warn!(
-                target: "whitenoise::accounts_groups",
-                "Failed to cleanup cleared messages: {}",
-                e
-            );
-        }
-
-        match self.create_mdk_for_account(account.pubkey) {
-            Ok(mdk) => {
-                if let Err(e) = mdk.delete_messages_for_group(group_id) {
-                    tracing::warn!(
-                        target: "whitenoise::accounts_groups",
-                        "Failed to delete MDK messages during clear_chat: {}",
-                        e
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::accounts_groups",
-                    "Failed to create MDK for clear_chat message cleanup: {}",
-                    e
-                );
-            }
-        }
-
-        self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::ChatCleared)
-            .await;
-
-        Ok(())
-    }
-
     /// Deletes all local data for a group from this account's perspective.
     ///
     /// The chat disappears from the account's chat list entirely. This is a
@@ -806,22 +399,93 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<(), WhitenoiseError> {
-        // 1. Verify the AccountGroup exists
-        let Some(_account_group) = AccountGroup::get(self, &account.pubkey, group_id).await? else {
+        // 1. Look up session for account-DB access
+        let session = self
+            .account_manager
+            .get_session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+
+        // 2. Verify the AccountGroup exists
+        let Some(_account_group) = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            group_id,
+            &session.account_db.inner.pool,
+        )
+        .await?
+        else {
             return Err(WhitenoiseError::GroupNotFound);
         };
 
-        // 2. Pre-build the ChatListItem while data still exists
-        //    (MDK state and DB data are needed for build_chat_list_item)
-        let chat_list_item = self.build_chat_list_item(account, group_id).await;
+        // 3. Pre-build the ChatListItem while data still exists
+        //    (MDK state and DB data are needed to build the item)
+        let chat_list_item = session.chat_list().build_item(group_id).await;
 
-        // 3. Delete all DB data in a transaction (fallible — must run before
-        //    non-rollbackable MDK cleanup so a DB failure leaves state intact)
-        self.database
-            .delete_chat_data(&account.pubkey, group_id)
+        // 4. Delete per-account accounts_groups row
+        AccountGroup::delete_for_group(group_id, &session.account_db.inner.pool).await?;
+
+        // Delete per-account aggregated_messages for this group. Order doesn't
+        // matter relative to the steps below: there's no FK between
+        // accounts_groups and aggregated_messages, and message_delivery_status
+        // cascades via the intra-DB FK on aggregated_messages.
+        crate::whitenoise::aggregated_message::AggregatedMessage::delete_by_group(
+            group_id,
+            &session.account_db.inner,
+        )
+        .await?;
+
+        // 4a. Check if any other account still has this group.
+        // We can only inspect active sessions, not every persisted account.
+        // If inactive accounts exist, conservatively keep shared data — the
+        // orphaned rows will be cleaned up on next login or full GC pass.
+        let total_accounts = Account::count(&self.shared.database).await?;
+        let mut sessions_checked: i64 = 0;
+        let mut other_has_group = false;
+        for other_session in self.account_manager.sessions_iter() {
+            if other_session.account_pubkey == account.pubkey {
+                continue;
+            }
+            sessions_checked += 1;
+            let exists =
+                AccountGroup::exists_for_group(group_id, &other_session.account_db.inner.pool)
+                    .await?;
+            if exists {
+                other_has_group = true;
+                break;
+            }
+        }
+        // If we couldn't verify all other accounts, be conservative.
+        if !other_has_group && sessions_checked + 1 < total_accounts {
+            tracing::warn!(
+                target: "whitenoise::accounts_groups",
+                checked = sessions_checked,
+                total = total_accounts,
+                "Not all accounts have active sessions; \
+                 skipping shared data deletion to be safe"
+            );
+            other_has_group = true;
+        }
+
+        // 4b. Delete shared group data if this was the last account
+        self.shared
+            .database
+            .delete_shared_group_data(group_id, !other_has_group)
             .await?;
 
-        // 4. Delete MDK group state for this account (best-effort)
+        // 4b. Delete per-account group_push_tokens for this group
+        GroupPushToken::delete_by_group(group_id, &session.account_db.inner.pool).await?;
+
+        // 4c. Delete per-account media_references for this group
+        MediaFile::delete_references_for_group(&session.account_db.inner.pool, group_id).await?;
+
+        // 4d. Delete per-account drafts for this group (best-effort)
+        if let Err(e) = session.repos.drafts.delete(group_id).await {
+            tracing::warn!(
+                target: "whitenoise::accounts_groups",
+                "Failed to delete draft during delete_chat: {e}"
+            );
+        }
+
+        // 5. Delete MDK group state for this account (best-effort)
         match self.create_mdk_for_account(account.pubkey) {
             Ok(mdk) => {
                 if let Err(e) = mdk.delete_group(group_id) {
@@ -841,9 +505,12 @@ impl Whitenoise {
             }
         }
 
-        // 5. Clean up orphaned media files from disk
-        let media_files =
-            crate::whitenoise::media_files::MediaFiles::new(&self.storage, &self.database);
+        // 6. Clean up orphaned media files from disk
+        let media_files = crate::whitenoise::media_files::MediaFiles::new(
+            &self.shared.storage,
+            &self.shared.database,
+            &session.account_db.inner.pool,
+        );
         if let Err(e) = media_files.cleanup_orphaned_files().await {
             tracing::warn!(
                 target: "whitenoise::accounts_groups",
@@ -858,9 +525,11 @@ impl Whitenoise {
                 trigger: ChatListUpdateTrigger::ChatDeleted,
                 item,
             };
-            self.chat_list_stream_manager
+            self.shared
+                .chat_list_stream_manager
                 .emit(&account.pubkey, update.clone());
-            self.archived_chat_list_stream_manager
+            self.shared
+                .archived_chat_list_stream_manager
                 .emit(&account.pubkey, update);
         }
 
@@ -877,41 +546,51 @@ impl Whitenoise {
     /// `dm_peer_pubkey`, then resolves the peer from MLS membership. Intended
     /// to be called once at startup.
     pub(crate) async fn backfill_dm_peer_pubkeys(&self) -> Result<(), WhitenoiseError> {
-        let accounts = crate::whitenoise::accounts::Account::all(&self.database).await?;
+        for session in self.account_manager.sessions_iter() {
+            let candidates =
+                AccountGroup::find_groups_missing_peer(&session.account_db.inner.pool).await?;
 
-        for account in &accounts {
-            let group_ids =
-                AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &self.database).await?;
-
-            if group_ids.is_empty() {
+            if candidates.is_empty() {
                 continue;
             }
 
-            let mdk = match self.create_mdk_for_account(account.pubkey) {
+            let mdk = match self.create_mdk_for_account(session.account_pubkey) {
                 Ok(mdk) => mdk,
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::accounts_groups",
                         "Failed to create MDK for account {}: {}",
-                        account.pubkey, e
+                        session.account_pubkey, e
                     );
                     continue;
                 }
             };
 
-            for group_id in group_ids {
+            for group_id in candidates {
+                // Filter to DM groups using shared DB
+                let is_dm = GroupInformation::is_dm(&group_id, &self.shared.database).await?;
+                if !is_dm {
+                    continue;
+                }
+
                 let members = match mdk.get_members(&group_id) {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "whitenoise::accounts_groups",
+                            group = %hex::encode(group_id.as_slice()),
+                            "get_members failed during DM peer backfill: {e}"
+                        );
+                        continue;
+                    }
                 };
 
-                let peer = members.iter().find(|pk| **pk != account.pubkey);
+                let peer = members.iter().find(|pk| **pk != session.account_pubkey);
                 if let Some(peer_pubkey) = peer
                     && let Err(e) = AccountGroup::update_dm_peer_pubkey(
-                        &account.pubkey,
                         &group_id,
                         peer_pubkey,
-                        &self.database,
+                        &session.account_db.inner.pool,
                     )
                     .await
                 {
@@ -932,9 +611,21 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whitenoise::aggregated_message::AggregatedMessage;
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::group_state_streaming::GroupStateUpdate;
     use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
+
+    /// Helper to get the per-account pool from a Whitenoise instance + account pubkey.
+    fn account_pool(whitenoise: &Whitenoise, pubkey: &PublicKey) -> SqlitePool {
+        whitenoise
+            .require_session(pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool
+            .clone()
+    }
 
     #[tokio::test]
     async fn test_account_group_visibility_methods() {
@@ -944,7 +635,11 @@ mod tests {
 
         // Create a pending group
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -969,7 +664,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[2; 32]);
 
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -989,13 +688,21 @@ mod tests {
 
         // Create pending group
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Accept via Whitenoise method
         let accepted = whitenoise
-            .accept_account_group(&account, &group_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .accept()
             .await
             .unwrap();
 
@@ -1010,13 +717,21 @@ mod tests {
 
         // Create pending group
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Decline via Whitenoise method
         let declined = whitenoise
-            .decline_account_group(&account, &group_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .decline()
             .await
             .unwrap();
 
@@ -1033,24 +748,39 @@ mod tests {
         let group_id3 = GroupId::from_slice(&[7; 32]); // declined
 
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id1, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id1)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id2, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id2)
+            .get_or_create(None)
             .await
             .unwrap();
         ag2.accept(&whitenoise).await.unwrap();
 
         let (ag3, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id3, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id3)
+            .get_or_create(None)
             .await
             .unwrap();
         ag3.decline(&whitenoise).await.unwrap();
 
         let visible = whitenoise
-            .get_visible_account_groups(&account)
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .visible_groups()
             .await
             .unwrap();
 
@@ -1070,18 +800,29 @@ mod tests {
         let group_id2 = GroupId::from_slice(&[9; 32]); // accepted
 
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id1, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id1)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id2, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id2)
+            .get_or_create(None)
             .await
             .unwrap();
         ag2.accept(&whitenoise).await.unwrap();
 
         let pending = whitenoise
-            .get_pending_account_groups(&account)
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .pending_groups()
             .await
             .unwrap();
 
@@ -1095,7 +836,13 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[11; 32]);
 
-        let result = whitenoise.accept_account_group(&account, &group_id).await;
+        let result = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .accept()
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1110,7 +857,13 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[12; 32]);
 
-        let result = whitenoise.decline_account_group(&account, &group_id).await;
+        let result = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .decline()
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1125,9 +878,13 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[13; 32]);
 
-        let result = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap();
+        let result = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_none());
     }
@@ -1140,14 +897,22 @@ mod tests {
 
         // Create an account group first
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Now get should return it
-        let result = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap();
+        let result = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_some());
         let ag = result.unwrap();
@@ -1163,14 +928,22 @@ mod tests {
 
         // First call creates
         let (_, was_created1) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         assert!(was_created1);
 
         // Second call finds existing
         let (_, was_created2) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         assert!(!was_created2);
@@ -1185,16 +958,24 @@ mod tests {
 
         // Both accounts can have the same group
         let (ag1, _) = whitenoise
-            .get_or_create_account_group(&account1, &group_id, None)
+            .require_session(&account1.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account2, &group_id, None)
+            .require_session(&account2.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
-        // Different records for different accounts
-        assert_ne!(ag1.id, ag2.id);
+        // Both accounts have the group (in separate per-account DBs)
+        assert_eq!(ag1.mls_group_id, ag2.mls_group_id);
 
         // Can have different confirmation states
         let accepted = ag1.accept(&whitenoise).await.unwrap();
@@ -1213,11 +994,19 @@ mod tests {
         let group_id2 = GroupId::from_slice(&[18; 32]);
 
         let (ag1, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id1, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id1)
+            .get_or_create(None)
             .await
             .unwrap();
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id2, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id2)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1227,7 +1016,10 @@ mod tests {
 
         // No pending groups should remain
         let pending = whitenoise
-            .get_pending_account_groups(&account)
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .pending_groups()
             .await
             .unwrap();
         assert!(pending.is_empty());
@@ -1240,7 +1032,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[19; 32]);
 
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1259,7 +1055,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[20; 32]);
 
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1278,15 +1078,27 @@ mod tests {
 
         // Create 3 groups for the same account
         let (ag1, c1) = whitenoise
-            .get_or_create_account_group(&account, &group_id1, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id1)
+            .get_or_create(None)
             .await
             .unwrap();
         let (ag2, c2) = whitenoise
-            .get_or_create_account_group(&account, &group_id2, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id2)
+            .get_or_create(None)
             .await
             .unwrap();
         let (ag3, c3) = whitenoise
-            .get_or_create_account_group(&account, &group_id3, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id3)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1305,7 +1117,10 @@ mod tests {
         let fake_message_id = EventId::all_zeros();
 
         let result = whitenoise
-            .mark_message_read(&account, &fake_message_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&fake_message_id)
             .await;
 
         assert!(matches!(result, Err(WhitenoiseError::MessageNotFound)));
@@ -1319,12 +1134,20 @@ mod tests {
 
         // Create account group first
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let result = whitenoise
-            .get_last_read_message_id(&account, &group_id)
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .last_read_message_id()
             .await
             .unwrap();
 
@@ -1339,7 +1162,11 @@ mod tests {
 
         // Don't create account group - it shouldn't exist
         let result = whitenoise
-            .get_last_read_message_id(&account, &group_id)
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .last_read_message_id()
             .await
             .unwrap();
 
@@ -1356,12 +1183,16 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1373,12 +1204,13 @@ mod tests {
         let older_msg_id = EventId::from_hex(&format!("{:0>64}", "aaa")).unwrap();
         let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "bbb")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             older_msg_id,
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1388,21 +1220,27 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
 
         // Mark older message as read first
         let ag = whitenoise
-            .mark_message_read(&account, &older_msg_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&older_msg_id)
             .await
             .unwrap();
         assert_eq!(ag.last_read_message_id, Some(older_msg_id));
 
         // Mark newer message as read - should update
         let ag = whitenoise
-            .mark_message_read(&account, &newer_msg_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&newer_msg_id)
             .await
             .unwrap();
         assert_eq!(ag.last_read_message_id, Some(newer_msg_id));
@@ -1418,12 +1256,16 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1435,12 +1277,13 @@ mod tests {
         let older_msg_id = EventId::from_hex(&format!("{:0>64}", "ccc")).unwrap();
         let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "ddd")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             older_msg_id,
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1450,21 +1293,27 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
 
         // Mark NEWER message as read first
         let ag = whitenoise
-            .mark_message_read(&account, &newer_msg_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&newer_msg_id)
             .await
             .unwrap();
         assert_eq!(ag.last_read_message_id, Some(newer_msg_id));
 
         // Attempt to mark OLDER message as read - should be a no-op
         let ag = whitenoise
-            .mark_message_read(&account, &older_msg_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&older_msg_id)
             .await
             .unwrap();
         // Should still be the newer message
@@ -1481,12 +1330,16 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1496,12 +1349,13 @@ mod tests {
         let first_msg_id = EventId::from_hex(&format!("{:0>64}", "eee")).unwrap();
         let second_msg_id = EventId::from_hex(&format!("{:0>64}", "fff")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             first_msg_id,
             group_id.clone(),
             account.pubkey,
             same_time,
-            &whitenoise.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1511,21 +1365,27 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             same_time,
-            &whitenoise.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
 
         // Mark first message as read
         let ag = whitenoise
-            .mark_message_read(&account, &first_msg_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&first_msg_id)
             .await
             .unwrap();
         assert_eq!(ag.last_read_message_id, Some(first_msg_id));
 
         // Mark second message with same timestamp - should NOT update (equal is not newer)
         let ag = whitenoise
-            .mark_message_read(&account, &second_msg_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&second_msg_id)
             .await
             .unwrap();
         assert_eq!(ag.last_read_message_id, Some(first_msg_id));
@@ -1539,13 +1399,21 @@ mod tests {
 
         // Create account group first
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Pin the chat
         let pinned = whitenoise
-            .set_chat_pin_order(&account, &group_id, Some(100))
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .set_pin_order(Some(100))
             .await
             .unwrap();
 
@@ -1560,17 +1428,29 @@ mod tests {
 
         // Create and pin account group
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         whitenoise
-            .set_chat_pin_order(&account, &group_id, Some(100))
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .set_pin_order(Some(100))
             .await
             .unwrap();
 
         // Unpin the chat
         let unpinned = whitenoise
-            .set_chat_pin_order(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .set_pin_order(None)
             .await
             .unwrap();
 
@@ -1585,17 +1465,29 @@ mod tests {
 
         // Create and pin account group
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         whitenoise
-            .set_chat_pin_order(&account, &group_id, Some(100))
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .set_pin_order(Some(100))
             .await
             .unwrap();
 
         // Update pin order
         let updated = whitenoise
-            .set_chat_pin_order(&account, &group_id, Some(50))
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .set_pin_order(Some(50))
             .await
             .unwrap();
 
@@ -1610,7 +1502,11 @@ mod tests {
 
         // Don't create account group - it shouldn't exist
         let result = whitenoise
-            .set_chat_pin_order(&account, &group_id, Some(100))
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .set_pin_order(Some(100))
             .await;
 
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
@@ -1623,7 +1519,10 @@ mod tests {
         let other = whitenoise.create_identity().await.unwrap();
 
         let result = whitenoise
-            .get_dm_group_with_peer(&account, &other.pubkey)
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .dm_group_with_peer(&other.pubkey)
             .await
             .unwrap();
 
@@ -1639,17 +1538,18 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
         let result = whitenoise
-            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .dm_group_with_peer(&member.pubkey)
             .await
             .unwrap();
 
@@ -1665,17 +1565,18 @@ mod tests {
         // Create a regular group (not a DM) with the same member
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::Group),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::Group))
             .await
             .unwrap();
 
         let result = whitenoise
-            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .dm_group_with_peer(&member.pubkey)
             .await
             .unwrap();
 
@@ -1692,12 +1593,10 @@ mod tests {
         let mut config1 = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config1.name = String::new();
         let _older_group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config1,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config1, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
@@ -1708,17 +1607,18 @@ mod tests {
         let mut config2 = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config2.name = String::new();
         let newer_group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config2,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config2, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
         let result = whitenoise
-            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .dm_group_with_peer(&member.pubkey)
             .await
             .unwrap();
 
@@ -1734,23 +1634,28 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let group = whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
         // Decline the group
         whitenoise
-            .decline_account_group(&creator, &group.mls_group_id)
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .decline()
             .await
             .unwrap();
 
         let result = whitenoise
-            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .dm_group_with_peer(&member.pubkey)
             .await
             .unwrap();
 
@@ -1767,18 +1672,19 @@ mod tests {
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         whitenoise
-            .create_group(
-                &creator,
-                vec![member.pubkey],
-                config,
-                Some(GroupType::DirectMessage),
-            )
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
             .await
             .unwrap();
 
         // Search for a DM with a different user
         let result = whitenoise
-            .get_dm_group_with_peer(&creator, &stranger.pubkey)
+            .session(&creator.pubkey)
+            .unwrap()
+            .membership()
+            .dm_group_with_peer(&stranger.pubkey)
             .await
             .unwrap();
 
@@ -1792,7 +1698,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[100; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1807,7 +1717,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[101; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1832,7 +1746,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[102; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         let first = ag
@@ -1843,7 +1761,11 @@ mod tests {
 
         // Second call via mark_as_removed must be a no-op (atomic WHERE removed_at IS NULL)
         let second = whitenoise
-            .mark_as_removed(&account, &group_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_removed()
             .await
             .unwrap();
 
@@ -1857,7 +1779,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[103; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         let removed = ag
@@ -1879,7 +1805,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[110; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -1895,12 +1825,20 @@ mod tests {
         let group_id = GroupId::from_slice(&[111; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let muted = whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::OneHour)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::OneHour)
             .await
             .unwrap();
 
@@ -1923,12 +1861,20 @@ mod tests {
         let group_id = GroupId::from_slice(&[112; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let muted = whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::Forever)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::Forever)
             .await
             .unwrap();
 
@@ -1944,18 +1890,33 @@ mod tests {
         let group_id = GroupId::from_slice(&[113; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Mute first
         whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::Forever)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::Forever)
             .await
             .unwrap();
 
         // Unmute
-        let unmuted = whitenoise.unmute_chat(&account, &group_id).await.unwrap();
+        let unmuted = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .unmute()
+            .await
+            .unwrap();
 
         assert!(!unmuted.is_muted());
         assert!(!unmuted.is_muted_forever());
@@ -1969,12 +1930,23 @@ mod tests {
         let group_id = GroupId::from_slice(&[114; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Unmute without ever muting — should succeed without error
-        let result = whitenoise.unmute_chat(&account, &group_id).await.unwrap();
+        let result = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .unmute()
+            .await
+            .unwrap();
 
         assert!(!result.is_muted());
         assert!(result.muted_until.is_none());
@@ -1987,19 +1959,31 @@ mod tests {
         let group_id = GroupId::from_slice(&[115; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Mute for 1 hour
         whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::OneHour)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::OneHour)
             .await
             .unwrap();
 
         // Re-mute for 1 week — must overwrite, not be a no-op
         let remuted = whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::OneWeek)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::OneWeek)
             .await
             .unwrap();
 
@@ -2049,7 +2033,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[117; 32]);
 
         let result = whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::Forever)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::Forever)
             .await;
 
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
@@ -2061,7 +2049,13 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[118; 32]);
 
-        let result = whitenoise.unmute_chat(&account, &group_id).await;
+        let result = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .unmute()
+            .await;
 
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
     }
@@ -2134,13 +2128,21 @@ mod tests {
         let group_id = GroupId::from_slice(&[131; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let until = Utc::now() + chrono::Duration::days(3);
         let muted = whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::Custom(until))
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::Custom(until))
             .await
             .unwrap();
 
@@ -2159,13 +2161,21 @@ mod tests {
         let group_id = GroupId::from_slice(&[130; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let past = Utc::now() - chrono::Duration::hours(1);
         let result = whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::Custom(past))
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::Custom(past))
             .await;
 
         assert!(
@@ -2181,13 +2191,21 @@ mod tests {
         let group_id = GroupId::from_slice(&[119; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Mute the chat
         whitenoise
-            .mute_chat(&account, &group_id, MuteDuration::Forever)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mute(MuteDuration::Forever)
             .await
             .unwrap();
 
@@ -2210,13 +2228,20 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        re_save.save(&whitenoise.database).await.unwrap();
+        re_save
+            .save(&account_pool(&whitenoise, &account.pubkey))
+            .await
+            .unwrap();
 
         // Fetch and confirm muted_until survived
-        let found = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(
             found.is_muted(),
@@ -2235,38 +2260,57 @@ mod tests {
         // Create two groups and set both to expired mutes via update_muted_until
         // (mute_chat rejects past timestamps, so we go through the DB layer directly)
         let (ag1, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id1, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id1)
+            .get_or_create(None)
             .await
             .unwrap();
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id2, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id2)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let past = Utc::now() - chrono::Duration::seconds(10);
-        ag1.update_muted_until(Some(past), &whitenoise.database)
+        ag1.update_muted_until(Some(past), &account_pool(&whitenoise, &account.pubkey))
             .await
             .unwrap();
-        ag2.update_muted_until(Some(past), &whitenoise.database)
+        ag2.update_muted_until(Some(past), &account_pool(&whitenoise, &account.pubkey))
             .await
             .unwrap();
 
         // Run cleanup
-        let cleared = AccountGroup::clear_expired_mutes(&whitenoise.database)
-            .await
-            .unwrap();
+        let cleared = AccountGroup::clear_expired_mutes(
+            &account.pubkey,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cleared.len(), 2);
 
         // Verify DB rows are actually cleared
-        let ag1 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id1)
-            .await
-            .unwrap()
-            .unwrap();
-        let ag2 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id2)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag1 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id1,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let ag2 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id2,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(ag1.muted_until.is_none());
         assert!(ag2.muted_until.is_none());
@@ -2281,54 +2325,89 @@ mod tests {
         let future_group = GroupId::from_slice(&[124; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &expired_group, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&expired_group)
+            .get_or_create(None)
             .await
             .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &forever_group, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&forever_group)
+            .get_or_create(None)
             .await
             .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &future_group, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&future_group)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // One expired (set via DB layer), one forever, one future
         let past = Utc::now() - chrono::Duration::seconds(10);
-        let expired_ag = AccountGroup::get(&whitenoise, &account.pubkey, &expired_group)
-            .await
-            .unwrap()
-            .unwrap();
+        let expired_ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &expired_group,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         expired_ag
-            .update_muted_until(Some(past), &whitenoise.database)
+            .update_muted_until(Some(past), &account_pool(&whitenoise, &account.pubkey))
             .await
             .unwrap();
         whitenoise
-            .mute_chat(&account, &forever_group, MuteDuration::Forever)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&forever_group)
+            .mute(MuteDuration::Forever)
             .await
             .unwrap();
         whitenoise
-            .mute_chat(&account, &future_group, MuteDuration::OneHour)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&future_group)
+            .mute(MuteDuration::OneHour)
             .await
             .unwrap();
 
         // Run cleanup — should only clear the expired one
-        let cleared = AccountGroup::clear_expired_mutes(&whitenoise.database)
-            .await
-            .unwrap();
+        let cleared = AccountGroup::clear_expired_mutes(
+            &account.pubkey,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cleared.len(), 1);
         assert_eq!(cleared[0].mls_group_id, expired_group);
 
         // Active mutes must be untouched
-        let forever_ag = AccountGroup::get(&whitenoise, &account.pubkey, &forever_group)
-            .await
-            .unwrap()
-            .unwrap();
-        let future_ag = AccountGroup::get(&whitenoise, &account.pubkey, &future_group)
-            .await
-            .unwrap()
-            .unwrap();
+        let forever_ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &forever_group,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let future_ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &future_group,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(forever_ag.is_muted_forever());
         assert!(future_ag.is_muted());
@@ -2341,7 +2420,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[104; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -2367,13 +2450,20 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        re_save.save(&whitenoise.database).await.unwrap();
+        re_save
+            .save(&account_pool(&whitenoise, &account.pubkey))
+            .await
+            .unwrap();
 
         // Fetch and confirm removed_at survived
-        let found = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(
             found.is_removed(),
@@ -2388,7 +2478,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[110; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -2403,13 +2497,24 @@ mod tests {
         let group_id = GroupId::from_slice(&[111; 32]);
 
         let (ag, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         assert!(!ag.self_removed);
 
-        let left = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        let left = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
+            .await
+            .unwrap();
 
         assert!(left.is_removed(), "removed_at must be set");
         assert!(left.self_removed, "self_removed must be true");
@@ -2424,12 +2529,30 @@ mod tests {
         let group_id = GroupId::from_slice(&[112; 32]);
 
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
-        let first = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
-        let second = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        let first = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
+            .await
+            .unwrap();
+        let second = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
+            .await
+            .unwrap();
 
         assert_eq!(first.removed_at, second.removed_at);
         assert!(second.self_removed);
@@ -2442,17 +2565,32 @@ mod tests {
         let group_id = GroupId::from_slice(&[113; 32]);
 
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // User leaves first
-        let left = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        let left = whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
+            .await
+            .unwrap();
         assert!(left.self_removed);
 
         // Admin kick arrives later — must not overwrite self_removed
         let removed = whitenoise
-            .mark_as_removed(&account, &group_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_removed()
             .await
             .unwrap();
 
@@ -2469,15 +2607,27 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[201; 32]);
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let mut updates = whitenoise
+            .shared
             .group_state_stream_manager
             .subscribe(&account.pubkey, &group_id);
 
-        whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
+            .await
+            .unwrap();
 
         assert_eq!(
             updates.try_recv().expect("should receive update"),
@@ -2491,16 +2641,25 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[202; 32]);
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let mut updates = whitenoise
+            .shared
             .group_state_stream_manager
             .subscribe(&account.pubkey, &group_id);
 
         whitenoise
-            .mark_as_removed(&account, &group_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_removed()
             .await
             .unwrap();
 
@@ -2517,23 +2676,37 @@ mod tests {
         let account_b = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[210; 32]);
         whitenoise
-            .get_or_create_account_group(&account_a, &group_id, None)
+            .require_session(&account_a.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         whitenoise
-            .get_or_create_account_group(&account_b, &group_id, None)
+            .require_session(&account_b.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let mut updates_a = whitenoise
+            .shared
             .group_state_stream_manager
             .subscribe(&account_a.pubkey, &group_id);
         let mut updates_b = whitenoise
+            .shared
             .group_state_stream_manager
             .subscribe(&account_b.pubkey, &group_id);
 
         whitenoise
-            .mark_as_left(&account_b, &group_id)
+            .require_session(&account_b.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
             .await
             .unwrap();
 
@@ -2568,16 +2741,35 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[203; 32]);
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let mut updates = whitenoise
+            .shared
             .group_state_stream_manager
             .subscribe(&account.pubkey, &group_id);
 
-        whitenoise.mark_as_left(&account, &group_id).await.unwrap();
-        whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
+            .await
+            .unwrap();
+        whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .mark_as_left()
+            .await
+            .unwrap();
 
         let _first = updates.try_recv().expect("first call must emit");
         assert!(
@@ -2592,7 +2784,13 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[140; 32]);
 
-        let result = whitenoise.clear_chat(&account, &group_id).await;
+        let result = whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await;
 
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
     }
@@ -2604,9 +2802,12 @@ mod tests {
         let group_id = GroupId::from_slice(&[141; 32]);
 
         // No AccountGroup row exists for this pubkey/group_id
-        let result =
-            AccountGroup::chat_cleared_at_ms(&account.pubkey, &group_id, &whitenoise.database)
-                .await;
+        let result = AccountGroup::chat_cleared_at_ms(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await;
 
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
     }
@@ -2618,18 +2819,33 @@ mod tests {
         let group_id = GroupId::from_slice(&[142; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         let before = Utc::now();
-        whitenoise.clear_chat(&account, &group_id).await.unwrap();
+        whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
+            .unwrap();
         let after = Utc::now();
 
-        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let cleared_at = ag.chat_cleared_at.expect("chat_cleared_at must be set");
         // Allow 1s tolerance for millisecond truncation in the database layer
@@ -2650,44 +2866,119 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // Create a message and mark it as read
         let msg_id = EventId::from_hex(&format!("{:0>64}", "aab")).unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             msg_id,
             group_id.clone(),
             account.pubkey,
             Utc::now(),
-            &whitenoise.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
 
         let ag = whitenoise
-            .mark_message_read(&account, &msg_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&msg_id)
             .await
             .unwrap();
         assert_eq!(ag.last_read_message_id, Some(msg_id));
 
         // Clear the chat
-        whitenoise.clear_chat(&account, &group_id).await.unwrap();
+        whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
+            .unwrap();
 
         // Verify last_read_message_id is reset
-        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             ag.last_read_message_id.is_none(),
             "last_read_message_id must be None after clear_chat"
+        );
+    }
+
+    /// Regression: post-phase-18e, `clear_chat` must drop this account's old
+    /// `aggregated_messages` rows immediately. The pre-18e logic gated cleanup
+    /// on a min-across-accounts `chat_cleared_at`, which after the per-account
+    /// split silently turned the cleanup into a no-op whenever any other
+    /// account in the group hadn't cleared its (totally separate) DB.
+    #[tokio::test]
+    async fn test_clear_chat_deletes_per_account_aggregated_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[145; 32]);
+        let session = whitenoise.session(&account.pubkey).unwrap();
+
+        whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        // Seed two old messages directly in this account's per-account DB.
+        let old = Utc::now() - chrono::Duration::seconds(10);
+        for tag in &["e1", "e2"] {
+            let id = EventId::from_hex(&format!("{:0>64}", tag)).unwrap();
+            AggregatedMessage::create_for_test(
+                id,
+                group_id.clone(),
+                account.pubkey,
+                old,
+                &session.account_db.inner,
+            )
+            .await
+            .unwrap();
+        }
+        let before = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
+            .await
+            .unwrap();
+        assert_eq!(before, 2);
+
+        session
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
+            .unwrap();
+
+        let after = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "clear_chat must drop this account's seeded messages even when no other account has cleared"
         );
     }
 
@@ -2698,24 +2989,50 @@ mod tests {
         let group_id = GroupId::from_slice(&[144; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
         // First clear
-        whitenoise.clear_chat(&account, &group_id).await.unwrap();
-        let ag1 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
+        whitenoise
+            .session(&account.pubkey)
             .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
             .unwrap();
+        let ag1 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let first_cleared_at = ag1.chat_cleared_at.unwrap();
 
         // Second clear should also succeed
-        whitenoise.clear_chat(&account, &group_id).await.unwrap();
-        let ag2 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
+        whitenoise
+            .session(&account.pubkey)
             .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
             .unwrap();
+        let ag2 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &account_pool(&whitenoise, &account.pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let second_cleared_at = ag2.chat_cleared_at.unwrap();
 
         assert!(
@@ -2742,7 +3059,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[152; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -2751,7 +3072,7 @@ mod tests {
         let ag = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &account_pool(&whitenoise, &account.pubkey),
         )
         .await
         .unwrap();
@@ -2768,7 +3089,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[153; 32]);
 
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -2794,12 +3119,16 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id, None)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -2807,7 +3136,7 @@ mod tests {
 
         // group_information must be deleted by delete_chat_data
         let gi_result =
-            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database).await;
+            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.shared.database).await;
         assert!(
             gi_result.is_err(),
             "group_information must be deleted when sole account deletes"
@@ -2817,7 +3146,7 @@ mod tests {
         let ag = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &account_pool(&whitenoise, &account.pubkey),
         )
         .await
         .unwrap();
@@ -2838,16 +3167,24 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account_a, &group_id, None)
+            .require_session(&account_a.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
         whitenoise
-            .get_or_create_account_group(&account_b, &group_id, None)
+            .require_session(&account_b.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
             .await
             .unwrap();
 
@@ -2858,7 +3195,7 @@ mod tests {
         let ag_a = AccountGroup::find_by_account_and_group(
             &account_a.pubkey,
             &group_id,
-            &whitenoise.database,
+            &account_pool(&whitenoise, &account_a.pubkey),
         )
         .await
         .unwrap();
@@ -2868,14 +3205,15 @@ mod tests {
         let ag_b = AccountGroup::find_by_account_and_group(
             &account_b.pubkey,
             &group_id,
-            &whitenoise.database,
+            &account_pool(&whitenoise, &account_b.pubkey),
         )
         .await
         .unwrap();
         assert!(ag_b.is_some(), "B's row must still exist");
 
         // Shared data must still exist
-        let gi = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database).await;
+        let gi =
+            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.shared.database).await;
         assert!(
             gi.is_ok(),
             "group_information must persist while B still has the group"
@@ -2886,7 +3224,7 @@ mod tests {
 
         // Now everything should be cleaned up
         let gi_after =
-            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database).await;
+            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.shared.database).await;
         assert!(
             gi_after.is_err(),
             "group_information must be deleted after all accounts delete"
@@ -2895,7 +3233,7 @@ mod tests {
         let ag_a_after = AccountGroup::find_by_account_and_group(
             &account_a.pubkey,
             &group_id,
-            &whitenoise.database,
+            &account_pool(&whitenoise, &account_a.pubkey),
         )
         .await
         .unwrap();
@@ -2907,7 +3245,7 @@ mod tests {
         let ag_b_after = AccountGroup::find_by_account_and_group(
             &account_b.pubkey,
             &group_id,
-            &whitenoise.database,
+            &account_pool(&whitenoise, &account_b.pubkey),
         )
         .await
         .unwrap();

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::whitenoise::media_files::MediaFile;
 use crate::{Account, Whitenoise, WhitenoiseError};
 use mdk_core::prelude::group_types::Group;
@@ -6,7 +8,7 @@ use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct ScenarioContext {
-    pub whitenoise: &'static Whitenoise,
+    pub whitenoise: Arc<Whitenoise>,
     pub dev_relays: Vec<&'static str>,
     pub accounts: HashMap<String, Account>,
     pub groups: HashMap<String, Group>,
@@ -17,7 +19,7 @@ pub struct ScenarioContext {
 }
 
 impl ScenarioContext {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         let relays = if cfg!(debug_assertions) {
             vec!["ws://localhost:8080", "ws://localhost:7777"]
         } else {

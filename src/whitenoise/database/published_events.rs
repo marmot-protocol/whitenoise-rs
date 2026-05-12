@@ -1,15 +1,19 @@
 use chrono::{DateTime, Utc};
 use nostr_sdk::EventId;
 
-use super::{Database, DatabaseError, utils::parse_timestamp};
+use super::DatabaseError;
+use super::account_db::AccountDatabase;
+use super::utils::parse_timestamp;
 use crate::perf_instrument;
 
-/// Row structure for published_events table
+/// Row structure for the per-account `published_events` table.
+///
+/// Lives in the per-account SQLite file (post-Phase 18c). The owning account
+/// is implicit — it's whichever account owns the file.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PublishedEvent {
     pub id: i64,
     pub event_id: EventId,
-    pub account_id: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -23,7 +27,6 @@ where
     fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
         let id: i64 = row.try_get("id")?;
         let event_id_hex: String = row.try_get("event_id")?;
-        let account_id: i64 = row.try_get("account_id")?;
 
         let event_id =
             EventId::from_hex(&event_id_hex).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
@@ -33,60 +36,44 @@ where
         Ok(PublishedEvent {
             id,
             event_id,
-            account_id,
             created_at,
         })
     }
 }
 
 impl PublishedEvent {
-    /// Records that we published a specific event to prevent processing our own events
+    /// Records that this account published a specific event.
     #[perf_instrument("db::published_events")]
     pub(crate) async fn create(
         event_id: &EventId,
-        account_id: i64,
-        database: &Database,
+        db: &AccountDatabase,
     ) -> Result<(), DatabaseError> {
-        sqlx::query("INSERT OR IGNORE INTO published_events (event_id, account_id) VALUES (?, ?)")
+        sqlx::query("INSERT OR IGNORE INTO published_events (event_id) VALUES (?)")
             .bind(event_id.to_hex())
-            .bind(account_id)
-            .execute(&database.pool)
+            .execute(&db.inner.pool)
             .await?;
 
         tracing::debug!(
-            target: "whitenoise::database::published_events::create",
-            "Recorded published event: {} by account ID {}",
+            target: "whitenoise::database::published_events",
+            "Recorded published event {} for account {}",
             event_id.to_hex(),
-            account_id
+            db.account_pubkey().to_hex()
         );
 
         Ok(())
     }
 
-    /// Checks if we published a specific event
-    /// - account_id: Some(id) for account-specific processing, None for global processing
+    /// Checks if this account published a specific event.
     #[perf_instrument("db::published_events")]
     pub(crate) async fn exists(
         event_id: &EventId,
-        account_id: Option<i64>,
-        database: &Database,
+        db: &AccountDatabase,
     ) -> Result<bool, DatabaseError> {
-        let result = if let Some(account_id) = account_id {
-            sqlx::query_as::<_, (i64,)>(
-                "SELECT EXISTS(SELECT 1 FROM published_events WHERE event_id = ? AND account_id = ?)",
-            )
-            .bind(event_id.to_hex())
-            .bind(account_id)
-            .fetch_optional(&database.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, (i64,)>(
-                "SELECT EXISTS(SELECT 1 FROM published_events WHERE event_id = ?)",
-            )
-            .bind(event_id.to_hex())
-            .fetch_optional(&database.pool)
-            .await?
-        };
+        let result: Option<(i64,)> =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM published_events WHERE event_id = ?)")
+                .bind(event_id.to_hex())
+                .fetch_optional(&db.inner.pool)
+                .await?;
 
         Ok(result.is_some_and(|row| row.0 != 0))
     }
@@ -94,310 +81,69 @@ impl PublishedEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use chrono::Utc;
     use nostr_sdk::{EventId, Keys};
-    use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
     use std::str::FromStr;
+    use tempfile::TempDir;
 
-    // Helper function to create a test database with the required tables
-    async fn setup_test_db() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+    use super::*;
+
+    async fn setup() -> (AccountDatabase, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let pubkey = Keys::generate().public_key();
+        let path = dir.path().join("acct.db");
+        let db = AccountDatabase::new(pubkey, path).await.unwrap();
+
+        sqlx::query("DROP TABLE IF EXISTS published_events")
+            .execute(&db.inner.pool)
             .await
             .unwrap();
-
-        // Create accounts table (referenced by foreign keys)
-        sqlx::query(
-            "CREATE TABLE accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pubkey TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                last_synced_at INTEGER,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Create published_events table
         sqlx::query(
             "CREATE TABLE published_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL
+                event_id TEXT NOT NULL UNIQUE
                     CHECK (length(event_id) = 64 AND event_id GLOB '[0-9a-fA-F]*'),
-                account_id INTEGER NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                UNIQUE(event_id, account_id)
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
-        .execute(&pool)
+        .execute(&db.inner.pool)
         .await
         .unwrap();
 
-        // Create test account
-        sqlx::query(
-            "INSERT INTO accounts (pubkey, user_id, created_at, updated_at)
-             VALUES (?, 1, ?, ?)",
-        )
-        .bind("test_pubkey")
-        .bind(Utc::now().timestamp())
-        .bind(Utc::now().timestamp())
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        pool
+        (db, dir)
     }
 
-    // Helper function to create a test event ID
     fn create_test_event_id() -> EventId {
         let keys = Keys::generate();
         EventId::from_str(&keys.public_key().to_string()).unwrap_or_else(|_| {
-            // Fallback to a valid hex string
             EventId::from_hex("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
                 .unwrap()
         })
     }
 
-    // Helper function to wrap pool in Database struct
-    fn wrap_pool_in_database(pool: SqlitePool) -> Database {
-        Database {
-            pool,
-            path: std::path::PathBuf::from(":memory:"),
-            last_connected: std::time::SystemTime::now(),
-        }
-    }
-
     #[tokio::test]
-    async fn test_published_event_from_row_valid_data() {
-        let pool = setup_test_db().await;
-        let event_id = create_test_event_id();
-        let account_id = 1i64;
-        let timestamp = Utc::now().timestamp_millis();
-
-        // Insert a test record
-        sqlx::query(
-            "INSERT INTO published_events (event_id, account_id, created_at) VALUES (?, ?, ?)",
-        )
-        .bind(event_id.to_hex())
-        .bind(account_id)
-        .bind(timestamp)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Fetch and verify
-        let row: PublishedEvent = sqlx::query_as(
-            "SELECT id, event_id, account_id, created_at FROM published_events WHERE account_id = ?",
-        )
-        .bind(account_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(row.event_id, event_id);
-        assert_eq!(row.account_id, account_id);
-        assert_eq!(row.created_at.timestamp_millis(), timestamp);
-    }
-
-    #[tokio::test]
-    async fn test_published_event_from_row_invalid_event_id() {
-        let pool = setup_test_db().await;
-        let account_id = 1i64;
-        let timestamp = Utc::now().timestamp();
-
-        // Insert a record with invalid event_id (should fail due to database constraints)
-        let result = sqlx::query(
-            "INSERT INTO published_events (event_id, account_id, created_at) VALUES (?, ?, ?)",
-        )
-        .bind("invalid_hex")
-        .bind(account_id)
-        .bind(timestamp)
-        .execute(&pool)
-        .await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_published_event_create() {
-        let pool = setup_test_db().await;
-        let database = wrap_pool_in_database(pool);
-        let event_id = create_test_event_id();
-        let account_id = 1i64;
-
-        // Create a published event
-        let result = PublishedEvent::create(&event_id, account_id, &database).await;
-        assert!(result.is_ok());
-
-        // Verify it was inserted
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM published_events WHERE event_id = ? AND account_id = ?",
-        )
-        .bind(event_id.to_hex())
-        .bind(account_id)
-        .fetch_one(&database.pool)
-        .await
-        .unwrap();
-
-        assert_eq!(count.0, 1);
-    }
-
-    #[tokio::test]
-    async fn test_published_event_create_duplicate_ignored() {
-        let pool = setup_test_db().await;
-        let database = wrap_pool_in_database(pool);
-        let event_id = create_test_event_id();
-        let account_id = 1i64;
-
-        // Create the same published event twice
-        let result1 = PublishedEvent::create(&event_id, account_id, &database).await;
-        let result2 = PublishedEvent::create(&event_id, account_id, &database).await;
-
-        assert!(result1.is_ok());
-        assert!(result2.is_ok());
-
-        // Verify only one record exists (INSERT OR IGNORE behavior)
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM published_events WHERE event_id = ? AND account_id = ?",
-        )
-        .bind(event_id.to_hex())
-        .bind(account_id)
-        .fetch_one(&database.pool)
-        .await
-        .unwrap();
-
-        assert_eq!(count.0, 1);
-    }
-
-    #[tokio::test]
-    async fn test_published_event_exists_true() {
-        let pool = setup_test_db().await;
-        let database = wrap_pool_in_database(pool);
-        let event_id = create_test_event_id();
-        let account_id = 1i64;
-
-        // Create a published event
-        PublishedEvent::create(&event_id, account_id, &database)
-            .await
-            .unwrap();
-
-        // Check if it exists
-        let exists = PublishedEvent::exists(&event_id, Some(account_id), &database)
-            .await
-            .unwrap();
-
-        assert!(exists);
-    }
-
-    #[tokio::test]
-    async fn test_published_event_exists_false() {
-        let pool = setup_test_db().await;
-        let database = wrap_pool_in_database(pool);
-        let event_id = create_test_event_id();
-        let account_id = 1i64;
-
-        // Check if non-existent event exists
-        let exists = PublishedEvent::exists(&event_id, Some(account_id), &database)
-            .await
-            .unwrap();
-
-        assert!(!exists);
-    }
-
-    #[tokio::test]
-    async fn test_published_event_exists_different_account() {
-        let pool = setup_test_db().await;
-        let database = wrap_pool_in_database(pool);
-        let event_id = create_test_event_id();
-        let account_id1 = 1i64;
-        let account_id2 = 999i64; // Non-existent account
-
-        // Create a published event for account 1
-        PublishedEvent::create(&event_id, account_id1, &database)
-            .await
-            .unwrap();
-
-        // Check if it exists for account 2 (should be false)
-        let exists = PublishedEvent::exists(&event_id, Some(account_id2), &database)
-            .await
-            .unwrap();
-
-        assert!(!exists);
-    }
-
-    #[tokio::test]
-    async fn test_multiple_accounts_same_event() {
-        let pool = setup_test_db().await;
-        let database = wrap_pool_in_database(pool);
+    async fn test_create_and_exists() {
+        let (db, _dir) = setup().await;
         let event_id = create_test_event_id();
 
-        // Create another test account
-        sqlx::query(
-            "INSERT INTO accounts (pubkey, user_id, created_at, updated_at)
-             VALUES (?, 2, ?, ?)",
-        )
-        .bind("test_pubkey_2")
-        .bind(Utc::now().timestamp())
-        .bind(Utc::now().timestamp())
-        .execute(&database.pool)
-        .await
-        .unwrap();
+        assert!(!PublishedEvent::exists(&event_id, &db).await.unwrap());
+        PublishedEvent::create(&event_id, &db).await.unwrap();
+        assert!(PublishedEvent::exists(&event_id, &db).await.unwrap());
+    }
 
-        let account_id1 = 1i64;
-        let account_id2 = 2i64;
+    #[tokio::test]
+    async fn test_create_duplicate_ignored() {
+        let (db, _dir) = setup().await;
+        let event_id = create_test_event_id();
 
-        // Both accounts can have records for the same event
-        PublishedEvent::create(&event_id, account_id1, &database)
-            .await
-            .unwrap();
-        PublishedEvent::create(&event_id, account_id2, &database)
-            .await
-            .unwrap();
+        PublishedEvent::create(&event_id, &db).await.unwrap();
+        PublishedEvent::create(&event_id, &db).await.unwrap();
 
-        // Verify both accounts have their records
-        assert!(
-            PublishedEvent::exists(&event_id, Some(account_id1), &database)
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM published_events WHERE event_id = ?")
+                .bind(event_id.to_hex())
+                .fetch_one(&db.inner.pool)
                 .await
-                .unwrap()
-        );
-        assert!(
-            PublishedEvent::exists(&event_id, Some(account_id2), &database)
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_published_event_exists_global_check() {
-        let pool = setup_test_db().await;
-        let database = wrap_pool_in_database(pool);
-        let event_id = create_test_event_id();
-        let account_id = 1i64;
-
-        // Create a published event for specific account
-        PublishedEvent::create(&event_id, account_id, &database)
-            .await
-            .unwrap();
-
-        // Check if event exists globally (without specifying account)
-        let exists_globally = PublishedEvent::exists(&event_id, None, &database)
-            .await
-            .unwrap();
-
-        assert!(exists_globally);
-
-        // Check with non-existent event globally
-        let non_existent_event = create_test_event_id();
-        let does_not_exist_globally = PublishedEvent::exists(&non_existent_event, None, &database)
-            .await
-            .unwrap();
-
-        assert!(!does_not_exist_globally);
+                .unwrap();
+        assert_eq!(count.0, 1);
     }
 }

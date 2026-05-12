@@ -108,7 +108,8 @@ impl TestCase for VerifyChatListItemTestCase {
 
         let account = context.get_account(&self.account_name)?;
         let expected_group = context.get_group(&self.group_context_name)?;
-        let chat_list = context.whitenoise.get_chat_list(account).await?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+        let chat_list = session.chat_list().active().await?;
 
         let item = chat_list
             .iter()

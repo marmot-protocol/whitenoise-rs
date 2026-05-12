@@ -9,7 +9,6 @@ use futures::stream::{self, StreamExt};
 use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
-use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::scheduled_tasks::Task;
 
@@ -41,13 +40,13 @@ impl Task for ConsumedKeyPackageCleanup {
     }
 
     #[perf_instrument("scheduled::consumed_kp_cleanup")]
-    async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+    async fn execute(&self, whitenoise: std::sync::Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
         tracing::debug!(
             target: "whitenoise::scheduler::consumed_key_package_cleanup",
             "Starting consumed key package cleanup"
         );
 
-        let accounts = Account::all(&whitenoise.database).await?;
+        let accounts = Account::all(&whitenoise.shared.database).await?;
 
         if accounts.is_empty() {
             tracing::debug!(
@@ -58,10 +57,13 @@ impl Task for ConsumedKeyPackageCleanup {
         }
 
         let cleanup_results: Vec<(String, Result<usize, WhitenoiseError>)> = stream::iter(accounts)
-            .map(|account| async move {
-                let pubkey_hex = account.pubkey.to_hex();
-                let result = cleanup_consumed_key_packages(whitenoise, &account).await;
-                (pubkey_hex, result)
+            .map(|account| {
+                let whitenoise = whitenoise.clone();
+                async move {
+                    let pubkey_hex = account.pubkey.to_hex();
+                    let result = cleanup_consumed_key_packages(&whitenoise, &account).await;
+                    (pubkey_hex, result)
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
@@ -119,12 +121,23 @@ async fn cleanup_consumed_key_packages(
     whitenoise: &Whitenoise,
     account: &Account,
 ) -> Result<usize, WhitenoiseError> {
-    let eligible = PublishedKeyPackage::find_eligible_for_cleanup(
-        &account.pubkey,
-        CONSUMED_KP_QUIET_PERIOD_SECS,
-        &whitenoise.database,
-    )
-    .await?;
+    // Skip dormant accounts: cleanup reads/writes the per-account DB via
+    // the session, so an account with no active session has nothing to
+    // clean up this tick. Returning Ok(0) instead of erroring keeps the
+    // scheduler quiet.
+    let Some(session) = whitenoise.session(&account.pubkey) else {
+        tracing::debug!(
+            target: "whitenoise::scheduler::consumed_kp_cleanup",
+            "Account {} has no active session, skipping",
+            account.pubkey.to_hex()
+        );
+        return Ok(0);
+    };
+    let eligible = session
+        .repos
+        .published_key_packages
+        .find_eligible_for_cleanup(CONSUMED_KP_QUIET_PERIOD_SECS)
+        .await?;
 
     if eligible.is_empty() {
         return Ok(0);
@@ -148,12 +161,11 @@ async fn cleanup_consumed_key_packages(
 
         match mdk.delete_key_package_from_storage_by_hash_ref(&consumed.key_package_hash_ref) {
             Ok(()) => {
-                if let Err(e) = PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
-                    &account.pubkey,
-                    &consumed.key_package_hash_ref,
-                    &whitenoise.database,
-                )
-                .await
+                if let Err(e) = session
+                    .repos
+                    .published_key_packages
+                    .mark_key_material_deleted_by_hash_ref(&consumed.key_package_hash_ref)
+                    .await
                 {
                     tracing::warn!(
                         target: "whitenoise::scheduler::consumed_key_package_cleanup",
@@ -193,10 +205,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_no_accounts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let task = ConsumedKeyPackageCleanup;
-        let result = task.execute(whitenoise).await;
+        let result = task.execute(whitenoise.clone()).await;
 
         assert!(result.is_ok());
     }

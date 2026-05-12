@@ -44,7 +44,8 @@ impl TestCase for LoadDraftTestCase {
         let group = context.get_group(&self.group_name)?;
         let group_id = GroupId::from_slice(group.mls_group_id.as_slice());
 
-        let loaded = context.whitenoise.load_draft(account, &group_id).await?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+        let loaded = session.drafts().load(&group_id).await?;
 
         if self.expect_exists {
             let draft = loaded.expect("Draft should exist");

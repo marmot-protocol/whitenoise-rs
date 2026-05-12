@@ -36,7 +36,7 @@ pub trait Task: Send + Sync {
     /// - Be idempotent (safe to run multiple times)
     /// - Handle transient failures gracefully (log and continue)
     /// - Avoid holding locks for extended periods
-    async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError>;
+    async fn execute(&self, whitenoise: Arc<Whitenoise>) -> Result<(), WhitenoiseError>;
 }
 
 /// Configuration for the scheduler.
@@ -58,7 +58,7 @@ impl Default for SchedulerConfig {
 /// immediately (tokio interval first-tick behavior), then repeats at the
 /// configured interval.
 pub(super) fn start_scheduled_tasks(
-    whitenoise: &'static Whitenoise,
+    whitenoise: Arc<Whitenoise>,
     shutdown_rx: watch::Receiver<bool>,
     config: Option<SchedulerConfig>,
     tasks: Vec<Arc<dyn Task>>,
@@ -79,6 +79,7 @@ pub(super) fn start_scheduled_tasks(
 
     for task in tasks {
         let mut task_shutdown_rx = shutdown_rx.clone();
+        let whitenoise = Arc::clone(&whitenoise);
         let handle = tokio::spawn(async move {
             let task_name = task.name();
 
@@ -94,7 +95,7 @@ pub(super) fn start_scheduled_tasks(
                             "Executing task: {}",
                             task_name
                         );
-                        if let Err(e) = task.execute(whitenoise).await {
+                        if let Err(e) = task.execute(Arc::clone(&whitenoise)).await {
                             tracing::warn!(
                                 target: "whitenoise::scheduler",
                                 "Task {} failed: {}",
@@ -165,7 +166,7 @@ mod tests {
             self.interval
         }
 
-        async fn execute(&self, _whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+        async fn execute(&self, _whitenoise: Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
             self.execution_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -180,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_task_list_returns_empty_handles() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let handles = start_scheduled_tasks(whitenoise, shutdown_rx, None, vec![]);
@@ -191,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn test_disabled_scheduler_returns_empty_handles() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let config = SchedulerConfig { enabled: false };
@@ -206,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn test_task_executes_on_first_tick() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let (task, count) = CountingTask::new("test_task", Duration::from_secs(3600));
@@ -230,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn test_task_responds_to_shutdown() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let (task, _count) = CountingTask::new("shutdown_test", Duration::from_secs(3600));
@@ -254,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_tasks_spawn_independently() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let (task1, count1) = CountingTask::new("task1", Duration::from_secs(3600));

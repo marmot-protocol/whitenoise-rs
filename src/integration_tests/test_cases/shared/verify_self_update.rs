@@ -51,7 +51,7 @@ impl TestCase for VerifySelfUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;
         let group_id = group.mls_group_id.clone();
-        let wn = context.whitenoise;
+        let wn = &context.whitenoise;
 
         // The self-update runs as a deferred background task after welcome
         // processing. It waits for in-flight messages at the current epoch to
@@ -77,7 +77,11 @@ impl TestCase for VerifySelfUpdateTestCase {
                     let group_id = group_id.clone();
                     let account_name = account_name_owned.clone();
                     async move {
-                        let current_group = wn.group(&account, &group_id).await?;
+                        let current_group = wn
+                            .require_session(&account.pubkey)
+                            .unwrap()
+                            .groups()
+                            .get(&group_id)?;
                         if current_group.epoch >= min_epoch {
                             Ok(current_group.epoch)
                         } else {

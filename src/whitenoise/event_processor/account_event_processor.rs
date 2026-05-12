@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use nostr_sdk::prelude::*;
 
 use crate::{
@@ -9,6 +11,7 @@ use crate::{
         Whitenoise,
         accounts::Account,
         error::{Result, WhitenoiseError},
+        session::AccountSession,
     },
 };
 
@@ -31,6 +34,21 @@ impl Whitenoise {
                     e
                 );
                 return; // Skip - no retry
+            }
+        };
+
+        // Resolve active session — if the account logged out between receipt
+        // and processing, discard the event.
+        let session = match self.session(&account.pubkey) {
+            Some(s) => s,
+            None => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_account_event",
+                    "Skipping event {}: no active session for account {}",
+                    event.id.to_hex(),
+                    account.pubkey.to_hex()
+                );
+                return;
             }
         };
 
@@ -73,7 +91,7 @@ impl Whitenoise {
         );
 
         let result = self
-            .route_account_event_for_processing(&event, &account)
+            .route_account_event_for_processing(&session, &account, &event)
             .await;
 
         // Handle the result - success, retry, or give up
@@ -81,6 +99,7 @@ impl Whitenoise {
             Ok(()) => {
                 // Record that we processed this event successfully
                 if let Err(e) = self
+                    .shared
                     .event_tracker
                     .track_processed_account_event(&event, &account.pubkey)
                     .await
@@ -103,7 +122,7 @@ impl Whitenoise {
                         if let Err(e) = Account::update_last_synced_max(
                             &account.pubkey,
                             created_ms,
-                            &self.database,
+                            &self.shared.database,
                         )
                         .await
                         {
@@ -127,7 +146,7 @@ impl Whitenoise {
                     Kind::GiftWrap => {
                         // Use rumor timestamp for advancement per NIP-59
                         match self
-                            .extract_rumor_timestamp_for_advancement(&event, &account)
+                            .extract_rumor_timestamp_for_advancement(&event, &session)
                             .await
                         {
                             Ok(Some(rumor_timestamp)) => {
@@ -137,7 +156,7 @@ impl Whitenoise {
                                 if let Err(e) = Account::update_last_synced_max(
                                     &account.pubkey,
                                     created_ms,
-                                    &self.database,
+                                    &self.shared.database,
                                 )
                                 .await
                                 {
@@ -210,10 +229,12 @@ impl Whitenoise {
 
         let hash_str = &subscription_id[..underscore_pos.unwrap()];
         // Get all accounts and find the one whose hash matches
-        let accounts = Account::all(&self.database).await?;
+        let accounts = Account::all(&self.shared.database).await?;
         for account in accounts.iter() {
-            let pubkey_hash =
-                hash_pubkey_for_subscription_id(self.relay_control.session_salt(), &account.pubkey);
+            let pubkey_hash = hash_pubkey_for_subscription_id(
+                self.shared.relay_control.session_salt(),
+                &account.pubkey,
+            );
             if pubkey_hash == hash_str {
                 return Ok(account.pubkey);
             }
@@ -241,7 +262,7 @@ impl Whitenoise {
             target_pubkey.to_hex()
         );
 
-        Account::find_by_pubkey(&target_pubkey, &self.database).await
+        Account::find_by_pubkey(&target_pubkey, &self.shared.database).await
     }
 
     /// Check if an account event should be skipped (not processed)
@@ -253,6 +274,7 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<Option<&'static str>> {
         let already_processed = match self
+            .shared
             .event_tracker
             .already_processed_account_event(&event.id, &account.pubkey)
             .await
@@ -279,6 +301,7 @@ impl Whitenoise {
             Kind::MlsGroupMessage => false,
             Kind::GiftWrap => false,
             _ => match self
+                .shared
                 .event_tracker
                 .account_published_event(&event.id, &account.pubkey)
                 .await
@@ -307,20 +330,27 @@ impl Whitenoise {
     #[perf_instrument("event_processor")]
     async fn route_account_event_for_processing(
         &self,
-        event: &Event,
+        session: &Arc<AccountSession>,
         account: &Account,
+        event: &Event,
     ) -> Result<()> {
         match event.kind {
             Kind::GiftWrap => match validate_giftwrap_target(account, event) {
-                Ok(()) => self.handle_giftwrap(account, event.clone()).await,
+                Ok(()) => self.handle_giftwrap(session, account, event.clone()).await,
                 Err(e) => Err(e),
             },
-            Kind::MlsGroupMessage => self.handle_mls_message(account, event.clone()).await,
+            Kind::MlsGroupMessage => {
+                self.handle_mls_message(session, account, event.clone())
+                    .await
+            }
             Kind::Metadata => self.handle_metadata(event.clone()).await,
             Kind::RelayList | Kind::InboxRelays | Kind::MlsKeyPackageRelays => {
                 self.handle_relay_list(event.clone()).await
             }
-            Kind::ContactList => self.handle_contact_list(account, event.clone()).await,
+            Kind::ContactList => {
+                self.handle_contact_list(session, account, event.clone())
+                    .await
+            }
             Kind::MuteList => self.handle_mute_list(account, event.clone()).await,
             _ => {
                 tracing::debug!(
@@ -333,14 +363,20 @@ impl Whitenoise {
         }
     }
 
-    /// Extract rumor timestamp from giftwrap event for sync advancement
+    /// Extract rumor timestamp from giftwrap event for sync advancement.
+    ///
+    /// Only called after `handle_giftwrap` succeeds. A missing signer here
+    /// is surfaced as `SignerUnavailable` so it is distinguishable from an
+    /// actual rumor-extraction failure in the caller's logs.
     #[perf_instrument("event_processor")]
     async fn extract_rumor_timestamp_for_advancement(
         &self,
         event: &Event,
-        account: &Account,
+        session: &Arc<AccountSession>,
     ) -> Result<Option<Timestamp>> {
-        let signer = self.get_signer_for_account(account)?;
+        let signer = session
+            .get_signer()
+            .ok_or(WhitenoiseError::SignerUnavailable(session.account_pubkey))?;
 
         match extract_rumor(&signer, event).await {
             Ok(unwrapped) => Ok(Some(unwrapped.rumor.created_at)),
@@ -425,7 +461,7 @@ mod tests {
 
         // Build the expected subscription hash for this account
         let mut hasher = Sha256::new();
-        hasher.update(whitenoise.relay_control.session_salt());
+        hasher.update(whitenoise.shared.relay_control.session_salt());
         hasher.update(account.pubkey.to_bytes());
         let hash = hasher.finalize();
         let pubkey_hash = format!("{:x}", hash)[..12].to_string();
@@ -442,7 +478,9 @@ mod tests {
     async fn test_route_account_event_unhandled_kind() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -454,7 +492,7 @@ mod tests {
             .unwrap();
 
         let result = whitenoise
-            .route_account_event_for_processing(&event, &account)
+            .route_account_event_for_processing(&session, &account, &event)
             .await;
 
         // Unhandled events return Ok(())
@@ -516,6 +554,7 @@ mod tests {
 
         assert!(
             whitenoise
+                .shared
                 .event_tracker
                 .already_processed_account_event(&event.id, &admin_account.pubkey)
                 .await
@@ -524,6 +563,7 @@ mod tests {
         );
         assert!(
             whitenoise
+                .shared
                 .event_tracker
                 .already_processed_account_event(&event.id, &member_account.pubkey)
                 .await
@@ -543,6 +583,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -571,6 +612,7 @@ mod tests {
 
         // The event must have been processed (not dropped or mis-routed).
         let was_processed = whitenoise
+            .shared
             .event_tracker
             .already_processed_account_event(&event.id, &account.pubkey)
             .await
@@ -605,6 +647,56 @@ mod tests {
         assert!(
             err_msg.contains("No valid target pubkey"),
             "Error should describe missing p tag, got: {err_msg}"
+        );
+    }
+
+    /// When the session is removed (account logged out) between event receipt
+    /// and processing, the event is silently discarded and not tracked.
+    #[tokio::test]
+    async fn test_process_account_event_discards_when_session_missing() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let keys = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        // Build a contact-list event for this account
+        let event = EventBuilder::new(Kind::ContactList, "")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        // Remove the session to simulate logout
+        whitenoise.account_manager.remove_session(&account.pubkey);
+        assert!(whitenoise.session(&account.pubkey).is_none());
+
+        // Process the event; it should be silently discarded
+        let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
+        whitenoise
+            .process_account_event(
+                event.clone(),
+                EventSource::RelaySubscription(SubscriptionContext {
+                    plane: RelayPlane::Discovery,
+                    account_pubkey: Some(account.pubkey),
+                    relay_url,
+                    stream: SubscriptionStream::DiscoveryFollowLists,
+                    group_ids: Vec::new(),
+                }),
+                Default::default(),
+            )
+            .await;
+
+        // Event must NOT be tracked as processed
+        assert!(
+            !whitenoise
+                .shared
+                .event_tracker
+                .already_processed_account_event(&event.id, &account.pubkey)
+                .await
+                .unwrap(),
+            "Event should not be tracked when session is missing"
         );
     }
 }

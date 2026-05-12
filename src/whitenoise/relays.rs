@@ -97,7 +97,7 @@ impl Relay {
         }
     }
 
-    pub(crate) fn defaults() -> Vec<Relay> {
+    pub fn defaults() -> Vec<Relay> {
         let urls: &[&str] = if cfg!(debug_assertions) {
             &["ws://localhost:8080", "ws://localhost:7777"]
         } else {
@@ -125,7 +125,7 @@ impl Relay {
 impl Whitenoise {
     #[perf_instrument("relays")]
     pub async fn find_or_create_relay_by_url(&self, url: &RelayUrl) -> Result<Relay> {
-        Relay::find_or_create_by_url(url, &self.database).await
+        Relay::find_or_create_by_url(url, &self.shared.database).await
     }
 
     /// Get connection status for all of an account's relays.
@@ -157,11 +157,11 @@ impl Whitenoise {
 
         let mut relay_types_by_url: HashMap<RelayUrl, HashSet<RelayType>> = HashMap::new();
         for (relay_type, relays) in [
-            (RelayType::Nip65, account.nip65_relays(self).await?),
-            (RelayType::Inbox, account.inbox_relays(self).await?),
+            (RelayType::Nip65, account.nip65_relays(&self.shared).await?),
+            (RelayType::Inbox, account.inbox_relays(&self.shared).await?),
             (
                 RelayType::KeyPackage,
-                account.key_package_relays(self).await?,
+                account.key_package_relays(&self.shared).await?,
             ),
         ] {
             for relay in relays {
@@ -205,7 +205,8 @@ impl Whitenoise {
             lookup_keys_by_url.insert(relay_url.clone(), lookup_keys);
         }
 
-        let status_records = RelayStatusRecord::find_many(&all_lookup_keys, &self.database).await?;
+        let status_records =
+            RelayStatusRecord::find_many(&all_lookup_keys, &self.shared.database).await?;
         let records_by_key = status_records
             .into_iter()
             .map(|record| (record.lookup_key(), record))
@@ -257,7 +258,7 @@ mod tests {
             None => RelayTelemetry::new(RelayTelemetryKind::Connected, plane, relay_url.clone()),
         };
 
-        RelayStatusRecord::upsert_from_telemetry(&telemetry, &whitenoise.database)
+        RelayStatusRecord::upsert_from_telemetry(&telemetry, &whitenoise.shared.database)
             .await
             .unwrap();
     }
@@ -269,8 +270,12 @@ mod tests {
         async fn test_get_account_relay_statuses_empty() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, keys) = create_test_account(&whitenoise).await;
-            let account = account.save(&whitenoise.database).await.unwrap();
-            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .unwrap();
 
             // Account with no relays should return an empty list.
             let statuses = whitenoise
@@ -287,18 +292,26 @@ mod tests {
         async fn test_get_account_relay_statuses_with_relays() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, keys) = create_test_account(&whitenoise).await;
-            let account = account.save(&whitenoise.database).await.unwrap();
-            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .unwrap();
 
             // Add some relays to the account's user.
-            let user = account.user(&whitenoise.database).await.unwrap();
+            let user = account.user(&whitenoise.shared.database).await.unwrap();
             let url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let url2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
             let relay1 = whitenoise.find_or_create_relay_by_url(&url1).await.unwrap();
             let relay2 = whitenoise.find_or_create_relay_by_url(&url2).await.unwrap();
-            user.add_relays(&[relay1, relay2], RelayType::Nip65, &whitenoise.database)
-                .await
-                .unwrap();
+            user.add_relays(
+                &[relay1, relay2],
+                RelayType::Nip65,
+                &whitenoise.shared.database,
+            )
+            .await
+            .unwrap();
 
             let statuses = whitenoise
                 .get_account_relay_statuses(&account)
@@ -319,21 +332,25 @@ mod tests {
         async fn test_get_account_relay_statuses_deduplicates() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, keys) = create_test_account(&whitenoise).await;
-            let account = account.save(&whitenoise.database).await.unwrap();
-            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .unwrap();
 
             // Add the same relay URL to both NIP-65 and Inbox types.
-            let user = account.user(&whitenoise.database).await.unwrap();
+            let user = account.user(&whitenoise.shared.database).await.unwrap();
             let url = RelayUrl::parse("wss://shared.relay.example.com").unwrap();
             let relay = whitenoise.find_or_create_relay_by_url(&url).await.unwrap();
             user.add_relays(
                 std::slice::from_ref(&relay),
                 RelayType::Nip65,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
-            user.add_relays(&[relay], RelayType::Inbox, &whitenoise.database)
+            user.add_relays(&[relay], RelayType::Inbox, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -353,16 +370,20 @@ mod tests {
         async fn test_get_account_relay_statuses_ignores_unrelated_discovery_status() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, keys) = create_test_account(&whitenoise).await;
-            let account = account.save(&whitenoise.database).await.unwrap();
-            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .unwrap();
 
-            let user = account.user(&whitenoise.database).await.unwrap();
+            let user = account.user(&whitenoise.shared.database).await.unwrap();
             let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
             let relay = whitenoise
                 .find_or_create_relay_by_url(&relay_url)
                 .await
                 .unwrap();
-            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.database)
+            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -380,16 +401,20 @@ mod tests {
         async fn test_get_account_relay_statuses_reads_account_inbox_plane() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, keys) = create_test_account(&whitenoise).await;
-            let account = account.save(&whitenoise.database).await.unwrap();
-            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .unwrap();
 
-            let user = account.user(&whitenoise.database).await.unwrap();
+            let user = account.user(&whitenoise.shared.database).await.unwrap();
             let relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
             let relay = whitenoise
                 .find_or_create_relay_by_url(&relay_url)
                 .await
                 .unwrap();
-            user.add_relays(&[relay], RelayType::Inbox, &whitenoise.database)
+            user.add_relays(&[relay], RelayType::Inbox, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -413,16 +438,20 @@ mod tests {
         async fn test_get_account_relay_statuses_reads_ephemeral_plane_for_nip65() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, keys) = create_test_account(&whitenoise).await;
-            let account = account.save(&whitenoise.database).await.unwrap();
-            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .unwrap();
 
-            let user = account.user(&whitenoise.database).await.unwrap();
+            let user = account.user(&whitenoise.shared.database).await.unwrap();
             let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
             let relay = whitenoise
                 .find_or_create_relay_by_url(&relay_url)
                 .await
                 .unwrap();
-            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.database)
+            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -446,16 +475,20 @@ mod tests {
         async fn test_get_account_relay_statuses_reads_unscoped_ephemeral_plane_for_nip65() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, keys) = create_test_account(&whitenoise).await;
-            let account = account.save(&whitenoise.database).await.unwrap();
-            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .unwrap();
 
-            let user = account.user(&whitenoise.database).await.unwrap();
+            let user = account.user(&whitenoise.shared.database).await.unwrap();
             let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
             let relay = whitenoise
                 .find_or_create_relay_by_url(&relay_url)
                 .await
                 .unwrap();
-            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.database)
+            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 

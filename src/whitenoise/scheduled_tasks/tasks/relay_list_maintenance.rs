@@ -40,13 +40,13 @@ impl Task for RelayListMaintenance {
     }
 
     #[perf_instrument("scheduled::relay_list_maintenance")]
-    async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+    async fn execute(&self, whitenoise: std::sync::Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
         tracing::debug!(
             target: "whitenoise::scheduler::relay_list_maintenance",
             "Starting relay list maintenance"
         );
 
-        let accounts = Account::all(&whitenoise.database).await?;
+        let accounts = Account::all(&whitenoise.shared.database).await?;
 
         if accounts.is_empty() {
             tracing::debug!(
@@ -57,7 +57,10 @@ impl Task for RelayListMaintenance {
         }
 
         let results: Vec<MaintenanceResult> = stream::iter(accounts)
-            .map(|account| async move { maintain_relay_lists(whitenoise, &account).await })
+            .map(|account| {
+                let whitenoise = whitenoise.clone();
+                async move { maintain_relay_lists(&whitenoise, &account).await }
+            })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .flat_map(stream::iter)
             .collect()
@@ -146,7 +149,7 @@ async fn check_and_republish(
     relay_type: RelayType,
 ) -> MaintenanceResult {
     // 1. Read local relay config from DB
-    let local_relays = match account.relays(relay_type, whitenoise).await {
+    let local_relays = match account.relays(relay_type, &whitenoise.shared).await {
         Ok(relays) => relays,
         Err(e) => return MaintenanceResult::Error(e),
     };
@@ -164,7 +167,7 @@ async fn check_and_republish(
     // 2. Determine where to look for the event on the network.
     //    Use NIP-65 relays as the source, falling back to the relay list's own
     //    relays when NIP-65 is empty (e.g. the account only has inbox/kp relays).
-    let source_relays = match account.nip65_relays(whitenoise).await {
+    let source_relays = match account.nip65_relays(&whitenoise.shared).await {
         Ok(nip65) if !nip65.is_empty() => nip65,
         Ok(_) => local_relays.clone(),
         Err(e) => {
@@ -183,6 +186,7 @@ async fn check_and_republish(
 
     // 3. Query the network for the existing relay list event
     let network_event = match whitenoise
+        .shared
         .relay_control
         .fetch_user_relays(account.pubkey, relay_type, &source_urls)
         .await
@@ -237,6 +241,7 @@ async fn check_and_republish(
     let target_urls = Relay::urls(&source_relays);
 
     match whitenoise
+        .shared
         .relay_control
         .publish_relay_list_with_signer(&relay_urls, relay_type, &target_urls, signer)
         .await
@@ -278,6 +283,7 @@ mod tests {
 
         loop {
             match whitenoise
+                .shared
                 .relay_control
                 .fetch_user_relays(account.pubkey, relay_type, source_urls)
                 .await
@@ -304,10 +310,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_no_accounts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let task = RelayListMaintenance;
-        let result = task.execute(whitenoise).await;
+        let result = task.execute(whitenoise.clone()).await;
 
         assert!(result.is_ok());
     }
@@ -369,34 +374,36 @@ mod tests {
     #[tokio::test]
     async fn test_execute_is_noop_when_relay_lists_already_present() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         // Create account — this publishes relay lists to the local test relays
         let account = whitenoise.create_identity().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify local relay config exists
-        let inbox_relays = account.inbox_relays(whitenoise).await.unwrap();
+        let inbox_relays = account.inbox_relays(&whitenoise.shared).await.unwrap();
         assert!(!inbox_relays.is_empty(), "Account should have inbox relays");
 
-        let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
+        let kp_relays = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(
             !kp_relays.is_empty(),
             "Account should have key package relays"
         );
 
         // Verify relay lists are discoverable on the network before maintenance
-        let nip65_urls = Relay::urls(&account.nip65_relays(whitenoise).await.unwrap());
+        let nip65_urls = Relay::urls(&account.nip65_relays(&whitenoise.shared).await.unwrap());
 
         assert!(
-            wait_for_relay_list_on_network(whitenoise, &account, RelayType::Inbox, &nip65_urls)
+            wait_for_relay_list_on_network(&whitenoise, &account, RelayType::Inbox, &nip65_urls)
                 .await,
             "Inbox relay list should be on network before maintenance"
         );
 
         assert!(
             wait_for_relay_list_on_network(
-                whitenoise,
+                &whitenoise,
                 &account,
                 RelayType::KeyPackage,
                 &nip65_urls,
@@ -407,11 +414,12 @@ mod tests {
 
         // Run maintenance — should be a no-op since both lists are already present
         let task = RelayListMaintenance;
-        let result = task.execute(whitenoise).await;
+        let result = task.execute(whitenoise.clone()).await;
         assert!(result.is_ok());
 
         // Verify relay lists are still discoverable after maintenance (unchanged)
         let inbox_after = whitenoise
+            .shared
             .relay_control
             .fetch_user_relays(account.pubkey, RelayType::Inbox, &nip65_urls)
             .await
@@ -422,6 +430,7 @@ mod tests {
         );
 
         let kp_after = whitenoise
+            .shared
             .relay_control
             .fetch_user_relays(account.pubkey, RelayType::KeyPackage, &nip65_urls)
             .await
@@ -440,24 +449,26 @@ mod tests {
     #[tokio::test]
     async fn test_maintain_relay_lists_skips_when_no_local_relays() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         // Create a bare account with no relay config — simulates an account
         // where relay list publishing failed and no local relays were saved.
         let keys = nostr_sdk::Keys::generate();
-        let account = Account::new_external(whitenoise, keys.public_key())
+        let account = Account::new_external(&whitenoise, keys.public_key())
             .await
             .unwrap();
-        let account = account.save(&whitenoise.database).await.unwrap();
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
 
         // Verify no local relays exist
-        let inbox = account.inbox_relays(whitenoise).await.unwrap();
-        let kp = account.key_package_relays(whitenoise).await.unwrap();
+        let inbox = account.inbox_relays(&whitenoise.shared).await.unwrap();
+        let kp = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(inbox.is_empty(), "Should have no inbox relays");
         assert!(kp.is_empty(), "Should have no key package relays");
 
         // Run maintain_relay_lists directly — both types should be Skipped
-        let results = maintain_relay_lists(whitenoise, &account).await;
+        let results = maintain_relay_lists(&whitenoise, &account).await;
         assert_eq!(results.len(), 2);
         assert!(
             results

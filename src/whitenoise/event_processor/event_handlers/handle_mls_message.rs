@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use mdk_core::prelude::group_types::GroupState;
 use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingOutcome, MessageProcessingResult};
@@ -7,6 +9,7 @@ use nostr_sdk::prelude::*;
 #[cfg(test)]
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::{
+    nostr_manager::parser::ContentParser,
     perf_instrument, perf_span,
     whitenoise::{
         Whitenoise,
@@ -16,9 +19,11 @@ use crate::{
         chat_list_streaming::ChatListUpdateTrigger,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
+        message_aggregator::processor::{extract_deletion_target_ids, extract_reaction_target_id},
         message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
         message_streaming::{MessageUpdate, UpdateTrigger},
         push_notifications::is_push_group_message_kind,
+        session::AccountSession,
     },
 };
 #[cfg(test)]
@@ -45,7 +50,22 @@ fn extract_group_id(result: &MessageProcessingResult) -> Option<&GroupId> {
 
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
-    pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
+    pub async fn handle_mls_message(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        event: Event,
+    ) -> Result<()> {
+        if session.account_pubkey != account.pubkey {
+            tracing::error!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                session_pubkey = %session.account_pubkey.to_hex(),
+                account_pubkey = %account.pubkey.to_hex(),
+                "Refusing to process MLS message: session and account refer to different identities"
+            );
+            return Err(WhitenoiseError::AccountNotFound);
+        }
+
         tracing::debug!(
           target: "whitenoise::event_processor::handle_mls_message",
           "Handling MLS message {} (kind {}) for account: {}",
@@ -54,7 +74,7 @@ impl Whitenoise {
           account.pubkey.to_hex()
         );
 
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let mdk = &*session.mdk;
         let _mls_proc = perf_span!("event_handlers::mls_process_message");
         let outcome = match mdk.process_message_with_context(&event) {
             Ok(outcome) => {
@@ -91,10 +111,13 @@ impl Whitenoise {
         // MDK has already processed the message (updating MLS state), but we
         // must not write application-level data for a group the user deleted.
         if let Some(group_id) = extract_group_id(&outcome.result) {
-            let has_account_group =
-                AccountGroup::find_by_account_and_group(&account.pubkey, group_id, &self.database)
-                    .await?
-                    .is_some();
+            let has_account_group = AccountGroup::find_by_account_and_group(
+                &account.pubkey,
+                group_id,
+                &session.account_db.inner.pool,
+            )
+            .await?
+            .is_some();
 
             if !has_account_group {
                 tracing::info!(
@@ -110,8 +133,9 @@ impl Whitenoise {
 
         if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome) {
             self.handle_application_message_outcome(
+                session,
                 account,
-                &mdk,
+                mdk,
                 &outcome,
                 group_id,
                 inner_event,
@@ -120,7 +144,7 @@ impl Whitenoise {
             .await?;
         }
 
-        self.handle_non_application_outcome(account, &mdk, outcome.result)
+        self.handle_non_application_outcome(session, account, mdk, outcome.result)
             .await?;
 
         Ok(())
@@ -129,6 +153,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn handle_application_message_outcome(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
         mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         outcome: &MessageProcessingOutcome,
@@ -137,8 +162,9 @@ impl Whitenoise {
         message: Message,
     ) -> Result<()> {
         if is_push_group_message_kind(message.kind) {
-            if let Err(error) = self
-                .handle_push_application_message(mdk, account, outcome, &message)
+            if let Err(error) = session
+                .push()
+                .handle_received_push_group_message(&message, outcome.context.sender_leaf_index)
                 .await
             {
                 tracing::warn!(
@@ -158,23 +184,6 @@ impl Whitenoise {
             .await
     }
 
-    async fn handle_push_application_message(
-        &self,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
-        account: &Account,
-        outcome: &MessageProcessingOutcome,
-        message: &Message,
-    ) -> Result<()> {
-        self.handle_received_push_group_message(
-            mdk,
-            account,
-            message,
-            outcome.context.sender_leaf_index,
-        )
-        .await?;
-        Ok(())
-    }
-
     #[perf_instrument("event_handlers")]
     async fn handle_standard_application_message(
         &self,
@@ -184,21 +193,32 @@ impl Whitenoise {
         inner_event: UnsignedEvent,
         message: Message,
     ) -> Result<()> {
+        let session = self
+            .account_manager
+            .get_session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let media_files = crate::whitenoise::media_files::MediaFiles::new(
+            &self.shared.storage,
+            &self.shared.database,
+            &session.account_db.inner.pool,
+        );
+
         let parsed_references = {
             let media_manager = mdk.media_manager(group_id.clone());
-            self.media_files()
-                .parse_imeta_tags_from_event(&inner_event, &media_manager)?
+            media_files.parse_imeta_tags_from_event(&inner_event, &media_manager)?
         };
 
-        self.media_files()
+        media_files
             .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
             .await?;
 
         match message.kind {
             Kind::ChatMessage => {
-                let msg = self.cache_chat_message(&group_id, &message).await?;
+                let msg = self
+                    .cache_chat_message(&account.pubkey, &group_id, &message)
+                    .await?;
                 let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
-                Whitenoise::spawn_new_message_notification_if_enabled(
+                self.spawn_new_message_notification_if_enabled(
                     account, &group_id, &msg, group_name,
                 );
                 self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
@@ -210,12 +230,15 @@ impl Whitenoise {
                 .await;
             }
             Kind::Reaction => {
-                if let Some(target) = self.cache_reaction(&group_id, &message).await? {
+                if let Some(target) = self
+                    .cache_reaction(&account.pubkey, &group_id, &message)
+                    .await?
+                {
                     self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
                 }
             }
             Kind::EventDeletion => {
-                self.handle_deletion_application_message(&group_id, &message)
+                self.handle_deletion_application_message(&account.pubkey, &group_id, &message)
                     .await?;
             }
             _ => {
@@ -228,12 +251,16 @@ impl Whitenoise {
 
     async fn handle_deletion_application_message(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<()> {
-        let last_message_id = self.get_last_message_id(group_id).await;
+        let last_message_id = self.get_last_message_id(account_pubkey, group_id).await;
 
-        for (trigger, msg) in self.cache_deletion(group_id, message).await? {
+        for (trigger, msg) in self
+            .cache_deletion(account_pubkey, group_id, message)
+            .await?
+        {
             self.emit_message_update(group_id, trigger, msg);
         }
 
@@ -243,7 +270,7 @@ impl Whitenoise {
         // modifies shared state). We emit for ALL subscribed accounts because
         // subsequent handlers will see incorrect post-deletion state.
         if let Some(last_message_id) = last_message_id {
-            let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
+            let deleted_ids = extract_deletion_target_ids(&message.tags);
             if deleted_ids.contains(&last_message_id) {
                 self.emit_chat_list_update_for_group(
                     group_id,
@@ -259,6 +286,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn handle_non_application_outcome(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
         mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         result: MessageProcessingResult,
@@ -269,7 +297,7 @@ impl Whitenoise {
         match result {
             MessageProcessingResult::ApplicationMessage(_) => Ok(()),
             MessageProcessingResult::Proposal(update_result) => {
-                self.handle_auto_committed_proposal(account, mdk, update_result)
+                self.handle_auto_committed_proposal(session, account, update_result)
                     .await
             }
             MessageProcessingResult::PendingProposal { mls_group_id } => {
@@ -301,7 +329,7 @@ impl Whitenoise {
                 Ok(())
             }
             MessageProcessingResult::Commit { mls_group_id } => {
-                self.handle_commit_outcome(account, mdk, &mls_group_id)
+                self.handle_commit_outcome(session, account, mdk, &mls_group_id)
                     .await
             }
             MessageProcessingResult::Unprocessable { mls_group_id } => {
@@ -331,20 +359,17 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn handle_auto_committed_proposal(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         update_result: mdk_core::prelude::UpdateGroupResult,
     ) -> Result<()> {
         let group_id = &update_result.mls_group_id;
-        let relay_urls = Self::ensure_group_relays(mdk, group_id)?;
+        let groups = session.groups();
+        let relay_urls = groups.ensure_relays(group_id)?;
 
-        self.publish_and_merge_commit(
-            update_result.evolution_event.clone(),
-            &account.pubkey,
-            group_id,
-            &relay_urls,
-        )
-        .await?;
+        groups
+            .publish_and_merge_commit(update_result.evolution_event.clone(), group_id, &relay_urls)
+            .await?;
 
         self.background_refresh_account_group_subscriptions(account);
 
@@ -366,7 +391,7 @@ impl Whitenoise {
 
         self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewLastMessage)
             .await;
-        Self::background_sync_group_image_cache_if_needed(account, group_id);
+        self.background_sync_group_image_cache_if_needed(account, group_id);
 
         Ok(())
     }
@@ -374,6 +399,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn handle_commit_outcome(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
         mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         mls_group_id: &GroupId,
@@ -396,12 +422,17 @@ impl Whitenoise {
                 account.pubkey.to_hex(),
                 hex::encode(mls_group_id.as_slice())
             );
-            self.mark_as_removed(account, mls_group_id).await?;
+            let _ = session
+                .membership()
+                .for_group(mls_group_id)
+                .mark_as_removed()
+                .await?;
         }
 
         if still_active
-            && let Err(error) = self
-                .reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
+            && let Err(error) = session
+                .push()
+                .reconcile_group_tokens_for_active_leaves(mls_group_id)
                 .await
         {
             tracing::warn!(
@@ -415,7 +446,7 @@ impl Whitenoise {
 
         self.background_refresh_account_group_subscriptions(account);
         if still_active {
-            Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
+            self.background_sync_group_image_cache_if_needed(account, mls_group_id);
         }
 
         Ok(())
@@ -449,17 +480,26 @@ impl Whitenoise {
         trigger: UpdateTrigger,
         message: ChatMessage,
     ) {
-        self.message_stream_manager
+        self.shared
+            .message_stream_manager
             .emit(group_id, MessageUpdate { trigger, message });
     }
 
     /// Gets the ID of the last message in a group (if any).
-    async fn get_last_message_id(&self, group_id: &GroupId) -> Option<String> {
-        AggregatedMessage::find_last_by_group_ids(std::slice::from_ref(group_id), &self.database)
-            .await
-            .ok()
-            .and_then(|v| v.into_iter().next())
-            .map(|s| s.message_id.to_hex())
+    async fn get_last_message_id(
+        &self,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+    ) -> Option<String> {
+        let session = self.account_manager.get_session(account_pubkey)?;
+        AggregatedMessage::find_last_by_group_ids(
+            std::slice::from_ref(group_id),
+            &session.account_db.inner,
+        )
+        .await
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|s| s.message_id.to_hex())
     }
 
     /// Cache a new chat message and return it for emission.
@@ -469,31 +509,54 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn cache_chat_message(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<ChatMessage> {
-        let media_files = MediaFile::find_by_group(&self.database, group_id).await?;
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let media_files = MediaFile::find_by_group(
+            &session.account_db.inner.pool,
+            &self.shared.database,
+            account_pubkey,
+            group_id,
+        )
+        .await?;
 
         let mut chat_message = self
+            .shared
             .message_aggregator
-            .process_single_message(message, &self.content_parser, media_files)
+            .process_single_message(message, &ContentParser::new(), media_files)
             .await?;
 
         // Preserve existing delivery status for relay echoes of locally-sent messages.
         // This keeps stream payloads aligned with the latest DB state instead of
         // regressing to `None` on reprocessing.
-        if let Some(existing_message) =
-            AggregatedMessage::find_by_id(&chat_message.id, group_id, &self.database).await?
+        if let Some(existing_message) = AggregatedMessage::find_by_id(
+            &chat_message.id,
+            group_id,
+            account_pubkey,
+            &session.account_db.inner,
+        )
+        .await?
             && existing_message.delivery_status.is_some()
         {
             chat_message.delivery_status = existing_message.delivery_status;
         }
 
-        AggregatedMessage::insert_message(&chat_message, group_id, &self.database).await?;
+        AggregatedMessage::insert_message(
+            &chat_message,
+            group_id,
+            account_pubkey,
+            &session.account_db.inner,
+        )
+        .await?;
 
         // Apply orphaned reactions/deletions - modifies in-place and returns final state
         let final_message = self
-            .apply_orphaned_reactions_and_deletions(chat_message, group_id)
+            .apply_orphaned_reactions_and_deletions(account_pubkey, chat_message, group_id)
             .await?;
 
         tracing::debug!(
@@ -514,14 +577,24 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn cache_reaction(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Option<ChatMessage>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         // If this reaction already has a delivery status, it was sent by us and already
         // applied to the parent — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.
-        if AggregatedMessage::has_delivery_status(&message.id.to_string(), group_id, &self.database)
-            .await?
+        if AggregatedMessage::has_delivery_status(
+            &message.id.to_string(),
+            group_id,
+            account_pubkey,
+            &session.account_db.inner,
+        )
+        .await?
         {
             tracing::debug!(
                 target: "whitenoise::cache",
@@ -532,9 +605,11 @@ impl Whitenoise {
             return Ok(None);
         }
 
-        AggregatedMessage::insert_reaction(message, group_id, &self.database).await?;
+        AggregatedMessage::insert_reaction(message, group_id, &session.account_db.inner).await?;
 
-        let result = self.apply_reaction_to_target(message, group_id).await?;
+        let result = self
+            .apply_reaction_to_target(account_pubkey, message, group_id)
+            .await?;
 
         if result.is_none() {
             tracing::debug!(
@@ -560,20 +635,30 @@ impl Whitenoise {
     /// Returns `Err` for real failures (malformed tags, invalid emoji, DB errors).
     async fn apply_reaction_to_target(
         &self,
+        account_pubkey: &PublicKey,
         reaction: &Message,
         group_id: &GroupId,
     ) -> Result<Option<ChatMessage>> {
-        let target_id = Self::extract_reaction_target_id(&reaction.tags)?;
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let target_id = extract_reaction_target_id(&reaction.tags)?;
 
-        let Some(mut target) =
-            AggregatedMessage::find_by_id(&target_id, group_id, &self.database).await?
+        let Some(mut target) = AggregatedMessage::find_by_id(
+            &target_id,
+            group_id,
+            account_pubkey,
+            &session.account_db.inner,
+        )
+        .await?
         else {
             return Ok(None); // True orphan: target not yet cached
         };
 
         let emoji = emoji_utils::validate_and_normalize_reaction(
             &reaction.content,
-            self.message_aggregator.config().normalize_emoji,
+            self.shared.message_aggregator.config().normalize_emoji,
         )?;
 
         reaction_handler::add_reaction_to_message(
@@ -588,7 +673,7 @@ impl Whitenoise {
             &target.id,
             group_id,
             &target.reactions,
-            &self.database,
+            &session.account_db.inner,
         )
         .await?;
 
@@ -602,14 +687,24 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn cache_deletion(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         // If this deletion already has a delivery status, it was sent by us and already
         // applied to targets — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.
-        if AggregatedMessage::has_delivery_status(&message.id.to_string(), group_id, &self.database)
-            .await?
+        if AggregatedMessage::has_delivery_status(
+            &message.id.to_string(),
+            group_id,
+            account_pubkey,
+            &session.account_db.inner,
+        )
+        .await?
         {
             tracing::debug!(
                 target: "whitenoise::cache",
@@ -620,9 +715,11 @@ impl Whitenoise {
             return Ok(Vec::new());
         }
 
-        AggregatedMessage::insert_deletion(message, group_id, &self.database).await?;
+        AggregatedMessage::insert_deletion(message, group_id, &session.account_db.inner).await?;
 
-        let updates = self.apply_deletions_to_targets(message, group_id).await?;
+        let updates = self
+            .apply_deletions_to_targets(account_pubkey, message, group_id)
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::cache",
@@ -638,15 +735,22 @@ impl Whitenoise {
     /// Apply deletion to all targets and collect updates to emit.
     async fn apply_deletions_to_targets(
         &self,
+        account_pubkey: &PublicKey,
         deletion: &Message,
         group_id: &GroupId,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
-        let target_ids = Self::extract_deletion_target_ids(&deletion.tags);
+        let target_ids = extract_deletion_target_ids(&deletion.tags);
         let mut updates = Vec::with_capacity(target_ids.len());
 
         for target_id in target_ids {
             if let Some(update) = self
-                .apply_single_deletion(&target_id, &deletion.id, group_id)
+                .apply_single_deletion(
+                    account_pubkey,
+                    &deletion.pubkey,
+                    &target_id,
+                    &deletion.id,
+                    group_id,
+                )
                 .await?
             {
                 updates.push(update);
@@ -657,67 +761,110 @@ impl Whitenoise {
     }
 
     /// Apply deletion to a single target, returning the appropriate update.
+    ///
+    /// Only authors may delete their own reactions or messages. Deletions whose
+    /// `deletion_author` does not match the target row's `author` are skipped
+    /// with a warning so a malicious peer can't wipe other members' content.
     async fn apply_single_deletion(
         &self,
+        account_pubkey: &PublicKey,
+        deletion_author: &PublicKey,
         target_id: &str,
         deletion_event_id: &EventId,
         group_id: &GroupId,
     ) -> Result<Option<(UpdateTrigger, ChatMessage)>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         // Check if target is a reaction
         if let Some(reaction) =
-            AggregatedMessage::find_reaction_by_id(target_id, group_id, &self.database).await?
+            AggregatedMessage::find_reaction_by_id(target_id, group_id, &session.account_db.inner)
+                .await?
         {
+            if &reaction.author != deletion_author {
+                tracing::warn!(
+                    target: "whitenoise::cache",
+                    deletion_author = %deletion_author.to_hex(),
+                    target_author = %reaction.author.to_hex(),
+                    target_id = target_id,
+                    "Ignoring deletion whose author does not match reaction author"
+                );
+                return Ok(None);
+            }
+
             let parent_update = self
-                .remove_reaction_from_parent(&reaction, group_id)
+                .remove_reaction_from_parent(account_pubkey, &reaction, group_id)
                 .await?;
             AggregatedMessage::mark_deleted(
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.database,
+                deletion_author,
+                &session.account_db.inner,
             )
             .await?;
             return Ok(parent_update.map(|msg| (UpdateTrigger::ReactionRemoved, msg)));
         }
 
         // Check if target is a message
-        if let Some(mut msg) =
-            AggregatedMessage::find_by_id(target_id, group_id, &self.database).await?
+        if let Some(mut msg) = AggregatedMessage::find_by_id(
+            target_id,
+            group_id,
+            account_pubkey,
+            &session.account_db.inner,
+        )
+        .await?
         {
+            if &msg.author != deletion_author {
+                tracing::warn!(
+                    target: "whitenoise::cache",
+                    deletion_author = %deletion_author.to_hex(),
+                    target_author = %msg.author.to_hex(),
+                    target_id = target_id,
+                    "Ignoring deletion whose author does not match message author"
+                );
+                return Ok(None);
+            }
+
             msg.is_deleted = true;
             AggregatedMessage::mark_deleted(
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.database,
+                deletion_author,
+                &session.account_db.inner,
             )
             .await?;
             return Ok(Some((UpdateTrigger::MessageDeleted, msg)));
         }
 
-        // Unknown target - still mark for audit trail (orphaned deletion)
-        AggregatedMessage::mark_deleted(
-            target_id,
-            group_id,
-            &deletion_event_id.to_string(),
-            &self.database,
-        )
-        .await?;
+        // Unknown target — orphan; reconciliation happens when the target arrives.
         Ok(None)
     }
 
     /// Remove a reaction from its parent message and return the updated parent.
     async fn remove_reaction_from_parent(
         &self,
+        account_pubkey: &PublicKey,
         reaction: &AggregatedMessage,
         group_id: &GroupId,
     ) -> Result<Option<ChatMessage>> {
-        let Ok(parent_id) = Self::extract_reaction_target_id(&reaction.tags) else {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let Ok(parent_id) = extract_reaction_target_id(&reaction.tags) else {
             return Ok(None);
         };
 
-        let Some(mut parent) =
-            AggregatedMessage::find_by_id(&parent_id, group_id, &self.database).await?
+        let Some(mut parent) = AggregatedMessage::find_by_id(
+            &parent_id,
+            group_id,
+            account_pubkey,
+            &session.account_db.inner,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -727,7 +874,7 @@ impl Whitenoise {
                 &parent_id,
                 group_id,
                 &parent.reactions,
-                &self.database,
+                &session.account_db.inner,
             )
             .await?;
 
@@ -744,36 +891,33 @@ impl Whitenoise {
         }
     }
 
-    pub(crate) fn extract_reaction_target_id(tags: &Tags) -> Result<String> {
-        tags.iter()
-            .find(|tag| tag.kind() == nostr_sdk::TagKind::e())
-            .and_then(|tag| tag.content().map(|s| s.to_string()))
-            .ok_or_else(|| WhitenoiseError::InvalidEvent("Reaction missing e-tag".to_string()))
-    }
-
-    pub(crate) fn extract_deletion_target_ids(tags: &Tags) -> Vec<String> {
-        tags.iter()
-            .filter(|tag| tag.kind() == nostr_sdk::TagKind::e())
-            .filter_map(|tag| tag.content().map(|s| s.to_string()))
-            .collect()
-    }
-
     /// Apply any orphaned reactions/deletions to a newly cached message.
     ///
     /// Takes ownership of the message, modifies in-place, and returns the final state.
     /// This avoids re-fetching from the database after applying orphans.
     async fn apply_orphaned_reactions_and_deletions(
         &self,
+        account_pubkey: &PublicKey,
         mut message: ChatMessage,
         group_id: &GroupId,
     ) -> Result<ChatMessage> {
-        let orphaned_reactions =
-            AggregatedMessage::find_orphaned_reactions(&message.id, group_id, &self.database)
-                .await?;
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let orphaned_reactions = AggregatedMessage::find_orphaned_reactions(
+            &message.id,
+            group_id,
+            &session.account_db.inner,
+        )
+        .await?;
 
-        let orphaned_deletions =
-            AggregatedMessage::find_orphaned_deletions(&message.id, group_id, &self.database)
-                .await?;
+        let orphaned_deletions = AggregatedMessage::find_orphaned_deletions(
+            &message.id,
+            group_id,
+            &session.account_db.inner,
+        )
+        .await?;
 
         if !orphaned_reactions.is_empty() || !orphaned_deletions.is_empty() {
             tracing::info!(
@@ -789,7 +933,7 @@ impl Whitenoise {
         for reaction in orphaned_reactions {
             let reaction_emoji = match emoji_utils::validate_and_normalize_reaction(
                 &reaction.content,
-                self.message_aggregator.config().normalize_emoji,
+                self.shared.message_aggregator.config().normalize_emoji,
             ) {
                 Ok(emoji) => emoji,
                 Err(e) => {
@@ -818,19 +962,33 @@ impl Whitenoise {
                 &message.id,
                 group_id,
                 &message.reactions,
-                &self.database,
+                &session.account_db.inner,
             )
             .await?;
         }
 
-        // Apply orphaned deletions
-        for deletion_event_id in orphaned_deletions {
+        // Apply orphaned deletions, but only those whose author matches the
+        // target message author. Cross-author deletions never legitimately
+        // apply and would let a malicious peer wipe other members' content.
+        for deletion in orphaned_deletions {
+            if deletion.author != message.author {
+                tracing::warn!(
+                    target: "whitenoise::cache",
+                    deletion_author = %deletion.author.to_hex(),
+                    target_author = %message.author.to_hex(),
+                    target_id = %message.id,
+                    "Ignoring orphaned deletion whose author does not match message author"
+                );
+                continue;
+            }
+
             message.is_deleted = true;
             AggregatedMessage::mark_deleted(
                 &message.id,
                 group_id,
-                &deletion_event_id.to_string(),
-                &self.database,
+                &deletion.event_id.to_string(),
+                &deletion.author,
+                &session.account_db.inner,
             )
             .await?;
         }
@@ -882,14 +1040,17 @@ mod tests {
         // Arrange: Setup whitenoise and create a group
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -915,15 +1076,19 @@ mod tests {
         let message_event = mdk.create_message(group_id, inner, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, message_event)
+            .handle_mls_message(&creator_session, &creator_account, message_event)
             .await;
         assert!(result.is_ok(), "Failed to handle regular message");
 
         // Verify message was cached
-        let cached_msg =
-            AggregatedMessage::find_by_id(&message_id.to_string(), group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            group_id,
+            &creator_account.pubkey,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap();
         assert!(cached_msg.is_some(), "Message should be cached");
 
         // Test 2: Reaction message (Kind 7)
@@ -938,16 +1103,20 @@ mod tests {
         let reaction_event = mdk.create_message(group_id, reaction_inner, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, reaction_event)
+            .handle_mls_message(&creator_session, &creator_account, reaction_event)
             .await;
         assert!(result.is_ok(), "Failed to handle reaction");
 
         // Verify reaction was applied to cached message
-        let cached_msg =
-            AggregatedMessage::find_by_id(&message_id.to_string(), group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            group_id,
+            &creator_account.pubkey,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             !cached_msg.reactions.by_emoji.is_empty(),
             "Reaction should be applied"
@@ -965,16 +1134,20 @@ mod tests {
         let deletion_event = mdk.create_message(group_id, deletion_inner, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, deletion_event)
+            .handle_mls_message(&creator_session, &creator_account, deletion_event)
             .await;
         assert!(result.is_ok(), "Failed to handle deletion");
 
         // Verify message was marked as deleted
-        let cached_msg =
-            AggregatedMessage::find_by_id(&message_id.to_string(), group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            group_id,
+            &creator_account.pubkey,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(cached_msg.is_deleted, "Message should be marked as deleted");
     }
 
@@ -982,14 +1155,17 @@ mod tests {
     async fn test_cache_chat_message_preserves_existing_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1020,7 +1196,7 @@ mod tests {
 
         // Initial cache pass creates the row without delivery status.
         let first = whitenoise
-            .cache_chat_message(&group.mls_group_id, &message)
+            .cache_chat_message(&creator_account.pubkey, &group.mls_group_id, &message)
             .await
             .unwrap();
         assert_eq!(first.delivery_status, None);
@@ -1029,15 +1205,16 @@ mod tests {
         AggregatedMessage::update_delivery_status(
             &message_id.to_string(),
             &group.mls_group_id,
+            &creator_account.pubkey,
             &DeliveryStatus::Sent(1),
-            &whitenoise.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap();
 
         // Relay echo reprocess should preserve the existing status.
         let second = whitenoise
-            .cache_chat_message(&group.mls_group_id, &message)
+            .cache_chat_message(&creator_account.pubkey, &group.mls_group_id, &message)
             .await
             .unwrap();
         assert_eq!(second.delivery_status, Some(DeliveryStatus::Sent(1)));
@@ -1045,7 +1222,8 @@ mod tests {
         let persisted = AggregatedMessage::find_by_id(
             &message_id.to_string(),
             &group.mls_group_id,
-            &whitenoise.database,
+            &creator_account.pubkey,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1058,14 +1236,17 @@ mod tests {
     async fn test_handle_mls_message_error_handling() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1093,7 +1274,7 @@ mod tests {
         bad_event.kind = Kind::TextNote;
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, bad_event)
+            .handle_mls_message(&creator_session, &creator_account, bad_event)
             .await;
 
         assert!(result.is_err(), "Expected error for corrupted event");
@@ -1108,14 +1289,17 @@ mod tests {
     async fn test_handle_mls_message_orphaned_reactions_and_deletions() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1128,7 +1312,8 @@ mod tests {
             .unwrap();
         let group_id = &group.mls_group_id;
 
-        // Create the target message ID before processing it to simulate out-of-order delivery.
+        // Build the message first so MDK can stamp a valid content-hash id,
+        // then tag the orphaned reaction at that id.
         let mut actual_message = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -1137,9 +1322,8 @@ mod tests {
             "Late message".to_string(),
         );
         actual_message.ensure_id();
-        let future_message_id = actual_message.id.expect("message id should be set");
+        let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
-        // Send reaction to non-existent message (orphaned reaction)
         let mut orphaned_reaction = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -1153,7 +1337,7 @@ mod tests {
             .unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, reaction_event)
+            .handle_mls_message(&creator_session, &creator_account, reaction_event)
             .await;
         assert!(result.is_ok(), "Orphaned reaction should be stored");
 
@@ -1161,7 +1345,7 @@ mod tests {
         let orphaned_reactions = AggregatedMessage::find_orphaned_reactions(
             &future_message_id.to_string(),
             group_id,
-            &whitenoise.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1171,11 +1355,10 @@ mod tests {
             "Should have one orphaned reaction"
         );
 
-        // Now send the actual message with the matching ID
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, message_event)
+            .handle_mls_message(&creator_session, &creator_account, message_event)
             .await;
         assert!(
             result.is_ok(),
@@ -1186,7 +1369,8 @@ mod tests {
         let cached_msg = AggregatedMessage::find_by_id(
             &future_message_id.to_string(),
             group_id,
-            &whitenoise.database,
+            &creator_account.pubkey,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1211,14 +1395,17 @@ mod tests {
     async fn test_invalid_orphaned_reactions_are_skipped() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![member_pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1231,6 +1418,8 @@ mod tests {
             .unwrap();
         let group_id = &group.mls_group_id;
 
+        // Build the target first so MDK can stamp a valid content-hash id,
+        // then tag the orphaned reactions at that id.
         let mut actual_message = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -1239,7 +1428,7 @@ mod tests {
             "Target message".to_string(),
         );
         actual_message.ensure_id();
-        let future_message_id = actual_message.id.expect("message id should be set");
+        let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
         // Send a VALID orphaned reaction
         let mut valid_reaction = UnsignedEvent::new(
@@ -1253,7 +1442,7 @@ mod tests {
         let valid_event = mdk.create_message(group_id, valid_reaction, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&creator_account, valid_event)
+            .handle_mls_message(&creator_session, &creator_account, valid_event)
             .await
             .unwrap();
 
@@ -1271,15 +1460,14 @@ mod tests {
             .unwrap();
 
         whitenoise
-            .handle_mls_message(&creator_account, invalid_event)
+            .handle_mls_message(&creator_session, &creator_account, invalid_event)
             .await
             .unwrap();
 
-        // Now send the target message - this should succeed despite invalid orphaned reaction
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, message_event)
+            .handle_mls_message(&creator_session, &creator_account, message_event)
             .await;
 
         // The critical assertion: message processing should succeed
@@ -1292,7 +1480,8 @@ mod tests {
         let cached_msg = AggregatedMessage::find_by_id(
             &future_message_id.to_string(),
             group_id,
-            &whitenoise.database,
+            &creator_account.pubkey,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1366,12 +1555,12 @@ mod tests {
         // Test extract_reaction_target_id
         let mut tags = Tags::new();
         tags.push(Tag::parse(vec!["e", "test_event_id"]).unwrap());
-        let target_id = Whitenoise::extract_reaction_target_id(&tags).unwrap();
+        let target_id = extract_reaction_target_id(&tags).unwrap();
         assert_eq!(target_id, "test_event_id");
 
         // Test extract_reaction_target_id with missing e-tag
         let empty_tags = Tags::new();
-        let result = Whitenoise::extract_reaction_target_id(&empty_tags);
+        let result = extract_reaction_target_id(&empty_tags);
         assert!(result.is_err(), "Should fail with missing e-tag");
 
         // Test extract_deletion_target_ids with multiple targets
@@ -1380,7 +1569,7 @@ mod tests {
         tags.push(Tag::parse(vec!["e", "id2"]).unwrap());
         tags.push(Tag::parse(vec!["p", "some_pubkey"]).unwrap()); // Should be ignored
 
-        let target_ids = Whitenoise::extract_deletion_target_ids(&tags);
+        let target_ids = extract_deletion_target_ids(&tags);
         assert_eq!(target_ids.len(), 2);
         assert!(target_ids.contains(&"id1".to_string()));
         assert!(target_ids.contains(&"id2".to_string()));
@@ -1391,6 +1580,7 @@ mod tests {
     async fn test_handle_mls_message_cache_integration() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
         let member_accounts = members
@@ -1400,8 +1590,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1428,7 +1620,7 @@ mod tests {
                 .unwrap();
 
             whitenoise
-                .handle_mls_message(&creator_account, event)
+                .handle_mls_message(&creator_session, &creator_account, event)
                 .await
                 .unwrap();
         }
@@ -1436,8 +1628,9 @@ mod tests {
         // Verify all messages are in cache
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator_account.pubkey,
             None,
-            &whitenoise.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1466,6 +1659,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1485,14 +1679,20 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
+        let member_pool = &whitenoise
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            member_pool,
         )
         .await
         .unwrap();
@@ -1506,10 +1706,14 @@ mod tests {
             token_tag.encrypted_token.to_base64()
         );
 
-        let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            &member_account.pubkey,
+            None,
+            &member_session.account_db.inner,
+        )
+        .await
+        .unwrap();
         assert!(cached_messages.is_empty());
     }
 
@@ -1519,6 +1723,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1553,14 +1758,20 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
+        let member_pool = &whitenoise
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            member_pool,
         )
         .await
         .unwrap();
@@ -1577,10 +1788,14 @@ mod tests {
             leaf_one.encrypted_token.to_base64()
         );
 
-        let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            &member_account.pubkey,
+            None,
+            &member_session.account_db.inner,
+        )
+        .await
+        .unwrap();
         assert!(cached_messages.is_empty());
     }
 
@@ -1590,6 +1805,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1600,6 +1816,12 @@ mod tests {
         let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
         let token_tag = make_token_tag(4);
 
+        let member_pool = &whitenoise
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         GroupPushToken::upsert(
             &member_account.pubkey,
             &group_id,
@@ -1608,7 +1830,7 @@ mod tests {
             &token_tag.server_pubkey,
             Some(&token_tag.relay_hint),
             &token_tag.encrypted_token.to_base64(),
-            &whitenoise.database,
+            member_pool,
         )
         .await
         .unwrap();
@@ -1617,23 +1839,27 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, removal, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            member_pool,
         )
         .await
         .unwrap();
         assert!(stored.is_empty());
 
-        let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            &member_account.pubkey,
+            None,
+            &member_session.account_db.inner,
+        )
+        .await
+        .unwrap();
         assert!(cached_messages.is_empty());
     }
 
@@ -1643,6 +1869,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1660,18 +1887,23 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         let dispatched = whitenoise
-            .dispatch_pending_token_response(&member_account, &group_id, request_event_id)
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .dispatch_pending_token_response(&group_id, request_event_id)
             .await
             .unwrap();
         assert!(dispatched);
@@ -1687,6 +1919,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1705,15 +1938,17 @@ mod tests {
         let request_event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, request_event)
+            .handle_mls_message(&member_session, &member_account, request_event)
             .await
             .unwrap();
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         let response = build_token_list_response_rumor(
             admin_account.pubkey,
@@ -1728,18 +1963,23 @@ mod tests {
         let response_event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, response_event)
+            .handle_mls_message(&member_session, &member_account, response_event)
             .await
             .unwrap();
 
-        assert!(!whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            !whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         let dispatched = whitenoise
-            .dispatch_pending_token_response(&member_account, &group_id, request_event_id)
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .dispatch_pending_token_response(&group_id, request_event_id)
             .await
             .unwrap();
         assert!(!dispatched);
@@ -1752,6 +1992,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 2).await;
         let member_one = members[0].0.clone();
         let member_two = members[1].0.clone();
+        let member_two_session = whitenoise.require_session(&member_two.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_one, &member_two]).await;
 
@@ -1769,6 +2010,12 @@ mod tests {
             .expect("removed member leaf should exist before removal");
         let stale_token = make_token_tag(8);
 
+        let member_two_pool = &whitenoise
+            .require_session(&member_two.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         GroupPushToken::upsert(
             &member_two.pubkey,
             &group_id,
@@ -1777,7 +2024,7 @@ mod tests {
             &stale_token.server_pubkey,
             Some(&stale_token.relay_hint),
             &stale_token.encrypted_token.to_base64(),
-            &whitenoise.database,
+            member_two_pool,
         )
         .await
         .unwrap();
@@ -1793,14 +2040,14 @@ mod tests {
         };
 
         whitenoise
-            .handle_mls_message(&member_two, removal_event)
+            .handle_mls_message(&member_two_session, &member_two, removal_event)
             .await
             .unwrap();
 
         let stored = GroupPushToken::find_by_account_and_group(
             &member_two.pubkey,
             &group_id,
-            &whitenoise.database,
+            member_two_pool,
         )
         .await
         .unwrap();
@@ -1820,6 +2067,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
@@ -1837,7 +2085,7 @@ mod tests {
         // Admin processes the leave proposal -- should auto-commit because
         // admin_account is the group admin
         let result = whitenoise
-            .handle_mls_message(&admin_account, leave_result.evolution_event)
+            .handle_mls_message(&admin_session, &admin_account, leave_result.evolution_event)
             .await;
         assert!(
             result.is_ok(),
@@ -1869,6 +2117,7 @@ mod tests {
     async fn test_unprocessable_message_returns_err() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
         let member_accounts = members
@@ -1878,8 +2127,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1905,14 +2156,16 @@ mod tests {
 
         // First processing: should succeed
         let first = whitenoise
-            .handle_mls_message(&creator_account, event.clone())
+            .handle_mls_message(&creator_session, &creator_account, event.clone())
             .await;
         assert!(first.is_ok(), "First processing should succeed: {first:?}");
 
         // Second processing of the same event: MDK returns Unprocessable because
         // the event was already processed and its state recorded as Processed.
         // Our handler must propagate this as an error.
-        let second = whitenoise.handle_mls_message(&creator_account, event).await;
+        let second = whitenoise
+            .handle_mls_message(&creator_session, &creator_account, event)
+            .await;
         assert!(
             second.is_err(),
             "Second processing of same event should return Err"
@@ -1944,6 +2197,7 @@ mod tests {
     async fn test_unprocessable_not_tracked_via_process_account_event() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
         let member_accounts = members
@@ -1953,8 +2207,10 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                &creator_account,
                 vec![members[0].0.pubkey],
                 create_nostr_group_config_data(vec![creator_account.pubkey]),
                 None,
@@ -1994,6 +2250,7 @@ mod tests {
             .await;
 
         let tracked_after_first = whitenoise
+            .shared
             .event_tracker
             .already_processed_account_event(&event_id, &creator_account.pubkey)
             .await
@@ -2013,6 +2270,7 @@ mod tests {
 
         // Still tracked — no double-entry, no crash.
         let tracked_after_second = whitenoise
+            .shared
             .event_tracker
             .already_processed_account_event(&event_id, &creator_account.pubkey)
             .await
@@ -2024,7 +2282,9 @@ mod tests {
 
         // Confirm that handle_mls_message itself returns Err on duplicate so
         // any caller that bypasses the skip check also cannot silently succeed.
-        let direct_result = whitenoise.handle_mls_message(&creator_account, event).await;
+        let direct_result = whitenoise
+            .handle_mls_message(&creator_session, &creator_account, event)
+            .await;
         assert!(
             direct_result.is_err(),
             "Direct second call to handle_mls_message must return Err"
@@ -2039,6 +2299,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
@@ -2054,7 +2315,7 @@ mod tests {
 
         // Admin auto-commits the leave proposal
         whitenoise
-            .handle_mls_message(&admin_account, leave_result.evolution_event)
+            .handle_mls_message(&admin_session, &admin_account, leave_result.evolution_event)
             .await
             .expect("auto-commit should succeed");
 
@@ -2099,11 +2360,12 @@ mod tests {
             fake_event_id,
         );
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &fake_group_id,
-            &fake_event_id,
-        ));
+        assert!(
+            whitenoise
+                .shared
+                .pending_push_token_responses
+                .contains_key(&(member_account.pubkey, fake_group_id.clone(), fake_event_id))
+        );
 
         // Schedule with the same key hits the duplicate-dedup early-return;
         // the existing entry must remain intact.
@@ -2114,11 +2376,10 @@ mod tests {
         );
 
         assert!(
-            whitenoise.has_pending_token_response(
-                &member_account.pubkey,
-                &fake_group_id,
-                &fake_event_id,
-            ),
+            whitenoise
+                .shared
+                .pending_push_token_responses
+                .contains_key(&(member_account.pubkey, fake_group_id.clone(), fake_event_id)),
             "pending entry should still be present after duplicate request"
         );
     }
@@ -2144,25 +2405,29 @@ mod tests {
         let request_event_id = request.id.expect("447 rumor must have an event id");
         let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
-        assert!(whitenoise.has_pending_token_response(
-            &member_account.pubkey,
-            &group_id,
-            &request_event_id,
-        ));
+        assert!(
+            whitenoise
+                .session(&member_account.pubkey)
+                .unwrap()
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), request_event_id))
+        );
 
         // In tests the spawn delay is 0ms; wait for the spawned task to clear the entry.
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if !whitenoise.has_pending_token_response(
-                    &member_account.pubkey,
-                    &group_id,
-                    &request_event_id,
-                ) {
+                if !whitenoise
+                    .session(&member_account.pubkey)
+                    .unwrap()
+                    .pending_push_token_responses
+                    .contains_key(&(group_id.clone(), request_event_id))
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2172,45 +2437,15 @@ mod tests {
         .expect("timed out waiting for spawned token-response task to complete");
     }
 
-    #[tokio::test]
-    async fn test_token_request_dropped_when_semaphore_exhausted() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-
-        // Hold all semaphore permits so the next scheduled response task is dropped.
-        let _guard = whitenoise.exhaust_token_response_semaphore();
-
-        let token_tag = make_token_tag(20);
-        let request =
-            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
-                .unwrap();
-        let request_event_id = request.id.expect("447 rumor must have an event id");
-        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
-
-        whitenoise
-            .handle_mls_message(&member_account, event)
-            .await
-            .unwrap();
-
-        // The task should have been dropped; no pending entry should remain.
-        assert!(
-            !whitenoise.has_pending_token_response(
-                &member_account.pubkey,
-                &group_id,
-                &request_event_id,
-            ),
-            "pending entry should be removed when the concurrency cap is reached"
-        );
-    }
+    // Note: `test_token_request_dropped_when_semaphore_exhausted` was removed
+    // in Phase 18c. It exercised a token-response concurrency cap that only
+    // existed on the legacy `Whitenoise::schedule_pending_token_response` test
+    // fixture (which writes to `SharedServices::pending_push_token_responses`,
+    // a `#[cfg(test)]` map). Production token-response scheduling moved to
+    // `AccountSession::schedule_pending_token_response` in Phase 12 and never
+    // had a cap. The test passed pre-18c only because `has_pending_token_response`
+    // was reading the wrong map; once it correctly checks the session map,
+    // the assertion's premise (cap drops the entry) no longer holds.
 
     /// Verify `extract_group_id` returns the correct group ID for every variant
     /// that carries one, and `None` for `PreviouslyFailed`.

@@ -44,7 +44,7 @@ impl TestCase for SearchGroupMembersTestCase {
             .name(member_name)
             .about("A group co-member");
         member
-            .update_metadata(&metadata, context.whitenoise)
+            .update_metadata(&metadata, &context.whitenoise)
             .await?;
         tracing::info!(
             "Set metadata for member {} ('{}')",

@@ -34,7 +34,7 @@ impl TestCase for VerifyRequiredProposalUpgradeStatusTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let account = context.get_account(&self.account_name)?.clone();
         let group_id = context.get_group(&self.group_name)?.mls_group_id.clone();
-        let wn = context.whitenoise;
+        let wn = context.whitenoise.clone();
         let account_name = self.account_name.clone();
         let proposal = self.proposal;
         let expected = self.expected.clone();
@@ -45,6 +45,7 @@ impl TestCase for VerifyRequiredProposalUpgradeStatusTestCase {
                 let group_id = group_id.clone();
                 let account_name = account_name.clone();
                 let expected = expected.clone();
+                let wn = wn.clone();
 
                 async move {
                     let status = wn

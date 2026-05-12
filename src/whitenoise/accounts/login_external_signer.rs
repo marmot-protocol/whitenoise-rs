@@ -77,7 +77,8 @@ impl Whitenoise {
                 discovered.found(RelayType::Inbox),
                 discovered.found(RelayType::KeyPackage),
             );
-            self.pending_logins.insert(pubkey, discovered);
+            self.account_manager
+                .stash_pending_login(&pubkey, discovered);
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -98,10 +99,9 @@ impl Whitenoise {
         pubkey: &PublicKey,
     ) -> core::result::Result<LoginResult, LoginError> {
         let discovered = self
-            .pending_logins
-            .get(pubkey)
-            .ok_or(LoginError::NoLoginInProgress)?
-            .clone();
+            .account_manager
+            .get_pending_login(pubkey)
+            .ok_or(LoginError::NoLoginInProgress)?;
 
         let signer = self
             .get_external_signer(pubkey)
@@ -118,12 +118,12 @@ impl Whitenoise {
             !discovered.found(RelayType::KeyPackage),
         );
 
-        let account = Account::find_by_pubkey(pubkey, &self.database)
+        let account = Account::find_by_pubkey(pubkey, &self.shared.database)
             .await
             .map_err(LoginError::from)?;
         let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
         let user = account
-            .user(&self.database)
+            .user(&self.shared.database)
             .await
             .map_err(LoginError::from)?;
 
@@ -138,10 +138,11 @@ impl Whitenoise {
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             if !discovered.found(relay_type) {
                 // Missing — assign defaults in the DB and publish via the signer.
-                user.add_relays(&default_relays, relay_type, &self.database)
+                user.add_relays(&default_relays, relay_type, &self.shared.database)
                     .await
                     .map_err(LoginError::from)?;
                 if let Err(error) = self
+                    .shared
                     .relay_control
                     .publish_relay_list_with_signer(
                         &default_urls,
@@ -178,7 +179,7 @@ impl Whitenoise {
         )
         .await?;
 
-        self.pending_logins.remove(pubkey);
+        self.account_manager.take_pending_login(pubkey);
         tracing::info!(
             target: "whitenoise::accounts",
             "Login complete for {}",
@@ -197,7 +198,7 @@ impl Whitenoise {
         pubkey: &PublicKey,
         relay_url: RelayUrl,
     ) -> core::result::Result<LoginResult, LoginError> {
-        if !self.pending_logins.contains_key(pubkey) {
+        if !self.account_manager.has_pending_login(pubkey) {
             return Err(LoginError::NoLoginInProgress);
         }
 
@@ -207,7 +208,7 @@ impl Whitenoise {
                 "External signer not found for pending login".to_string(),
             ))?;
 
-        let mut account = Account::find_by_pubkey(pubkey, &self.database)
+        let mut account = Account::find_by_pubkey(pubkey, &self.shared.database)
             .await
             .map_err(LoginError::from)?;
 
@@ -230,7 +231,7 @@ impl Whitenoise {
             self.sync_discovered_relay_lists(&account, &merged).await?;
             self.complete_external_signer_login(&account, merged.relays(RelayType::Inbox), signer)
                 .await?;
-            self.pending_logins.remove(pubkey);
+            self.account_manager.take_pending_login(pubkey);
             tracing::info!(
                 target: "whitenoise::accounts",
                 "Login complete for {} (found lists on {})",
@@ -292,7 +293,7 @@ impl Whitenoise {
         &self,
         pubkey: PublicKey,
     ) -> core::result::Result<(Account, User), LoginError> {
-        let account = match Account::find_by_pubkey(&pubkey, &self.database).await {
+        let account = match Account::find_by_pubkey(&pubkey, &self.shared.database).await {
             Ok(existing) => {
                 let mut account_mut = existing.clone();
                 if account_mut.account_type != AccountType::External {
@@ -308,6 +309,7 @@ impl Whitenoise {
                         .map_err(LoginError::from)?;
                 }
                 let _ = self
+                    .shared
                     .secrets_store
                     .remove_private_key_for_pubkey(&account_mut.pubkey);
                 account_mut
@@ -323,7 +325,7 @@ impl Whitenoise {
         };
 
         let user = account
-            .user(&self.database)
+            .user(&self.shared.database)
             .await
             .map_err(LoginError::from)?;
         Ok((account, user))
@@ -340,7 +342,7 @@ impl Whitenoise {
     ) -> crate::whitenoise::error::Result<(Account, super::ExternalSignerRelaySetup)> {
         // Check if account already exists
         let mut account =
-            if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+            if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.shared.database).await {
                 tracing::debug!(
                     target: "whitenoise::accounts",
                     "Found existing account"
@@ -361,6 +363,7 @@ impl Whitenoise {
 
                 // Best-effort removal of any local keys
                 let _ = self
+                    .shared
                     .secrets_store
                     .remove_private_key_for_pubkey(&account_mut.pubkey);
 
@@ -424,7 +427,8 @@ impl Whitenoise {
                     target: "whitenoise::accounts",
                     "Publishing NIP-65 relay list (defaults)"
                 );
-                self.relay_control
+                self.shared
+                    .relay_control
                     .publish_relay_list_with_signer(
                         &nip65_urls,
                         RelayType::Nip65,
@@ -442,7 +446,8 @@ impl Whitenoise {
                     target: "whitenoise::accounts",
                     "Publishing inbox relay list (defaults)"
                 );
-                self.relay_control
+                self.shared
+                    .relay_control
                     .publish_relay_list_with_signer(
                         &Relay::urls(&relay_setup.inbox_relays),
                         RelayType::Inbox,
@@ -460,7 +465,8 @@ impl Whitenoise {
                     target: "whitenoise::accounts",
                     "Publishing key package relay list (defaults)"
                 );
-                self.relay_control
+                self.shared
+                    .relay_control
                     .publish_relay_list_with_signer(
                         &Relay::urls(&relay_setup.key_package_relays),
                         RelayType::KeyPackage,
@@ -574,7 +580,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        let result = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&pubkey);
         assert!(
             result.is_err(),
             "External signer account should not have local keys"
@@ -693,15 +702,19 @@ mod tests {
 
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&pubkey)
                 .is_err(),
             "External account should not have stored private key"
         );
 
-        let nip65 = account.nip65_relays(&whitenoise).await.unwrap();
-        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
-        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+        let nip65 = account.nip65_relays(&whitenoise.shared).await.unwrap();
+        let inbox = account.inbox_relays(&whitenoise.shared).await.unwrap();
+        let kp = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
 
         assert!(!nip65.is_empty(), "Should have NIP-65 relays");
         assert!(!inbox.is_empty(), "Should have inbox relays");
@@ -742,7 +755,11 @@ mod tests {
         let (local_account, _) = Account::new(&whitenoise, Some(keys.clone())).await.unwrap();
         assert_eq!(local_account.account_type, AccountType::Local);
         whitenoise.persist_account(&local_account).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         let migrated = whitenoise
             .login_with_external_signer_for_test(keys.clone())
@@ -758,6 +775,7 @@ mod tests {
 
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&pubkey)
                 .is_err(),
@@ -776,9 +794,14 @@ mod tests {
         let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
         whitenoise.persist_account(&account).await.unwrap();
 
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&pubkey)
                 .is_ok()
@@ -791,6 +814,7 @@ mod tests {
 
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&pubkey)
                 .is_err(),
@@ -939,7 +963,11 @@ mod tests {
 
         let (local_account, keys) = Account::new(&whitenoise, None).await.unwrap();
         let local_account = whitenoise.persist_account(&local_account).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
         assert_eq!(local_account.account_type, AccountType::Local);
 
         let (account, _user) = whitenoise
@@ -950,6 +978,7 @@ mod tests {
         assert_eq!(account.account_type, AccountType::External);
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&account.pubkey)
                 .is_err(),

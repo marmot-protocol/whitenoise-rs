@@ -1,9 +1,9 @@
 //! Initialization phase timing for benchmark diagnostics.
 //!
-//! Records wall-clock duration of each phase in [`initialize_whitenoise()`].
+//! Records wall-clock duration of each phase in [`Whitenoise::new`].
 //! In production builds all functions are no-ops that compile to nothing.
 //!
-//! [`initialize_whitenoise()`]: super::Whitenoise::initialize_whitenoise
+//! [`Whitenoise::new`]: super::Whitenoise::new
 
 #[cfg(feature = "benchmark-tests")]
 mod inner {

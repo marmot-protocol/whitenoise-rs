@@ -1,20 +1,25 @@
+//! Database operations for the NIP-51 mute list.
+//!
+//! Lives in the per-account SQLite file. The owning account's pubkey is
+//! implicit — it's whichever account owns the file — so methods take an
+//! `&AccountDatabase` and never need an `account_pubkey` parameter.
+
 use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
 
-use super::{Database, DatabaseError, utils::parse_timestamp};
+use super::DatabaseError;
+use super::account_db::AccountDatabase;
+use super::utils::parse_timestamp;
 use crate::perf_instrument;
 
-/// Row-level representation of a mute list entry from the `mute_list` table.
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-struct MuteListRow {
-    id: i64,
-    account_pubkey: PublicKey,
+/// Local row shape (no `account_pubkey` column — implied by the file).
+struct LocalRow {
     muted_pubkey: PublicKey,
     is_private: bool,
     created_at: DateTime<Utc>,
 }
 
-impl<'r, R> sqlx::FromRow<'r, R> for MuteListRow
+impl<'r, R> sqlx::FromRow<'r, R> for LocalRow
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -22,15 +27,6 @@ where
     i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
     fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
-        let id: i64 = row.try_get("id")?;
-
-        let account_pubkey_str: String = row.try_get("account_pubkey")?;
-        let account_pubkey =
-            PublicKey::parse(&account_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "account_pubkey".to_string(),
-                source: Box::new(e),
-            })?;
-
         let muted_pubkey_str: String = row.try_get("muted_pubkey")?;
         let muted_pubkey =
             PublicKey::parse(&muted_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
@@ -42,8 +38,6 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
 
         Ok(Self {
-            id,
-            account_pubkey,
             muted_pubkey,
             is_private: is_private != 0,
             created_at,
@@ -52,18 +46,19 @@ where
 }
 
 /// Public mute list entry exposed to consumers.
+///
+/// `account_pubkey` is implicit — the owning account is whichever
+/// per-account database the entry came from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MuteListEntry {
-    pub account_pubkey: PublicKey,
     pub muted_pubkey: PublicKey,
     pub is_private: bool,
     pub created_at: DateTime<Utc>,
 }
 
-impl From<MuteListRow> for MuteListEntry {
-    fn from(row: MuteListRow) -> Self {
+impl From<LocalRow> for MuteListEntry {
+    fn from(row: LocalRow) -> Self {
         Self {
-            account_pubkey: row.account_pubkey,
             muted_pubkey: row.muted_pubkey,
             is_private: row.is_private,
             created_at: row.created_at,
@@ -75,73 +70,62 @@ impl MuteListEntry {
     /// Inserts a new mute list entry. Ignores duplicates (UNIQUE constraint).
     #[perf_instrument("mute_list")]
     pub async fn insert(
-        account_pubkey: &PublicKey,
         muted_pubkey: &PublicKey,
         is_private: bool,
-        db: &Database,
+        db: &AccountDatabase,
     ) -> std::result::Result<(), DatabaseError> {
         sqlx::query(
-            "INSERT OR IGNORE INTO mute_list (account_pubkey, muted_pubkey, is_private, created_at)
-             VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO mute_list (muted_pubkey, is_private, created_at)
+             VALUES (?, ?, ?)",
         )
-        .bind(account_pubkey.to_hex())
         .bind(muted_pubkey.to_hex())
         .bind(i64::from(is_private))
         .bind(Utc::now().timestamp_millis())
-        .execute(&db.pool)
+        .execute(&db.inner.pool)
         .await?;
         Ok(())
     }
 
-    /// Removes a mute list entry for the given account and muted pubkey.
+    /// Removes a mute list entry by muted pubkey.
     #[perf_instrument("mute_list")]
     pub async fn delete(
-        account_pubkey: &PublicKey,
         muted_pubkey: &PublicKey,
-        db: &Database,
+        db: &AccountDatabase,
     ) -> std::result::Result<(), DatabaseError> {
-        sqlx::query("DELETE FROM mute_list WHERE account_pubkey = ? AND muted_pubkey = ?")
-            .bind(account_pubkey.to_hex())
+        sqlx::query("DELETE FROM mute_list WHERE muted_pubkey = ?")
             .bind(muted_pubkey.to_hex())
-            .execute(&db.pool)
+            .execute(&db.inner.pool)
             .await?;
         Ok(())
     }
 
-    /// Returns all mute list entries for the given account.
+    /// Returns all mute list entries for the owning account.
     #[perf_instrument("mute_list")]
-    pub async fn find_by_account(
-        account_pubkey: &PublicKey,
-        db: &Database,
-    ) -> std::result::Result<Vec<Self>, DatabaseError> {
-        let rows: Vec<MuteListRow> = sqlx::query_as(
-            "SELECT id, account_pubkey, muted_pubkey, is_private, created_at
+    pub async fn find_all(db: &AccountDatabase) -> std::result::Result<Vec<Self>, DatabaseError> {
+        let rows: Vec<LocalRow> = sqlx::query_as(
+            "SELECT muted_pubkey, is_private, created_at
              FROM mute_list
-             WHERE account_pubkey = ?
              ORDER BY created_at DESC",
         )
-        .bind(account_pubkey.to_hex())
-        .fetch_all(&db.pool)
+        .fetch_all(&db.inner.pool)
         .await?;
 
         Ok(rows.into_iter().map(Self::from).collect())
     }
 
-    /// Returns the mute list entry for a specific account + target pair, if any.
+    /// Returns the mute list entry for a specific muted pubkey, if any.
     #[perf_instrument("mute_list")]
-    pub async fn find_by_account_and_target(
-        account_pubkey: &PublicKey,
+    pub async fn find_by_muted_pubkey(
         muted_pubkey: &PublicKey,
-        db: &Database,
+        db: &AccountDatabase,
     ) -> std::result::Result<Option<Self>, DatabaseError> {
-        let row: Option<MuteListRow> = sqlx::query_as(
-            "SELECT id, account_pubkey, muted_pubkey, is_private, created_at
+        let row: Option<LocalRow> = sqlx::query_as(
+            "SELECT muted_pubkey, is_private, created_at
              FROM mute_list
-             WHERE account_pubkey = ? AND muted_pubkey = ?",
+             WHERE muted_pubkey = ?",
         )
-        .bind(account_pubkey.to_hex())
         .bind(muted_pubkey.to_hex())
-        .fetch_optional(&db.pool)
+        .fetch_optional(&db.inner.pool)
         .await?;
 
         Ok(row.map(Self::from))
@@ -150,34 +134,28 @@ impl MuteListEntry {
     /// Returns `true` if the given pubkey is on the account's mute list.
     #[perf_instrument("mute_list")]
     pub async fn exists(
-        account_pubkey: &PublicKey,
         muted_pubkey: &PublicKey,
-        db: &Database,
+        db: &AccountDatabase,
     ) -> std::result::Result<bool, DatabaseError> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM mute_list
-             WHERE account_pubkey = ? AND muted_pubkey = ?",
-        )
-        .bind(account_pubkey.to_hex())
-        .bind(muted_pubkey.to_hex())
-        .fetch_one(&db.pool)
-        .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM mute_list WHERE muted_pubkey = ?)")
+                .bind(muted_pubkey.to_hex())
+                .fetch_one(&db.inner.pool)
+                .await?;
 
-        Ok(count.0 > 0)
+        Ok(exists)
     }
 
-    /// Replaces all mute list entries for the given account with the provided
-    /// list. Used when syncing from a kind 10000 event received from relays.
+    /// Replaces all mute list entries with the provided list. Used when
+    /// syncing from a kind 10000 event received from relays.
     #[perf_instrument("mute_list")]
     pub async fn sync_from_event(
-        account_pubkey: &PublicKey,
         entries: &[(PublicKey, bool)],
-        db: &Database,
+        db: &AccountDatabase,
     ) -> std::result::Result<(), DatabaseError> {
-        let mut txn = db.pool.begin().await?;
+        let mut txn = db.inner.pool.begin().await?;
 
-        sqlx::query("DELETE FROM mute_list WHERE account_pubkey = ?")
-            .bind(account_pubkey.to_hex())
+        sqlx::query("DELETE FROM mute_list")
             .execute(&mut *txn)
             .await?;
 
@@ -189,10 +167,9 @@ impl MuteListEntry {
         // before private-section entries in `parse_mute_list_entries`.
         for (muted_pubkey, is_private) in entries {
             sqlx::query(
-                "INSERT OR IGNORE INTO mute_list (account_pubkey, muted_pubkey, is_private, created_at)
-                 VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO mute_list (muted_pubkey, is_private, created_at)
+                 VALUES (?, ?, ?)",
             )
-            .bind(account_pubkey.to_hex())
             .bind(muted_pubkey.to_hex())
             .bind(i64::from(*is_private))
             .bind(Utc::now().timestamp_millis())
@@ -208,157 +185,146 @@ impl MuteListEntry {
 #[cfg(test)]
 mod tests {
     use nostr_sdk::Keys;
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::whitenoise::database::Database;
 
-    async fn create_test_db() -> (Database, tempfile::TempDir) {
-        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp directory");
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path)
+    /// Build a per-account DB with the post-move local schema applied
+    /// directly. Bypasses the migration framework — that's covered in the
+    /// migration's own tests; here we exercise the ops in isolation.
+    ///
+    /// Schema must stay byte-for-byte aligned with
+    /// `m0042_move_mute_list.rs` so test/prod don't drift.
+    async fn create_test_db() -> (AccountDatabase, TempDir) {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("account.db");
+        let pubkey = Keys::generate().public_key();
+        let db = AccountDatabase::new(pubkey, db_path)
             .await
-            .expect("Failed to create test database");
+            .expect("Failed to create test account database");
+
+        sqlx::query("DROP TABLE IF EXISTS mute_list")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE mute_list (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                muted_pubkey  TEXT NOT NULL UNIQUE
+                    CHECK (length(muted_pubkey) = 64
+                           AND muted_pubkey GLOB '[0-9a-fA-F]*'),
+                is_private    INTEGER NOT NULL DEFAULT 1
+                    CHECK (is_private IN (0, 1)),
+                created_at    INTEGER NOT NULL
+            )",
+        )
+        .execute(&db.inner.pool)
+        .await
+        .expect("Failed to create mute_list table");
+
         (db, temp_dir)
     }
 
     #[tokio::test]
     async fn insert_and_exists() {
         let (db, _tmp) = create_test_db().await;
-        let account = Keys::generate().public_key();
         let target = Keys::generate().public_key();
 
-        assert!(!MuteListEntry::exists(&account, &target, &db).await.unwrap());
+        assert!(!MuteListEntry::exists(&target, &db).await.unwrap());
 
-        MuteListEntry::insert(&account, &target, true, &db)
-            .await
-            .unwrap();
+        MuteListEntry::insert(&target, true, &db).await.unwrap();
 
-        assert!(MuteListEntry::exists(&account, &target, &db).await.unwrap());
+        assert!(MuteListEntry::exists(&target, &db).await.unwrap());
     }
 
     #[tokio::test]
     async fn insert_duplicate_is_ignored() {
         let (db, _tmp) = create_test_db().await;
-        let account = Keys::generate().public_key();
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&account, &target, true, &db)
-            .await
-            .unwrap();
-        MuteListEntry::insert(&account, &target, true, &db)
-            .await
-            .unwrap();
+        MuteListEntry::insert(&target, true, &db).await.unwrap();
+        MuteListEntry::insert(&target, true, &db).await.unwrap();
 
-        let entries = MuteListEntry::find_by_account(&account, &db).await.unwrap();
+        let entries = MuteListEntry::find_all(&db).await.unwrap();
         assert_eq!(entries.len(), 1);
     }
 
     #[tokio::test]
     async fn delete_removes_entry() {
         let (db, _tmp) = create_test_db().await;
-        let account = Keys::generate().public_key();
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&account, &target, true, &db)
-            .await
-            .unwrap();
-        MuteListEntry::delete(&account, &target, &db).await.unwrap();
+        MuteListEntry::insert(&target, true, &db).await.unwrap();
+        MuteListEntry::delete(&target, &db).await.unwrap();
 
-        assert!(!MuteListEntry::exists(&account, &target, &db).await.unwrap());
+        assert!(!MuteListEntry::exists(&target, &db).await.unwrap());
     }
 
     #[tokio::test]
-    async fn find_by_account_returns_only_matching() {
-        let (db, _tmp) = create_test_db().await;
-        let account1 = Keys::generate().public_key();
-        let account2 = Keys::generate().public_key();
+    async fn find_all_returns_only_owning_account_entries() {
+        let (db1, _tmp1) = create_test_db().await;
+        let (db2, _tmp2) = create_test_db().await;
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&account1, &target, true, &db)
-            .await
-            .unwrap();
-        MuteListEntry::insert(&account2, &target, false, &db)
-            .await
-            .unwrap();
+        MuteListEntry::insert(&target, true, &db1).await.unwrap();
+        MuteListEntry::insert(&target, false, &db2).await.unwrap();
 
-        let entries = MuteListEntry::find_by_account(&account1, &db)
-            .await
-            .unwrap();
+        let entries = MuteListEntry::find_all(&db1).await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].account_pubkey, account1);
         assert!(entries[0].is_private);
+
+        let entries = MuteListEntry::find_all(&db2).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_private);
     }
 
     #[tokio::test]
     async fn sync_from_event_replaces_all() {
         let (db, _tmp) = create_test_db().await;
-        let account = Keys::generate().public_key();
         let old_target = Keys::generate().public_key();
         let new_target1 = Keys::generate().public_key();
         let new_target2 = Keys::generate().public_key();
 
-        MuteListEntry::insert(&account, &old_target, true, &db)
-            .await
-            .unwrap();
+        MuteListEntry::insert(&old_target, true, &db).await.unwrap();
 
         let new_entries = vec![(new_target1, true), (new_target2, false)];
-        MuteListEntry::sync_from_event(&account, &new_entries, &db)
+        MuteListEntry::sync_from_event(&new_entries, &db)
             .await
             .unwrap();
 
-        assert!(
-            !MuteListEntry::exists(&account, &old_target, &db)
-                .await
-                .unwrap()
-        );
-        assert!(
-            MuteListEntry::exists(&account, &new_target1, &db)
-                .await
-                .unwrap()
-        );
-        assert!(
-            MuteListEntry::exists(&account, &new_target2, &db)
-                .await
-                .unwrap()
-        );
+        assert!(!MuteListEntry::exists(&old_target, &db).await.unwrap());
+        assert!(MuteListEntry::exists(&new_target1, &db).await.unwrap());
+        assert!(MuteListEntry::exists(&new_target2, &db).await.unwrap());
 
-        let entries = MuteListEntry::find_by_account(&account, &db).await.unwrap();
+        let entries = MuteListEntry::find_all(&db).await.unwrap();
         assert_eq!(entries.len(), 2);
     }
 
     #[tokio::test]
     async fn sync_from_event_with_duplicate_pubkeys_is_safe() {
         let (db, _tmp) = create_test_db().await;
-        let account = Keys::generate().public_key();
         let target = Keys::generate().public_key();
 
         // Same pubkey appears twice (e.g. in both public and private sections of one event)
         let entries = vec![(target, false), (target, true)];
-        MuteListEntry::sync_from_event(&account, &entries, &db)
-            .await
-            .unwrap();
+        MuteListEntry::sync_from_event(&entries, &db).await.unwrap();
 
-        let result = MuteListEntry::find_by_account(&account, &db).await.unwrap();
+        let result = MuteListEntry::find_all(&db).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert!(MuteListEntry::exists(&account, &target, &db).await.unwrap());
+        assert!(MuteListEntry::exists(&target, &db).await.unwrap());
     }
 
     #[tokio::test]
     async fn sync_from_event_with_empty_list_clears_all() {
         let (db, _tmp) = create_test_db().await;
-        let account = Keys::generate().public_key();
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&account, &target, true, &db)
-            .await
-            .unwrap();
+        MuteListEntry::insert(&target, true, &db).await.unwrap();
 
-        MuteListEntry::sync_from_event(&account, &[], &db)
-            .await
-            .unwrap();
+        MuteListEntry::sync_from_event(&[], &db).await.unwrap();
 
-        assert!(!MuteListEntry::exists(&account, &target, &db).await.unwrap());
-        let entries = MuteListEntry::find_by_account(&account, &db).await.unwrap();
+        assert!(!MuteListEntry::exists(&target, &db).await.unwrap());
+        let entries = MuteListEntry::find_all(&db).await.unwrap();
         assert!(entries.is_empty());
     }
 }

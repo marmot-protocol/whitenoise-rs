@@ -45,7 +45,9 @@ impl TestCase for KeyPackageLifecycleTestCase {
         // Verify the member has at least one published KP tracked in the DB
         let member_kps = context
             .whitenoise
-            .fetch_all_key_packages_for_account(&member)
+            .require_session(&member.pubkey)?
+            .key_packages()
+            .fetch_all()
             .await?;
         assert!(
             !member_kps.is_empty(),
@@ -56,7 +58,9 @@ impl TestCase for KeyPackageLifecycleTestCase {
         let kp_event_id = member_kps[0].id.to_hex();
         let tracked = context
             .whitenoise
-            .find_published_key_package_for_testing(&member.pubkey, &kp_event_id)
+            .require_session(&member.pubkey)?
+            .key_packages()
+            .find_published_for_testing(&kp_event_id)
             .await?;
         assert!(
             tracked.is_some(),
@@ -95,14 +99,16 @@ impl TestCase for KeyPackageLifecycleTestCase {
         // Poll the DB until consumed_at is set.
         let member_pubkey = member.pubkey;
         let kp_event_id_clone = kp_event_id.clone();
-        let wn = context.whitenoise;
+        let wn = &context.whitenoise;
 
         retry_default(
             || {
                 let kp_event_id = kp_event_id_clone.clone();
                 async move {
                     let pkg = wn
-                        .find_published_key_package_for_testing(&member_pubkey, &kp_event_id)
+                        .require_session(&member_pubkey)?
+                        .key_packages()
+                        .find_published_for_testing(&kp_event_id)
                         .await?;
 
                     match pkg {
@@ -128,17 +134,21 @@ impl TestCase for KeyPackageLifecycleTestCase {
         // avoiding a 35-second real-time wait in the test suite.
         context
             .whitenoise
-            .backdate_consumed_at_for_testing(&member.pubkey, &kp_event_id, 60)
+            .require_session(&member.pubkey)?
+            .key_packages()
+            .backdate_consumed_at_for_testing(&kp_event_id, 60)
             .await?;
 
         // Run the cleanup task
         let task = ConsumedKeyPackageCleanup;
-        task.execute(context.whitenoise).await?;
+        task.execute(context.whitenoise.clone()).await?;
 
         // Verify key_material_deleted is now set
         let after_cleanup = context
             .whitenoise
-            .find_published_key_package_for_testing(&member.pubkey, &kp_event_id)
+            .require_session(&member.pubkey)?
+            .key_packages()
+            .find_published_for_testing(&kp_event_id)
             .await?;
 
         let after_cleanup = after_cleanup.expect("KP record should still exist (never deleted)");

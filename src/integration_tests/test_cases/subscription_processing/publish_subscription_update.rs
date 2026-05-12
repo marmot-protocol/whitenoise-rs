@@ -189,7 +189,7 @@ impl PublishSubscriptionUpdateTestCase {
             retry_until(
                 Self::verification_retry_config(),
                 || async {
-                    let updated_metadata = account.metadata(context.whitenoise).await?;
+                    let updated_metadata = account.metadata(&context.whitenoise).await?;
 
                     if updated_metadata.name == expected_name
                         && updated_metadata.about == expected_about
@@ -266,7 +266,7 @@ impl PublishSubscriptionUpdateTestCase {
                         .find_user_by_pubkey(&account_pubkey)
                         .await?;
                     let nip65_relays = user
-                        .relays_by_type(RelayType::Nip65, context.whitenoise)
+                        .relays_by_type(RelayType::Nip65, &context.whitenoise)
                         .await?;
                     let has_new_relay = nip65_relays.iter().any(|r| r.url == expected_relay);
 
@@ -293,7 +293,7 @@ impl PublishSubscriptionUpdateTestCase {
                 || async {
                     let user = context.whitenoise.find_user_by_pubkey(&pubkey).await?;
                     let nip65_relays = user
-                        .relays_by_type(RelayType::Nip65, context.whitenoise)
+                        .relays_by_type(RelayType::Nip65, &context.whitenoise)
                         .await?;
                     let has_new_relay = nip65_relays.iter().any(|r| r.url == expected_relay);
 
@@ -334,12 +334,13 @@ impl PublishSubscriptionUpdateTestCase {
         };
 
         let account = context.get_account(account_name)?;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
         let expected: HashSet<PublicKey> = expected_follows.iter().copied().collect();
 
         retry_until(
             Self::verification_retry_config(),
             || async {
-                let follows = context.whitenoise.follows(account).await?;
+                let follows = session.social().follows().await?;
                 let actual: HashSet<PublicKey> = follows.iter().map(|u| u.pubkey).collect();
 
                 if actual == expected {

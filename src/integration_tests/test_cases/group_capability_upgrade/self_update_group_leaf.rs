@@ -23,6 +23,8 @@ impl TestCase for SelfUpdateGroupLeafTestCase {
         let account = context.get_account(&self.account_name)?.clone();
         let group_id = context.get_group(&self.group_name)?.mls_group_id.clone();
 
+        let session = context.whitenoise.require_session(&account.pubkey)?;
+
         let (relay_urls, evolution_event) = {
             let mdk = context.whitenoise.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Whitenoise::ensure_group_relays(&mdk, &group_id)?;
@@ -31,9 +33,9 @@ impl TestCase for SelfUpdateGroupLeafTestCase {
             (relay_urls, update_result.evolution_event)
         };
 
-        context
-            .whitenoise
-            .publish_and_merge_commit(evolution_event, &account.pubkey, &group_id, &relay_urls)
+        session
+            .groups()
+            .publish_and_merge_commit(evolution_event, &group_id, &relay_urls)
             .await
     }
 }

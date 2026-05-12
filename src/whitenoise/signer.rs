@@ -15,6 +15,7 @@ impl Whitenoise {
             return Err(WhitenoiseError::ExternalSignerCannotExportNsec);
         }
         Ok(self
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?
             .secret_key()
@@ -46,12 +47,18 @@ impl Whitenoise {
         }
         self.insert_external_signer(pubkey, signer).await?;
 
+        if let Some(session) = self.account_manager.get_session(&pubkey)
+            && let Some(signer_arc) = self.get_external_signer(&pubkey)
+        {
+            session.set_signer(signer_arc).await;
+        }
+
         // On app restore, external accounts may exist before their signer is
         // re-registered. Startup subscription setup can fail in that gap.
         // Rebuild account subscriptions now that signing/decryption is available.
         // Match startup behavior by using the effective inbox relay set, so
         // legacy accounts without kind 10050 relays still fall back to NIP-65.
-        match account.effective_inbox_relays(self).await {
+        match account.effective_inbox_relays(&self.shared).await {
             Ok(inbox_relays) => {
                 if let Err(e) = self.setup_subscriptions(&account, &inbox_relays).await {
                     tracing::warn!(
@@ -102,13 +109,15 @@ impl Whitenoise {
             "Registering external signer for account: {}",
             pubkey.to_hex()
         );
-        self.external_signers.insert(pubkey, Arc::new(signer));
+        self.shared
+            .external_signers
+            .insert(pubkey, Arc::new(signer));
         Ok(())
     }
 
     /// Gets the external signer for an account, if one is registered.
     pub fn get_external_signer(&self, pubkey: &PublicKey) -> Option<Arc<dyn NostrSigner>> {
-        self.external_signers.get(pubkey).map(|r| r.clone())
+        self.shared.external_signers.get(pubkey).map(|r| r.clone())
     }
 
     /// Gets the appropriate signer for an account.
@@ -118,7 +127,18 @@ impl Whitenoise {
     ///
     /// Returns an error if no signer is available for the account.
     pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
-        // First check for a registered external signer
+        if let Some(session) = self.account_manager.get_session(&account.pubkey)
+            && let Some(signer) = session.get_signer()
+        {
+            tracing::debug!(
+                target: "whitenoise::signer",
+                "Using session signer for account {}",
+                account.pubkey.to_hex()
+            );
+            return Ok(signer);
+        }
+
+        // Pre-session login flow: signer arrives before the session exists.
         if let Some(external_signer) = self.get_external_signer(&account.pubkey) {
             tracing::debug!(
                 target: "whitenoise::signer",
@@ -128,8 +148,8 @@ impl Whitenoise {
             return Ok(external_signer);
         }
 
-        // Fall back to local keys from secrets store
         let keys = self
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?;
         tracing::debug!(
@@ -147,6 +167,6 @@ impl Whitenoise {
             "Removing external signer for account: {}",
             pubkey.to_hex()
         );
-        self.external_signers.remove(pubkey);
+        self.shared.external_signers.remove(pubkey);
     }
 }

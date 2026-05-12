@@ -14,20 +14,20 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     pub async fn handle_metadata(&self, event: Event) -> Result<()> {
         let (mut user, newly_created) =
-            User::find_or_create_by_pubkey(&event.pubkey, &self.database).await?;
+            User::find_or_create_by_pubkey(&event.pubkey, &self.shared.database).await?;
         match Metadata::from_json(&event.content) {
             Ok(metadata) => {
                 let should_update = user
-                    .should_update_metadata(&event, newly_created, &self.database)
+                    .should_update_metadata(&event, newly_created, &self.shared.database)
                     .await?;
 
                 if should_update {
                     user.metadata = metadata;
                     user.mark_metadata_known_now();
-                    let saved_user = user.save(&self.database).await?;
+                    let saved_user = user.save(&self.shared.database).await?;
                     let user_pubkey = saved_user.pubkey;
 
-                    self.user_stream_manager.emit(
+                    self.shared.user_stream_manager.emit(
                         &user_pubkey,
                         UserUpdate {
                             trigger: UserUpdateTrigger::MetadataChanged,
@@ -35,7 +35,8 @@ impl Whitenoise {
                         },
                     );
 
-                    self.event_tracker
+                    self.shared
+                        .event_tracker
                         .track_processed_global_event(&event)
                         .await?;
 
@@ -47,10 +48,10 @@ impl Whitenoise {
                     );
                 } else if user.metadata_is_unknown() {
                     user.mark_metadata_known_now();
-                    let saved_user = user.save(&self.database).await?;
+                    let saved_user = user.save(&self.shared.database).await?;
                     let user_pubkey = saved_user.pubkey;
 
-                    self.user_stream_manager.emit(
+                    self.shared.user_stream_manager.emit(
                         &user_pubkey,
                         UserUpdate {
                             trigger: UserUpdateTrigger::MetadataChanged,
@@ -186,15 +187,14 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
-        ProcessedEvent::create(
+        ProcessedEvent::create_global(
             &event.id,
-            None,
             Some(Utc::now()),
             Some(Kind::Metadata),
             Some(&keys.public_key()),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();

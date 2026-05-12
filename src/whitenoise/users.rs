@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration as StdDuration};
+use std::time::Duration as StdDuration;
 
 #[cfg(any(test, feature = "integration-tests"))]
 use std::sync::LazyLock;
@@ -11,13 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     perf_instrument,
-    relay_control::RelayControlPlane,
     whitenoise::{
         Whitenoise,
-        database::Database,
         database::processed_events::ProcessedEvent,
         error::{Result, WhitenoiseError},
-        event_tracker::EventTracker,
         relays::{Relay, RelayType},
         user_streaming::{UserUpdate, UserUpdateTrigger},
         utils::timestamp_to_datetime,
@@ -25,7 +22,7 @@ use crate::{
 };
 
 mod key_package;
-mod relay_sync;
+pub(crate) mod relay_sync;
 
 pub use key_package::KeyPackageStatus;
 
@@ -50,27 +47,6 @@ enum UserResolutionMode {
 
 #[cfg(any(test, feature = "integration-tests"))]
 static USER_RESOLUTION_RUN_COUNTS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
-
-#[derive(Clone)]
-pub(crate) struct UserRelaySyncContext {
-    database: Arc<Database>,
-    event_tracker: Arc<dyn EventTracker>,
-    relay_control: Arc<RelayControlPlane>,
-}
-
-impl UserRelaySyncContext {
-    pub(crate) fn new(
-        database: Arc<Database>,
-        event_tracker: Arc<dyn EventTracker>,
-        relay_control: Arc<RelayControlPlane>,
-    ) -> Self {
-        Self {
-            database,
-            event_tracker,
-            relay_control,
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct User {
@@ -101,7 +77,7 @@ impl User {
         relay_type: RelayType,
         whitenoise: &Whitenoise,
     ) -> Result<Vec<Relay>> {
-        self.relays(relay_type, &whitenoise.database).await
+        self.relays(relay_type, &whitenoise.shared.database).await
     }
 
     /// Determines whether a metadata event should be accepted by the guarded processing path.
@@ -126,8 +102,10 @@ impl User {
         newly_created: bool,
         database: &crate::whitenoise::database::Database,
     ) -> Result<bool> {
-        // Check if we've already processed this specific event from this author
-        let already_processed = ProcessedEvent::exists(&event.id, None, database)
+        // Check if we've already processed this specific event from this author.
+        // Metadata events live in the global-scoped table — author identity is
+        // tracked via the `author` column, not `account_pubkey`.
+        let already_processed = ProcessedEvent::exists_global(&event.id, database)
             .await
             .map_err(WhitenoiseError::Database)?;
 
@@ -166,7 +144,7 @@ impl User {
 
         // Check timestamp against most recent processed metadata event for this specific user
         let newest_processed_timestamp =
-            ProcessedEvent::newest_event_timestamp_for_kind(None, 0, Some(&self.pubkey), database)
+            ProcessedEvent::newest_global_event_timestamp_for_kind(0, Some(&self.pubkey), database)
                 .await
                 .map_err(WhitenoiseError::Database)?;
 
@@ -201,14 +179,6 @@ impl User {
 }
 
 impl Whitenoise {
-    pub(crate) fn user_relay_sync_context(&self) -> UserRelaySyncContext {
-        UserRelaySyncContext::new(
-            Arc::clone(&self.database),
-            Arc::clone(&self.event_tracker),
-            Arc::clone(&self.relay_control),
-        )
-    }
-
     /// Retrieves a user by their public key.
     ///
     /// This method looks up a user in the database using their Nostr public key.
@@ -244,7 +214,7 @@ impl Whitenoise {
     /// - There's a database connection or query error
     /// - The public key format is invalid (though this is typically caught at the type level)
     pub async fn find_user_by_pubkey(&self, pubkey: &PublicKey) -> Result<User> {
-        User::find_by_pubkey(pubkey, &self.database).await
+        User::find_by_pubkey(pubkey, &self.shared.database).await
     }
 
     #[perf_instrument("users")]
@@ -254,9 +224,15 @@ impl Whitenoise {
         relay_type: RelayType,
         query_relay_urls: &[RelayUrl],
     ) -> Result<Vec<Relay>> {
-        self.user_relay_sync_context()
-            .sync_relay_type_for_pubkey(*pubkey, relay_type, query_relay_urls)
-            .await
+        relay_sync::sync_relay_type_for_pubkey(
+            &self.shared.database,
+            &self.shared.relay_control,
+            &self.shared.event_tracker,
+            *pubkey,
+            relay_type,
+            query_relay_urls,
+        )
+        .await
     }
 
     fn targeted_discovery_filter(pubkey: PublicKey) -> Filter {
@@ -290,7 +266,7 @@ impl Whitenoise {
     }
 
     async fn fetch_targeted_discovery_events(&self, pubkey: PublicKey) -> Result<Vec<Event>> {
-        if self.relay_control.discovery().relays().is_empty() {
+        if self.shared.relay_control.discovery().relays().is_empty() {
             tracing::warn!(
                 target: "whitenoise::users::targeted_discovery",
                 "Skipping targeted discovery catch-up for {} because no discovery relays are configured",
@@ -300,6 +276,7 @@ impl Whitenoise {
         }
 
         let events = self
+            .shared
             .relay_control
             .discovery()
             .fetch_events(
@@ -338,7 +315,7 @@ impl Whitenoise {
             return;
         }
 
-        self.user_stream_manager.emit(
+        self.shared.user_stream_manager.emit(
             &user.pubkey,
             UserUpdate {
                 trigger: UserUpdateTrigger::UserCreated,
@@ -352,11 +329,12 @@ impl Whitenoise {
             return;
         }
 
-        self.discovery_sync_worker.request_rebuild();
+        self.shared.discovery_sync_worker.request_rebuild();
     }
 
     fn user_resolution_guard(&self, pubkey: PublicKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        self.user_resolution_guards
+        self.shared
+            .user_resolution_guards
             .entry(pubkey)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -368,7 +346,7 @@ impl Whitenoise {
         pubkey: &PublicKey,
         mode: UserResolutionMode,
     ) -> Result<User> {
-        let (user, created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
+        let (user, created) = User::find_or_create_by_pubkey(pubkey, &self.shared.database).await?;
         self.emit_user_created_if_needed(&user, created);
 
         if user.metadata_is_unknown() {
@@ -386,7 +364,7 @@ impl Whitenoise {
 
         self.refresh_discovery_for_new_user_if_needed(created, mode);
 
-        User::find_by_pubkey(pubkey, &self.database).await
+        User::find_by_pubkey(pubkey, &self.shared.database).await
     }
 
     /// Look up a local user row or create an empty unknown-metadata row.
@@ -423,7 +401,7 @@ impl Whitenoise {
     }
 
     async fn resolve_unknown_user_under_guard(&self, pubkey: PublicKey) -> Result<()> {
-        let user = User::find_by_pubkey(&pubkey, &self.database).await?;
+        let user = User::find_by_pubkey(&pubkey, &self.shared.database).await?;
         if user.metadata_is_known() {
             tracing::debug!(
                 target: "whitenoise::users::resolve_unknown_user_under_guard",
@@ -488,13 +466,17 @@ impl Whitenoise {
             pubkey
         );
 
+        let Ok(whitenoise) = self.arc() else {
+            tracing::warn!(
+                target: "whitenoise::users::start_background_user_resolution_if_unknown",
+                "Whitenoise instance unavailable; skipping background discovery for {}",
+                pubkey
+            );
+            return;
+        };
         tokio::spawn(async move {
             let _resolution_guard = resolution_guard;
-            let result = async {
-                let whitenoise = Self::get_instance()?;
-                whitenoise.resolve_unknown_user_under_guard(pubkey).await
-            }
-            .await;
+            let result = whitenoise.resolve_unknown_user_under_guard(pubkey).await;
 
             if let Err(error) = result {
                 tracing::warn!(
@@ -520,7 +502,7 @@ impl Whitenoise {
         sqlx::query("UPDATE users SET metadata_known_at = ? WHERE pubkey = ?")
             .bind(metadata_known_at.map(|timestamp| timestamp.timestamp_millis()))
             .bind(pubkey.to_hex())
-            .execute(&self.database.pool)
+            .execute(&self.shared.database.pool)
             .await
             .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
 
@@ -551,7 +533,7 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::test_utils::{create_mock_whitenoise, test_get_whitenoise};
+    use crate::whitenoise::test_utils::create_mock_whitenoise;
     use chrono::{Duration, Utc};
     use std::collections::HashSet;
 
@@ -593,7 +575,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         };
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
         let initial_relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let initial_relay = whitenoise
             .find_or_create_relay_by_url(&initial_relay_url)
@@ -601,13 +583,20 @@ mod tests {
             .unwrap();
 
         saved_user
-            .add_relay(&initial_relay, RelayType::Nip65, &whitenoise.database)
+            .add_relay(
+                &initial_relay,
+                RelayType::Nip65,
+                &whitenoise.shared.database,
+            )
             .await
             .unwrap();
 
-        saved_user.update_relay_lists(&whitenoise).await.unwrap();
+        saved_user
+            .update_relay_lists(&whitenoise.shared)
+            .await
+            .unwrap();
         let relays = saved_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(relays.len(), 1);
@@ -628,12 +617,15 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
-        saved_user.update_relay_lists(&whitenoise).await.unwrap();
+        saved_user
+            .update_relay_lists(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(
             saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .is_empty()
@@ -654,7 +646,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
         // Add a relay
         let relay_url = RelayUrl::parse("wss://test.example.com").unwrap();
@@ -663,12 +655,15 @@ mod tests {
             .await
             .unwrap();
         saved_user
-            .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Test get_query_relays
-        let query_relays = saved_user.get_query_relays(&whitenoise).await.unwrap();
+        let query_relays = saved_user
+            .get_query_relays(&whitenoise.shared)
+            .await
+            .unwrap();
 
         assert_eq!(query_relays.len(), 1);
         assert_eq!(query_relays[0].url, relay_url);
@@ -686,12 +681,15 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         };
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
-        let query_relays = saved_user.get_query_relays(&whitenoise).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
+        let query_relays = saved_user
+            .get_query_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         let query_urls: std::collections::HashSet<RelayUrl> =
             Relay::urls(&query_relays).into_iter().collect();
 
-        for url in &whitenoise.config.discovery_relays {
+        for url in &whitenoise.config().discovery_relays {
             assert!(
                 query_urls.contains(url),
                 "Fallback query relays should include discovery relay: {}",
@@ -715,8 +713,11 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         };
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
-        let query_relays = saved_user.get_query_relays(&whitenoise).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
+        let query_relays = saved_user
+            .get_query_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         let query_urls: Vec<RelayUrl> = Relay::urls(&query_relays);
 
         assert!(
@@ -749,7 +750,10 @@ mod tests {
     async fn test_get_or_create_user_local_emits_user_created_update() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let test_pubkey = Keys::generate().public_key();
-        let mut updates = whitenoise.user_stream_manager.subscribe(&test_pubkey);
+        let mut updates = whitenoise
+            .shared
+            .user_stream_manager
+            .subscribe(&test_pubkey);
 
         let user = whitenoise
             .get_or_create_user_local(&test_pubkey)
@@ -804,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_user_dedupes_background_resolution_for_same_unknown_user() {
-        let whitenoise = test_get_whitenoise().await;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
         let pubkey = keys.public_key();
         let metadata = Metadata::new().name("Background Deduped User");
@@ -884,7 +888,7 @@ mod tests {
             updated_at: Utc::now(),
         };
         user.mark_metadata_known_now();
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
         whitenoise.reset_user_resolution_run_count_for_testing(&test_pubkey);
 
@@ -929,7 +933,9 @@ mod tests {
     #[tokio::test]
     async fn test_all_users_with_relay_urls() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let users_with_relays = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        let users_with_relays = User::all_users_with_relay_urls(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(users_with_relays.is_empty());
 
         let test_pubkey = nostr_sdk::Keys::generate().public_key();
@@ -941,18 +947,20 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         };
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
         let relay_url = RelayUrl::parse("wss://test.example.com").unwrap();
         let relay = whitenoise
             .find_or_create_relay_by_url(&relay_url)
             .await
             .unwrap();
         saved_user
-            .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let users_with_relays = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        let users_with_relays = User::all_users_with_relay_urls(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(users_with_relays.len(), 1);
         assert_eq!(users_with_relays[0].0, test_pubkey);
         assert_eq!(users_with_relays[0].1, vec![relay_url]);
@@ -974,7 +982,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         }
-        .save(&whitenoise.database)
+        .save(&whitenoise.shared.database)
         .await
         .unwrap();
 
@@ -986,7 +994,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         }
-        .save(&whitenoise.database)
+        .save(&whitenoise.shared.database)
         .await
         .unwrap();
 
@@ -1004,23 +1012,25 @@ mod tests {
             .unwrap();
 
         user_a
-            .add_relay(&relay1, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay1, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         user_a
-            .add_relay(&relay2, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay2, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         user_b
-            .add_relay(&relay2, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay2, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         user_b
-            .add_relay(&relay3, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay3, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let results = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        let results = User::all_users_with_relay_urls(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
 
         // Find each user's entry (order is by pubkey hex, not insertion order)
@@ -1068,7 +1078,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         }
-        .save(&whitenoise.database)
+        .save(&whitenoise.shared.database)
         .await
         .unwrap();
 
@@ -1080,7 +1090,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         }
-        .save(&whitenoise.database)
+        .save(&whitenoise.shared.database)
         .await
         .unwrap();
 
@@ -1089,11 +1099,13 @@ mod tests {
             .await
             .unwrap();
         user_with
-            .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let results = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        let results = User::all_users_with_relay_urls(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2, "Both users should appear in results");
 
         let with_entry = results.iter().find(|(pk, _)| *pk == pubkey_with).unwrap();
@@ -1123,7 +1135,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         }
-        .save(&whitenoise.database)
+        .save(&whitenoise.shared.database)
         .await
         .unwrap();
 
@@ -1131,14 +1143,16 @@ mod tests {
             .find_or_create_relay_by_url(&RelayUrl::parse("wss://inbox.example.com").unwrap())
             .await
             .unwrap();
-        user.add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+        user.add_relay(&relay, RelayType::Inbox, &whitenoise.shared.database)
             .await
             .unwrap();
-        user.add_relay(&relay, RelayType::KeyPackage, &whitenoise.database)
+        user.add_relay(&relay, RelayType::KeyPackage, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let results = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        let results = User::all_users_with_relay_urls(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1, "User should appear in results");
         assert!(
             results[0].1.is_empty(),
@@ -1159,22 +1173,22 @@ mod tests {
             metadata_known_at: None,
             updated_at: Utc::now(),
         };
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
+        let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
         // Test 1: No relays - should return None
         let kp_relays = saved_user
-            .relays(RelayType::KeyPackage, &whitenoise.database)
+            .relays(RelayType::KeyPackage, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(kp_relays.is_empty());
 
         let nip65_relays = saved_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(nip65_relays.is_empty());
 
-        let result = saved_user.key_package_event(&whitenoise).await;
+        let result = saved_user.key_package_event(&whitenoise.shared).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
 
@@ -1185,11 +1199,11 @@ mod tests {
             .await
             .unwrap();
         saved_user
-            .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let result = saved_user.key_package_event(&whitenoise).await;
+        let result = saved_user.key_package_event(&whitenoise.shared).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
 
@@ -1200,11 +1214,15 @@ mod tests {
             .await
             .unwrap();
         saved_user
-            .add_relay(&kp_relay, RelayType::KeyPackage, &whitenoise.database)
+            .add_relay(
+                &kp_relay,
+                RelayType::KeyPackage,
+                &whitenoise.shared.database,
+            )
             .await
             .unwrap();
 
-        let result = saved_user.key_package_event(&whitenoise).await;
+        let result = saved_user.key_package_event(&whitenoise.shared).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
     }
@@ -1224,7 +1242,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let kp_url = RelayUrl::parse("wss://kp.example.com").unwrap();
             let kp_relay = whitenoise
@@ -1232,7 +1250,11 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&kp_relay, RelayType::KeyPackage, &whitenoise.database)
+                .add_relay(
+                    &kp_relay,
+                    RelayType::KeyPackage,
+                    &whitenoise.shared.database,
+                )
                 .await
                 .unwrap();
 
@@ -1243,12 +1265,12 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             let urls = saved_user
-                .key_package_relay_urls(&whitenoise)
+                .key_package_relay_urls(&whitenoise.shared)
                 .await
                 .unwrap();
             assert_eq!(urls, vec![kp_url]);
@@ -1266,7 +1288,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let nip65_url = RelayUrl::parse("wss://nip65.example.com").unwrap();
             let nip65_relay = whitenoise
@@ -1274,12 +1296,12 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             let urls = saved_user
-                .key_package_relay_urls(&whitenoise)
+                .key_package_relay_urls(&whitenoise.shared)
                 .await
                 .unwrap();
             assert_eq!(urls, vec![nip65_url]);
@@ -1297,13 +1319,13 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let urls = saved_user
-                .key_package_relay_urls(&whitenoise)
+                .key_package_relay_urls(&whitenoise.shared)
                 .await
                 .unwrap();
-            let expected = whitenoise.fallback_relay_urls().await;
+            let expected = whitenoise.shared.fallback_relay_urls().await;
             assert_eq!(urls, expected);
             assert!(
                 !urls.is_empty(),
@@ -1318,7 +1340,7 @@ mod tests {
 
         async fn create_test_user(whitenoise: &Whitenoise) -> User {
             let keys = Keys::generate();
-            User::find_or_create_by_pubkey(&keys.public_key(), &whitenoise.database)
+            User::find_or_create_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .0
@@ -1338,20 +1360,19 @@ mod tests {
             let event = create_test_metadata_event(None).await;
 
             // First, create a processed event entry
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
 
             // Test that already processed event returns false
             let result = user
-                .should_update_metadata(&event, false, &whitenoise.database)
+                .should_update_metadata(&event, false, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1366,7 +1387,7 @@ mod tests {
 
             // Test that newly created user always returns true
             let result = user
-                .should_update_metadata(&event, true, &whitenoise.database)
+                .should_update_metadata(&event, true, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1381,11 +1402,11 @@ mod tests {
 
             // Ensure user has default metadata
             user.metadata = Metadata::default();
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             // Test that user with default metadata returns true
             let result = user
-                .should_update_metadata(&event, false, &whitenoise.database)
+                .should_update_metadata(&event, false, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1400,11 +1421,11 @@ mod tests {
 
             // Give user some non-default metadata
             user.metadata = Metadata::new().name("Test User");
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             // Test that with no processed events, returns true
             let result = user
-                .should_update_metadata(&event, false, &whitenoise.database)
+                .should_update_metadata(&event, false, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1419,16 +1440,15 @@ mod tests {
 
             // Give user some non-default metadata
             user.metadata = Metadata::new().name("Test User");
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create an older processed event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &old_event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(old_event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1439,7 +1459,7 @@ mod tests {
 
             // Test that newer event returns true
             let result = user
-                .should_update_metadata(&new_event, false, &whitenoise.database)
+                .should_update_metadata(&new_event, false, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1454,16 +1474,15 @@ mod tests {
 
             // Give user some non-default metadata
             user.metadata = Metadata::new().name("Test User");
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create a processed event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &old_event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(old_event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1477,7 +1496,7 @@ mod tests {
 
             // Test that equal timestamp returns true (newer or equal)
             let result = user
-                .should_update_metadata(&new_event, false, &whitenoise.database)
+                .should_update_metadata(&new_event, false, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1492,16 +1511,15 @@ mod tests {
 
             // Give user some non-default metadata
             user.metadata = Metadata::new().name("Test User");
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create a newer processed event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &newer_event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(newer_event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1515,7 +1533,7 @@ mod tests {
 
             // Test that older event returns false
             let result = user
-                .should_update_metadata(&old_event, false, &whitenoise.database)
+                .should_update_metadata(&old_event, false, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1530,16 +1548,15 @@ mod tests {
 
             // Give user some non-default metadata
             user.metadata = Metadata::new().name("Test User");
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create a processed event entry for this exact event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1547,7 +1564,7 @@ mod tests {
             // Test that already processed takes priority over newly_created
             // Even though newly_created=true, it should return false because event is already processed
             let result = user
-                .should_update_metadata(&event, true, &whitenoise.database)
+                .should_update_metadata(&event, true, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1562,12 +1579,12 @@ mod tests {
 
             // Ensure user has default metadata (redundant but explicit)
             user.metadata = Metadata::default();
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             // Test that newly created user with default metadata returns true
             // (both conditions would return true, but newly_created takes priority)
             let result = user
-                .should_update_metadata(&event, true, &whitenoise.database)
+                .should_update_metadata(&event, true, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1606,7 +1623,7 @@ mod tests {
                 .unwrap();
 
             let result = user
-                .should_update_metadata(&event, false, &whitenoise.database)
+                .should_update_metadata(&event, false, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1648,7 +1665,10 @@ mod tests {
                 updated_at: Utc::now(),
             };
             original_user.mark_metadata_known_now();
-            let saved_user = original_user.save(&whitenoise.database).await.unwrap();
+            let saved_user = original_user
+                .save(&whitenoise.shared.database)
+                .await
+                .unwrap();
 
             let found_user = whitenoise
                 .get_or_create_user_local(&test_pubkey)
@@ -1686,7 +1706,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let user_from_db = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+            let user_from_db = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert!(user_from_db.metadata_is_unknown());
@@ -1713,7 +1733,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay_url = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let relay = whitenoise
@@ -1721,18 +1741,17 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             let newer_timestamp = Utc::now();
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &EventId::all_zeros(),
-                None,
                 Some(newer_timestamp),
                 Some(Kind::from(10002)),
                 Some(&test_pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1743,7 +1762,7 @@ mod tests {
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_relay_urls,
                     Some(stale_timestamp),
@@ -1753,7 +1772,7 @@ mod tests {
 
             assert!(!changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 1);
@@ -1773,7 +1792,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let old_relay_url = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let relay = whitenoise
@@ -1781,18 +1800,17 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             let old_timestamp = Utc::now() - Duration::hours(2);
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &EventId::all_zeros(),
-                None,
                 Some(old_timestamp),
                 Some(Kind::from(10002)),
                 Some(&test_pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1803,7 +1821,7 @@ mod tests {
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_relay_urls,
                     Some(newer_timestamp),
@@ -1813,7 +1831,7 @@ mod tests {
 
             assert!(changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 1);
@@ -1833,7 +1851,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let r1 = whitenoise
@@ -1841,18 +1859,17 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&r1, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&r1, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             let timestamp = Utc::now() - Duration::hours(1);
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &EventId::all_zeros(),
-                None,
                 Some(timestamp),
                 Some(Kind::from(10002)),
                 Some(&test_pubkey),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1862,7 +1879,7 @@ mod tests {
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_relay_urls,
                     Some(timestamp),
@@ -1872,7 +1889,7 @@ mod tests {
 
             assert!(!changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 1);
@@ -1892,19 +1909,19 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let new_relay_urls =
                 HashSet::from([RelayUrl::parse("wss://relay1.example.com").unwrap()]);
 
             let changed = saved_user
-                .sync_relay_urls(&whitenoise, RelayType::Nip65, &new_relay_urls, None)
+                .sync_relay_urls(&whitenoise.shared, RelayType::Nip65, &new_relay_urls, None)
                 .await
                 .unwrap();
 
             assert!(changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 1);
@@ -1923,7 +1940,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay_url = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let relay = whitenoise
@@ -1931,7 +1948,7 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1939,7 +1956,7 @@ mod tests {
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &same_relay_urls,
                     Some(Utc::now()),
@@ -1949,7 +1966,7 @@ mod tests {
 
             assert!(!changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 1);
@@ -1969,7 +1986,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let relay = whitenoise
@@ -1977,7 +1994,7 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1989,7 +2006,7 @@ mod tests {
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_relay_urls,
                     Some(Utc::now()),
@@ -1999,7 +2016,7 @@ mod tests {
 
             assert!(changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 3);
@@ -2018,7 +2035,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let relay2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
@@ -2027,7 +2044,7 @@ mod tests {
             for url in [&relay1, &relay2, &relay3] {
                 let relay = whitenoise.find_or_create_relay_by_url(url).await.unwrap();
                 saved_user
-                    .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+                    .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
                     .await
                     .unwrap();
             }
@@ -2036,7 +2053,7 @@ mod tests {
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_relay_urls,
                     Some(Utc::now()),
@@ -2046,7 +2063,7 @@ mod tests {
 
             assert!(changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 1);
@@ -2066,7 +2083,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let relay2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
@@ -2074,7 +2091,7 @@ mod tests {
             for url in [&relay1, &relay2] {
                 let relay = whitenoise.find_or_create_relay_by_url(url).await.unwrap();
                 saved_user
-                    .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+                    .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
                     .await
                     .unwrap();
             }
@@ -2085,7 +2102,7 @@ mod tests {
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_relay_urls,
                     Some(Utc::now()),
@@ -2095,7 +2112,7 @@ mod tests {
 
             assert!(changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 3);
@@ -2120,7 +2137,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let relay2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
@@ -2130,7 +2147,7 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&r1, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&r1, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -2139,14 +2156,14 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&r2, RelayType::Inbox, &whitenoise.database)
+                .add_relay(&r2, RelayType::Inbox, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             let new_nip65_urls = HashSet::from([relay2.clone()]);
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_nip65_urls,
                     Some(Utc::now()),
@@ -2156,14 +2173,14 @@ mod tests {
 
             assert!(changed);
             let nip65_relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(nip65_relays.len(), 1);
             assert_eq!(nip65_relays[0].url, relay2);
 
             let inbox_relays = saved_user
-                .relays(RelayType::Inbox, &whitenoise.database)
+                .relays(RelayType::Inbox, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(inbox_relays.len(), 1);
@@ -2183,7 +2200,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
             let r1 = whitenoise
@@ -2191,19 +2208,24 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&r1, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&r1, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             let empty_urls = HashSet::new();
             let changed = saved_user
-                .sync_relay_urls(&whitenoise, RelayType::Nip65, &empty_urls, Some(Utc::now()))
+                .sync_relay_urls(
+                    &whitenoise.shared,
+                    RelayType::Nip65,
+                    &empty_urls,
+                    Some(Utc::now()),
+                )
                 .await
                 .unwrap();
 
             assert!(changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 0);
@@ -2222,14 +2244,14 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let new_relay_urls =
                 HashSet::from([RelayUrl::parse("wss://relay1.example.com").unwrap()]);
 
             let changed = saved_user
                 .sync_relay_urls(
-                    &whitenoise,
+                    &whitenoise.shared,
                     RelayType::Nip65,
                     &new_relay_urls,
                     Some(Utc::now()),
@@ -2239,7 +2261,7 @@ mod tests {
 
             assert!(changed);
             let relays = saved_user
-                .relays(RelayType::Nip65, &whitenoise.database)
+                .relays(RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(relays.len(), 1);
@@ -2263,11 +2285,11 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let query_relays = Relay::defaults();
             let result = saved_user
-                .update_nip65_relays(&whitenoise, &query_relays)
+                .update_nip65_relays(&whitenoise.shared, &query_relays)
                 .await
                 .unwrap();
 
@@ -2290,11 +2312,11 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let query_relays = vec![];
             let result = saved_user
-                .update_nip65_relays(&whitenoise, &query_relays)
+                .update_nip65_relays(&whitenoise.shared, &query_relays)
                 .await
                 .unwrap();
 
@@ -2314,7 +2336,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let initial_relay = RelayUrl::parse("ws://localhost:8080").unwrap();
             let r = whitenoise
@@ -2322,7 +2344,7 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&r, RelayType::Nip65, &whitenoise.database)
+                .add_relay(&r, RelayType::Nip65, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -2334,7 +2356,7 @@ mod tests {
             }];
 
             let result = saved_user
-                .update_nip65_relays(&whitenoise, &query_relays)
+                .update_nip65_relays(&whitenoise.shared, &query_relays)
                 .await
                 .unwrap();
 
@@ -2360,11 +2382,11 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let query_relays = vec![];
             let result = saved_user
-                .update_secondary_relay_types(&whitenoise, &query_relays)
+                .update_secondary_relay_types(&whitenoise.shared, &query_relays)
                 .await;
 
             assert!(result.is_ok());
@@ -2383,11 +2405,11 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let query_relays = vec![];
             let result = saved_user
-                .update_secondary_relay_types(&whitenoise, &query_relays)
+                .update_secondary_relay_types(&whitenoise.shared, &query_relays)
                 .await;
 
             assert!(result.is_ok());
@@ -2406,7 +2428,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
             let query_relays = vec![crate::whitenoise::relays::Relay {
@@ -2417,7 +2439,7 @@ mod tests {
             }];
 
             let result = saved_user
-                .update_secondary_relay_types(&whitenoise, &query_relays)
+                .update_secondary_relay_types(&whitenoise.shared, &query_relays)
                 .await;
 
             assert!(result.is_ok());
@@ -2485,11 +2507,11 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let query_relays = Relay::defaults();
             let changed = saved_user
-                .sync_relays_for_type(&whitenoise, RelayType::Nip65, &query_relays)
+                .sync_relays_for_type(&whitenoise.shared, RelayType::Nip65, &query_relays)
                 .await
                 .unwrap();
 
@@ -2509,11 +2531,11 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let query_relays = vec![];
             let result = saved_user
-                .sync_relays_for_type(&whitenoise, RelayType::Inbox, &query_relays)
+                .sync_relays_for_type(&whitenoise.shared, RelayType::Inbox, &query_relays)
                 .await;
 
             assert!(result.is_err());
@@ -2532,13 +2554,13 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let query_relays = Relay::defaults();
 
             for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
                 let changed = saved_user
-                    .sync_relays_for_type(&whitenoise, relay_type, &query_relays)
+                    .sync_relays_for_type(&whitenoise.shared, relay_type, &query_relays)
                     .await
                     .unwrap();
 
@@ -2559,7 +2581,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
             let relay_url = RelayUrl::parse("wss://inbox.example.com").unwrap();
             let relay = whitenoise
                 .find_or_create_relay_by_url(&relay_url)
@@ -2567,7 +2589,7 @@ mod tests {
                 .unwrap();
 
             saved_user
-                .add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+                .add_relay(&relay, RelayType::Inbox, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -2597,12 +2619,15 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             // User has no relays in DB, so key_package_status should attempt
             // relay sync and retry. With no real relays to reach, the result
             // should still be NotFound but the retry path is exercised.
-            let status = saved_user.key_package_status(&whitenoise).await.unwrap();
+            let status = saved_user
+                .key_package_status(&whitenoise.shared)
+                .await
+                .unwrap();
             assert_eq!(status, KeyPackageStatus::NotFound);
         }
 
@@ -2619,7 +2644,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             // Add a key package relay using a local test relay so the connection succeeds
             let relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
@@ -2628,13 +2653,16 @@ mod tests {
                 .await
                 .unwrap();
             saved_user
-                .add_relay(&relay, RelayType::KeyPackage, &whitenoise.database)
+                .add_relay(&relay, RelayType::KeyPackage, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             // With a relay present, key_package_status should return NotFound
             // without attempting relay sync (no retry path).
-            let status = saved_user.key_package_status(&whitenoise).await.unwrap();
+            let status = saved_user
+                .key_package_status(&whitenoise.shared)
+                .await
+                .unwrap();
             assert_eq!(status, KeyPackageStatus::NotFound);
         }
     }

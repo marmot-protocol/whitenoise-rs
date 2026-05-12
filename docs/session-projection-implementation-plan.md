@@ -33,6 +33,11 @@ phase in this refactor after #740 lands; instead, rebase and adjust any new code
 
 ### Phase 1: AccountSession scaffolding + startup restore + MDK caching (~700 LOC)
 
+- [x] Completed in PR #743
+
+<details>
+<summary>Details</summary>
+
 **Files to create:**
 - `src/whitenoise/session/mod.rs` — `AccountSession`, `AccountManager`, `Whitenoise::session()` lookup
 
@@ -72,7 +77,14 @@ is re-registered. Operations that need signing return the existing external-sign
 
 **Validation:** `just precommit-quick`, `just int-test login-flow`, startup restore test.
 
+</details>
+
 ### Phase 2: Move per-account guards and cancellation to session (~600 LOC)
+
+- [x] Completed in PR #743
+
+<details>
+<summary>Details</summary>
 
 **Fields to move from `Whitenoise` to `AccountSession`:**
 - `contact_list_guards: DashMap<PublicKey, Arc<Semaphore>>` -> `session.contact_list_guard: Arc<Semaphore>`
@@ -93,7 +105,14 @@ transitional lookup.
 
 **Validation:** `just precommit-quick`, `just int-test login-flow`, `just int-test user-discovery`.
 
+</details>
+
 ### Phase 3: Scoped relay handles (~700 LOC)
+
+- [x] Completed in PRs #753, #755, #756
+
+<details>
+<summary>Details</summary>
 
 **Files to create:**
 - `src/whitenoise/session/relay_handles.rs` — `AccountEphemeralHandle`, `AccountGroupHandle`
@@ -115,7 +134,14 @@ transitional lookup.
 
 **Validation:** `just precommit-quick`, `just int-test basic-messaging`, `just int-test login-flow`.
 
+</details>
+
 ### Phase 4: Account repository scaffold for the first small domains (~500 LOC)
+
+- [x] Completed in PR #754
+
+<details>
+<summary>Details</summary>
 
 Create the repository module and only the repos needed by phase 5:
 - `src/whitenoise/database/account/mod.rs` — `AccountRepositories` with optional/partial fields
@@ -128,7 +154,14 @@ exposing a pubkey argument. Add the remaining repos when their domains migrate r
 
 **Validation:** `just precommit-quick`, focused repo tests.
 
+</details>
+
 ### Phase 5: View pattern + migrate drafts/follows/settings (~700 LOC)
+
+- [x] Completed on branch `phase-5-view-pattern-migrate-ops`
+
+<details>
+<summary>Details</summary>
 
 **Files to create:**
 - `src/whitenoise/session/social.rs` — `SocialOps`
@@ -165,7 +198,14 @@ call sites are migrated.
 
 **Validation:** `just precommit-quick`, `just int-test follow-management`.
 
+</details>
+
 ### Phase 6: Migrate message read/search operations (~500 LOC)
+
+- [x] Completed in PR #760
+
+<details>
+<summary>Details</summary>
 
 **Methods to move to `MessageOps`:**
 - `fetch_messages_for_group`
@@ -180,7 +220,14 @@ current shared `Database`.
 
 **Validation:** `just precommit-quick`, message read/search tests.
 
+</details>
+
 ### Phase 7: Migrate message send/retry/projection write path + delivery-status scope fix (~1000 LOC)
+
+- [x] Completed in PR #760
+
+<details>
+<summary>Details</summary>
 
 **Methods to move to `MessageOps`:**
 - `send_message_to_group`
@@ -210,7 +257,14 @@ in the same phase.
 **Validation:** `just precommit-quick`, `just int-test basic-messaging`, `just int-test reactions`, two-account
 delivery-status isolation test.
 
+</details>
+
 ### Phase 8: Migrate group read operations (~500 LOC)
+
+- [x] Completed in PR #763
+
+<details>
+<summary>Details</summary>
 
 **Methods to move to `GroupOps`:**
 - `groups`
@@ -225,7 +279,14 @@ Create only the repos needed for group membership reads. Leave mutation-heavy pa
 
 **Validation:** `just precommit-quick`, group read tests.
 
+</details>
+
 ### Phase 9: Migrate group member/data mutation operations (~800 LOC)
+
+- [x] Completed in PR #766
+
+<details>
+<summary>Details</summary>
 
 **Methods to move to `GroupOps`:**
 - `add_members_to_group`
@@ -237,7 +298,14 @@ Create only the repos needed for group membership reads. Leave mutation-heavy pa
 
 **Validation:** `just precommit-quick`, `just int-test basic-messaging`.
 
+</details>
+
 ### Phase 10: Migrate `create_group` and welcome delivery helpers (~800 LOC)
+
+- [x] Completed in PR #769
+
+<details>
+<summary>Details</summary>
 
 Move `create_group`, member key-package resolution, welcome preparation, welcome publish background work, and group
 record finalization into session-owned group ops.
@@ -247,14 +315,28 @@ and push-token sharing hooks.
 
 **Validation:** `just precommit-quick`, group creation integration tests.
 
+</details>
+
 ### Phase 11: Migrate group media operations (~800 LOC)
+
+- [x] Completed in PR #772
+
+<details>
+<summary>Details</summary>
 
 Move `groups/media.rs` account-scoped operations into session-owned media/group ops while still using the current
 `media_files` table. The blob/reference table split happens later in the database phase.
 
 **Validation:** `just precommit-quick`, chat media upload/download integration tests.
 
+</details>
+
 ### Phase 12: Migrate memberships (`accounts_groups`) (~700 LOC)
+
+- [x] Completed in PR #764
+
+<details>
+<summary>Details</summary>
 
 **Methods to move to `MembershipOps`:**
 - `get_or_create_account_group`
@@ -277,7 +359,14 @@ Add `AccountGroupsRepo` in this phase.
 
 **Validation:** `just precommit-quick`, membership tests, `just int-test basic-messaging`.
 
+</details>
+
 ### Phase 13: Migrate push account ops (~700 LOC)
+
+- [x] Completed in PR #767
+
+<details>
+<summary>Details</summary>
 
 Move push operations that mutate account-scoped state:
 - `push_registration`
@@ -294,7 +383,14 @@ tables.
 
 **Validation:** `just precommit-quick`, push registration/token integration tests.
 
+</details>
+
 ### Phase 14: Migrate key packages and chat list reads (~800 LOC)
+
+- [x] Completed in PR #768
+
+<details>
+<summary>Details</summary>
 
 **Methods to move:**
 - `KeyPackageOps`: account-scoped publish/delete/record/cleanup operations
@@ -307,7 +403,14 @@ split phase.
 
 **Validation:** `just precommit-quick`, `just int-test login-flow`, chat list integration tests.
 
+</details>
+
 ### Phase 15: Session-scoped event dispatch (~800 LOC)
+
+- [x] Completed in PR #770
+
+<details>
+<summary>Details</summary>
 
 **Files to modify:**
 - `src/whitenoise/event_processor/account_event_processor.rs` — resolve session and dispatch through it
@@ -323,7 +426,14 @@ split phase.
 
 **Validation:** `just precommit-quick`, `just int-test basic-messaging`, `just int-test notification-streaming`.
 
+</details>
+
 ### Phase 16a: Extract SharedServices while keeping singleton compatibility (~800 LOC)
+
+- [x] In review in PR #773
+
+<details>
+<summary>Details</summary>
 
 **Files to create:**
 - `src/whitenoise/shared.rs` — `SharedServices`
@@ -338,7 +448,14 @@ same PR.
 
 **Validation:** `just precommit-quick`.
 
+</details>
+
 ### Phase 16b: Kill singleton and pass app/shared handles explicitly (~800 LOC)
+
+- [x] Completed in PR #779
+
+<details>
+<summary>Details</summary>
 
 **Files to modify:**
 - `src/whitenoise/mod.rs` — delete `GLOBAL_WHITENOISE`, delete `get_instance()`, add `Whitenoise::new(config) -> Result<Self>`
@@ -350,7 +467,14 @@ same PR.
 
 **Validation:** `just precommit-quick`, all integration tests, `cargo test -- --test-threads=4`.
 
+</details>
+
 ### Phase 17: BroadcastHub consolidation (~400 LOC)
+
+- [x] Completed in PR `#765`
+
+<details>
+<summary>Details</summary>
 
 - Extract generic `BroadcastHub<K, V>` from the keyed streaming managers.
 - Replace `MessageStreamManager`, `ChatListStreamManager`, and `UserStreamManager` with thin wrappers.
@@ -361,7 +485,14 @@ boundary.
 
 **Validation:** `just precommit-quick`.
 
+</details>
+
 ### Phase 18a: Database split audit + scaffolding (~600 LOC)
+
+- [x] Completed in PR #776
+
+<details>
+<summary>Details</summary>
 
 **Files to create:**
 - `src/whitenoise/database/shared_db.rs`
@@ -377,7 +508,14 @@ boundary.
 
 **Validation:** `just precommit-quick`, migration smoke tests.
 
+</details>
+
 ### Phase 18b: Media blob/reference split (~800 LOC)
+
+- [x] Completed in PR #787
+
+<details>
+<summary>Details</summary>
 
 Create the new media shape:
 - shared DB: blob cache table
@@ -388,22 +526,99 @@ Migrate `media_files` usage to the two-table model while keeping bytes deduplica
 **Validation:** `just precommit-quick`, chat media upload/download integration tests, account deletion test that leaves
 shared blobs intact when still referenced.
 
+</details>
+
 ### Phase 18c: Move simple account tables to account DB (~800 LOC)
 
-Move tables with limited cross-table behavior first:
-- `account_settings`
-- `account_follows`
-- `drafts`
-- `published_key_packages`
-- `published_events`
-- account-scoped `processed_events`
+- [x] Completed
 
-Repos switch from `Arc<Database>` to `Arc<AccountDatabase>`. Drop `account_pubkey` columns where the DB file is the
-scope.
+<details>
+<summary>Details</summary>
+
+Six tables moved out of shared into per-account DB files. Migration timeline:
+
+| v   | Kind   | Migration                                         |
+| --- | ------ | ------------------------------------------------- |
+| 15  | global | `published_events.account_id → account_pubkey`    |
+| 16  | global | `processed_events.account_id → account_pubkey`    |
+| 17  | local  | move `account_settings`                           |
+| 18  | local  | move `drafts`                                     |
+| 19  | local  | move `published_key_packages`                     |
+| 20  | local  | move `published_events`                           |
+| 21  | local  | move account-scoped `processed_events`            |
+| 22  | local  | move `account_follows`                            |
+| 23  | global | drop shared `account_settings`                    |
+| 24  | global | drop shared `drafts`                              |
+| 25  | global | drop shared `published_key_packages`              |
+| 26  | global | drop shared `published_events`                    |
+| 27  | global | drop shared `account_follows`                     |
+| 28  | global | purge account-scoped rows from `processed_events` |
+
+**Unified-timeline ordering.** Globals and locals share one version space.
+`Migrator::run` walks them in version order, so a "global drop" at v23 is
+guaranteed to run only after the corresponding v17 local copy has been
+applied for whichever account-DB pool is being migrated. Cross-scope races
+that the segregated-sequence design used to allow (drop ahead of copy) are
+prevented by construction — see
+`m0028_purge_account_processed_events.rs:run_global` doc and the Migrator
+docs in `rust_migrations/mod.rs`.
+
+**Deferred-drop guarantee for never-logged-in accounts.** `Database::new`
+runs globals on the shared pool at boot, before any per-account DB exists.
+For accounts that never log in after upgrade, the per-account file is
+created on first session bring-up and runs locals at that point. To stop a
+boot-time global drop from racing ahead of a still-pending local copy, the
+app re-runs `MIGRATOR.run(&shared.pool, None)` once `restore_sessions`
+returns (see `Whitenoise::new` in `src/whitenoise/mod.rs`). For accounts
+that never log in *and* never had data in the moved tables, the drop is
+safe — there's nothing to lose. For accounts that had data and never log
+in: it stays in shared until the account either logs in (running its
+locals first) or the account row is removed entirely.
+
+**`account_follows` schema simplification.** Old: `(account_id INT FK,
+user_id INT FK)` joining shared `users` to recover the followed pubkey.
+New: `(pubkey TEXT PRIMARY KEY, created_at INT, updated_at INT)` — store
+the followed pubkey directly. No FK to shared `users`; richer views resolve
+pubkeys to `User` rows in shared on demand via
+`User::find_by_pubkeys`. Follow lists rarely exceed 1000 entries, so a
+two-step pubkey-then-batch-resolve is fine.
+
+**Event tracker rerouting.** `WhitenoiseEventTracker` now holds
+`Weak<Whitenoise>` so account-scoped ops (`track_published_event`,
+`track_processed_account_event`, etc.) look up the publisher's session and
+write to its `account_db`. `EventTracker::global_published_event` iterates
+every active session's per-account DB (1–3 accounts in practice; cost is
+negligible) since shared no longer carries a global index of all
+publications.
+
+**Repos and ops.**
+
+- `src/whitenoise/database/account/follows.rs` — `AccountFollowsRepo` now
+  wraps `Arc<AccountDatabase>` + `Arc<Database>`. Methods: `follow_pubkeys`,
+  `all`, `is_following`, `add` / `add_pubkey`, `remove` / `remove_pubkey`,
+  `replace_all`.
+- `src/whitenoise/database/published_events.rs` — `PublishedEvent::create` /
+  `exists` take `&AccountDatabase` (no pubkey arg).
+- `src/whitenoise/database/processed_events.rs` — split into
+  `create_global` / `exists_global` / `newest_global_event_timestamp_for_kind`
+  / `newest_relay_event_timestamp` (shared DB) and `create_for_account` /
+  `exists_for_account` / `newest_contact_list_timestamp` (per-account DB).
+
+**Removed APIs.** `Account::follows`, `is_following_user`, `follow_user`,
+`unfollow_user` deleted (callers migrated to `session.repos.follows.*` /
+`session.social()`). `Account::update_follows_from_event` now takes
+`&AccountSession` so it can rewrite the per-account follow set.
 
 **Validation:** `just precommit-quick`, upgrade migration tests.
 
+</details>
+
 ### Phase 18d: Move membership and push account tables to account DB (~800 LOC)
+
+- [x] Completed in PR #792
+
+<details>
+<summary>Details</summary>
 
 Move:
 - `accounts_groups`
@@ -414,7 +629,14 @@ Replace cross-DB FKs with application-level checks. Keep the account registry in
 
 **Validation:** `just precommit-quick`, push and group membership integration tests.
 
+</details>
+
 ### Phase 18e: Move message projection tables and chat-list join logic (~1000 LOC)
+
+- [ ] Not started
+
+<details>
+<summary>Details</summary>
 
 Move:
 - `aggregated_messages`
@@ -425,16 +647,29 @@ joins across account DB and shared DB.
 
 **Validation:** `just precommit-quick`, all messaging/chat-list integration tests, upgrade migration test.
 
+</details>
+
 ### Phase 19: CLI crate extraction (~500 LOC of Cargo.toml + module moves)
+
+- [x] Completed in PR #774
+
+<details>
+<summary>Details</summary>
 
 - Move `src/cli/` -> `crates/whitenoise-cli/src/`
 - Move `src/bin/wn.rs`, `src/bin/wnd.rs` -> `crates/whitenoise-cli/src/bin/`
 - Update workspace `Cargo.toml`
 - `whitenoise-cli` depends on `whitenoise` core crate
 - CLI-specific deps (`clap`, `rpassword`, `dirs`, `indicatif`) move to CLI crate
-- Remove `cli` feature flag from core crate
+- Retain `cli = []` as an empty feature flag in core (not removed as originally planned):
+  `src/whitenoise/mod.rs` uses `#[cfg(feature = "cli")]` to select the macOS keyring store —
+  CLI binaries are unsigned and must use `apple_native_keyring_store::keychain::Store` instead
+  of the Protected Data store, which requires a code-signed provisioning profile. The flag
+  carries no dependencies; it exists solely to gate this platform behaviour.
 
 **Validation:** `just precommit-quick`, CLI commands work end-to-end.
+
+</details>
 
 ## Known Type Issues and Mitigations
 

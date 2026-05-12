@@ -85,7 +85,10 @@ impl BenchmarkScenario for AddMembersPerformanceBenchmark {
 
         let group = context
             .whitenoise
-            .create_group(&admin, vec![initial_member.pubkey], group_config, None)
+            .require_session(&admin.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![initial_member.pubkey], group_config, None)
             .await?;
         tracing::info!("Created benchmark group");
         context.add_group("benchmark_group", group);

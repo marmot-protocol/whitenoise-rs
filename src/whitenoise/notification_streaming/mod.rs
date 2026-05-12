@@ -34,7 +34,7 @@ impl Whitenoise {
         message: &ChatMessage,
         group_name: Option<String>,
     ) {
-        if !self.notification_stream_manager.has_subscribers() {
+        if !self.shared.notification_stream_manager.has_subscribers() {
             return;
         }
 
@@ -55,7 +55,7 @@ impl Whitenoise {
             return;
         }
 
-        let is_dm = GroupInformation::find_by_mls_group_id(group_id, &self.database)
+        let is_dm = GroupInformation::find_by_mls_group_id(group_id, &self.shared.database)
             .await
             .ok()
             .map(|gi| gi.group_type == GroupType::DirectMessage)
@@ -76,7 +76,7 @@ impl Whitenoise {
             timestamp,
         };
 
-        self.notification_stream_manager.emit(update);
+        self.shared.notification_stream_manager.emit(update);
     }
 
     #[perf_instrument("notification_streaming")]
@@ -87,11 +87,11 @@ impl Whitenoise {
         group_name: &str,
         welcomer_pubkey: PublicKey,
     ) {
-        if !self.notification_stream_manager.has_subscribers() {
+        if !self.shared.notification_stream_manager.has_subscribers() {
             return;
         }
 
-        let is_dm = GroupInformation::find_by_mls_group_id(group_id, &self.database)
+        let is_dm = GroupInformation::find_by_mls_group_id(group_id, &self.shared.database)
             .await
             .ok()
             .map(|group_info| group_info.group_type == GroupType::DirectMessage)
@@ -111,7 +111,7 @@ impl Whitenoise {
             timestamp: Utc::now(),
         };
 
-        self.notification_stream_manager.emit(update);
+        self.shared.notification_stream_manager.emit(update);
     }
 
     /// Emits a new-message notification only if notifications are enabled for the account.
@@ -154,26 +154,23 @@ impl Whitenoise {
     ///
     /// The caller is not blocked; settings are checked inside the spawned task.
     pub(crate) fn spawn_new_message_notification_if_enabled(
+        &self,
         account: &Account,
         group_id: &GroupId,
         message: &ChatMessage,
         group_name: Option<String>,
     ) {
+        let Ok(whitenoise) = self.arc() else {
+            tracing::error!(
+                target: "whitenoise::notification_streaming",
+                "Whitenoise instance unavailable for notification"
+            );
+            return;
+        };
         let account = account.clone();
         let group_id = group_id.clone();
         let message = message.clone();
         tokio::spawn(async move {
-            let whitenoise = match Self::get_instance() {
-                Ok(wn) => wn,
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::notification_streaming",
-                        "Failed to get Whitenoise instance for notification: {}",
-                        e
-                    );
-                    return;
-                }
-            };
             whitenoise
                 .emit_new_message_notification_if_enabled(&account, &group_id, &message, group_name)
                 .await;
@@ -183,7 +180,11 @@ impl Whitenoise {
     /// Returns whether notifications are enabled for `account`. Fail-open on error.
     #[perf_instrument("notification_streaming")]
     async fn are_notifications_enabled(&self, account: &Account) -> bool {
-        AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
+        let Some(session) = self.session(&account.pubkey) else {
+            // No active session → no per-account DB to read. Fail-open.
+            return true;
+        };
+        AccountSettings::notifications_enabled(&session.account_db)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
@@ -198,7 +199,9 @@ impl Whitenoise {
 
     #[perf_instrument("notification_streaming")]
     async fn build_notification_user(&self, pubkey: &PublicKey) -> NotificationUser {
-        let user = User::find_by_pubkey(pubkey, &self.database).await.ok();
+        let user = User::find_by_pubkey(pubkey, &self.shared.database)
+            .await
+            .ok();
 
         let (display_name, picture_url) = user
             .map(|u| {
@@ -228,8 +231,16 @@ impl Whitenoise {
         account_pubkey: &PublicKey,
         group_id: &GroupId,
     ) -> Option<&'static str> {
-        match AccountGroup::find_by_account_and_group(account_pubkey, group_id, &self.database)
-            .await
+        let session = match self.account_manager.get_session(account_pubkey) {
+            Some(s) => s,
+            None => return Some("no_session"),
+        };
+        match AccountGroup::find_by_account_and_group(
+            account_pubkey,
+            group_id,
+            &session.account_db.inner.pool,
+        )
+        .await
         {
             Ok(Some(ag)) => {
                 if ag.is_removed() {
@@ -257,7 +268,7 @@ impl Whitenoise {
 
     #[perf_instrument("notification_streaming")]
     async fn is_own_account(&self, pubkey: &PublicKey) -> bool {
-        Account::find_by_pubkey(pubkey, &self.database)
+        Account::find_by_pubkey(pubkey, &self.shared.database)
             .await
             .is_ok()
     }
@@ -297,7 +308,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // Subscribe to get notifications
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         // Create a message from the account itself (should be filtered)
         let message = create_test_message(account.pubkey, "Hello");
@@ -321,7 +332,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // Subscribe to get notifications
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         // Create a message from an external user (not in database as account)
         let external_sender = Keys::generate().public_key();
@@ -381,7 +392,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // Subscribe to get notifications
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let welcomer = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[4u8; 32]);
@@ -464,7 +475,7 @@ mod tests {
     async fn test_emit_new_message_notification_if_enabled_emits_when_enabled() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Hello enabled");
@@ -494,10 +505,15 @@ mod tests {
     async fn test_emit_new_message_notification_if_enabled_suppressed_when_disabled() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         // Disable notifications
-        AccountSettings::update_notifications_enabled(&account.pubkey, false, &whitenoise.database)
+        whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .repos
+            .settings
+            .update_notifications_enabled(false)
             .await
             .unwrap();
 
@@ -524,7 +540,7 @@ mod tests {
     async fn test_emit_group_invite_notification_if_enabled_emits_when_enabled() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let welcomer = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[12u8; 32]);
@@ -552,10 +568,15 @@ mod tests {
     async fn test_emit_group_invite_notification_if_enabled_suppressed_when_disabled() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         // Disable notifications
-        AccountSettings::update_notifications_enabled(&account.pubkey, false, &whitenoise.database)
+        whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .repos
+            .settings
+            .update_notifications_enabled(false)
             .await
             .unwrap();
 
@@ -584,6 +605,7 @@ mod tests {
         account_pubkey: &PublicKey,
         group_id: &GroupId,
     ) -> AccountGroup {
+        let session = whitenoise.require_session(account_pubkey).unwrap();
         let ag = AccountGroup {
             id: None,
             account_pubkey: *account_pubkey,
@@ -602,14 +624,14 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.database).await.unwrap()
+        ag.save(&session.account_db.inner.pool).await.unwrap()
     }
 
     #[tokio::test]
     async fn test_emit_new_message_notification_suppressed_for_pending_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Pending group msg");
@@ -634,7 +656,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         whitenoise
             .emit_new_message_notification(
@@ -656,7 +679,7 @@ mod tests {
     async fn test_emit_new_message_notification_suppressed_for_declined_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Declined group msg");
@@ -681,7 +704,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         whitenoise
             .emit_new_message_notification(
@@ -703,7 +727,7 @@ mod tests {
     async fn test_emit_new_message_notification_suppressed_for_unknown_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Unknown group msg");
@@ -730,7 +754,7 @@ mod tests {
     async fn test_group_invite_notification_still_emits_for_pending_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let welcomer = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[23u8; 32]);
@@ -754,7 +778,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         whitenoise
             .emit_group_invite_notification(&account, &group_id, "Invite Group", welcomer)
@@ -795,7 +820,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         assert_eq!(
             whitenoise
@@ -848,9 +874,10 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let saved = ag.save(&whitenoise.database).await.unwrap();
+        let session = whitenoise.require_session(account_pubkey).unwrap();
+        let saved = ag.save(&session.account_db.inner.pool).await.unwrap();
         saved
-            .update_muted_until(Some(muted_until), &whitenoise.database)
+            .update_muted_until(Some(muted_until), &session.account_db.inner.pool)
             .await
             .unwrap();
     }
@@ -859,7 +886,7 @@ mod tests {
     async fn test_emit_new_message_notification_suppressed_for_muted_chat() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Muted chat msg");
@@ -893,7 +920,7 @@ mod tests {
     async fn test_emit_new_message_notification_resumes_after_mute_expires() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Post-expiry msg");
@@ -932,7 +959,7 @@ mod tests {
     async fn test_emit_new_message_notification_suppressed_for_forever_muted_chat() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let mut rx = whitenoise.notification_stream_manager.subscribe();
+        let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Forever muted msg");

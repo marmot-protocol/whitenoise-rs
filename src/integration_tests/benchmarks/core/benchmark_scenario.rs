@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -56,7 +58,7 @@ pub trait BenchmarkScenario {
     /// the default implementation does both; overrides do not inherit that logic.
     async fn run_benchmark(
         &mut self,
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
     ) -> Result<BenchmarkResult, WhitenoiseError> {
         let config = self.config();
         let mut context = ScenarioContext::new(whitenoise);

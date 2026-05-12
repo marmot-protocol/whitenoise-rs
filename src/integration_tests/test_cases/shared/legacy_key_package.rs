@@ -145,13 +145,9 @@ pub(crate) async fn publish_legacy_capability_key_package(
 
     context
         .whitenoise
-        .track_published_key_package_for_testing(
-            &account.pubkey,
-            &key_package_data.hash_ref,
-            &event_id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-        )
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .track_published_for_testing(&key_package_data.hash_ref, &event_id.to_hex())
         .await?;
 
     tracing::debug!(
@@ -185,7 +181,9 @@ pub(crate) async fn publish_legacy_leaf_key_package(
     let event = mdk_core::test_util::create_legacy_key_package_event(&mdk, &keys);
     let event_id = event.id;
 
-    let relays = account.key_package_relays(context.whitenoise).await?;
+    let relays = account
+        .key_package_relays(&context.whitenoise.shared)
+        .await?;
     let relay_urls: Vec<&str> = relays.iter().map(|relay| relay.url.as_str()).collect();
     let client = create_test_client(&relay_urls, keys).await?;
     client.send_event(&event).await?;
@@ -193,13 +191,9 @@ pub(crate) async fn publish_legacy_leaf_key_package(
 
     context
         .whitenoise
-        .track_published_key_package_for_testing(
-            &account.pubkey,
-            &[],
-            &event_id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-        )
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .track_published_for_testing(&[], &event_id.to_hex())
         .await?;
 
     tracing::debug!(

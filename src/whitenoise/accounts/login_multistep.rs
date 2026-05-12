@@ -55,13 +55,13 @@ impl Whitenoise {
         // Three conditions must hold to short-circuit:
         // 1. Account row exists in the database.
         // 2. No pending multi-step login is in progress (pending_logins).
-        // 3. An active session exists (background_task_cancellation is set
-        //    by activate_account). Without this check, a concurrent second
-        //    call could see the DB row created by a first call that hasn't
-        //    finished activation yet and return Complete prematurely.
-        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await
-            && !self.pending_logins.contains_key(&pubkey)
-            && self.background_task_cancellation.contains_key(&pubkey)
+        // 3. An active session exists (created by activate_account). Without
+        //    this check, a concurrent second call could see the DB row created
+        //    by a first call that hasn't finished activation yet and return
+        //    Complete prematurely.
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.shared.database).await
+            && !self.account_manager.has_pending_login(&pubkey)
+            && self.account_manager.get_session(&pubkey).is_some()
         {
             tracing::debug!(
                 target: "whitenoise::accounts",
@@ -119,7 +119,8 @@ impl Whitenoise {
                 discovered.found(RelayType::Inbox),
                 discovered.found(RelayType::KeyPackage),
             );
-            self.pending_logins.insert(pubkey, discovered);
+            self.account_manager
+                .stash_pending_login(&pubkey, discovered);
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -140,10 +141,9 @@ impl Whitenoise {
         pubkey: &PublicKey,
     ) -> core::result::Result<LoginResult, LoginError> {
         let discovered = self
-            .pending_logins
-            .get(pubkey)
-            .ok_or(LoginError::NoLoginInProgress)?
-            .clone();
+            .account_manager
+            .get_pending_login(pubkey)
+            .ok_or(LoginError::NoLoginInProgress)?;
 
         tracing::debug!(
             target: "whitenoise::accounts",
@@ -154,16 +154,17 @@ impl Whitenoise {
             !discovered.found(RelayType::KeyPackage),
         );
 
-        let account = Account::find_by_pubkey(pubkey, &self.database)
+        let account = Account::find_by_pubkey(pubkey, &self.shared.database)
             .await
             .map_err(LoginError::from)?;
         let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
         let keys = self
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(pubkey)
             .map_err(|e| LoginError::Internal(e.to_string()))?;
         let user = account
-            .user(&self.database)
+            .user(&self.shared.database)
             .await
             .map_err(LoginError::from)?;
 
@@ -182,7 +183,7 @@ impl Whitenoise {
         let _publish_span = perf_span!("accounts::login_publish_defaults::publish_missing");
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             if !discovered.found(relay_type) {
-                user.add_relays(&default_relays, relay_type, &self.database)
+                user.add_relays(&default_relays, relay_type, &self.shared.database)
                     .await
                     .map_err(LoginError::from)?;
             } else {
@@ -268,7 +269,7 @@ impl Whitenoise {
         )
         .await?;
 
-        self.pending_logins.remove(pubkey);
+        self.account_manager.take_pending_login(pubkey);
         tracing::info!(
             target: "whitenoise::accounts",
             "Login complete for {}",
@@ -296,7 +297,7 @@ impl Whitenoise {
         pubkey: &PublicKey,
         relay_url: RelayUrl,
     ) -> core::result::Result<LoginResult, LoginError> {
-        if !self.pending_logins.contains_key(pubkey) {
+        if !self.account_manager.has_pending_login(pubkey) {
             return Err(LoginError::NoLoginInProgress);
         }
         tracing::debug!(
@@ -306,7 +307,7 @@ impl Whitenoise {
             pubkey.to_hex()
         );
 
-        let mut account = Account::find_by_pubkey(pubkey, &self.database)
+        let mut account = Account::find_by_pubkey(pubkey, &self.shared.database)
             .await
             .map_err(LoginError::from)?;
 
@@ -339,7 +340,7 @@ impl Whitenoise {
                 merged.relays(RelayType::KeyPackage),
             )
             .await?;
-            self.pending_logins.remove(pubkey);
+            self.account_manager.take_pending_login(pubkey);
             tracing::info!(
                 target: "whitenoise::accounts",
                 "Login complete for {} (found lists on {})",
@@ -374,7 +375,9 @@ impl Whitenoise {
     /// login is pending this is a no-op and returns `Ok(())`.
     pub async fn login_cancel(&self, pubkey: &PublicKey) -> core::result::Result<(), LoginError> {
         // Only clean up if there was actually a pending login for this pubkey.
-        if self.pending_logins.remove(pubkey).is_none() {
+        // Peek without consuming so a fallible cleanup below doesn't strand
+        // the partial-login state (a retry would otherwise become a no-op).
+        if !self.account_manager.has_pending_login(pubkey) {
             tracing::debug!(
                 target: "whitenoise::accounts",
                 "No pending login for {}, nothing to cancel",
@@ -387,13 +390,13 @@ impl Whitenoise {
         self.remove_external_signer(pubkey);
 
         // Clean up the partial account if it exists.
-        if let Ok(account) = Account::find_by_pubkey(pubkey, &self.database).await {
+        if let Ok(account) = Account::find_by_pubkey(pubkey, &self.shared.database).await {
             // Remove relay associations that try_discover_relay_lists may have
             // written to the DB before the user cancelled.  The user_relays table
             // has no CASCADE from accounts, so these rows would otherwise persist
             // as stale data for a subsequent login with the same pubkey.
-            if let Ok(user) = account.user(&self.database).await
-                && let Err(e) = user.remove_all_relays(&self.database).await
+            if let Ok(user) = account.user(&self.shared.database).await
+                && let Err(e) = user.remove_all_relays(&self.shared.database).await
             {
                 tracing::warn!(
                     target: "whitenoise::accounts",
@@ -403,17 +406,25 @@ impl Whitenoise {
                 );
             }
             account
-                .delete(&self.database)
+                .delete(&self.shared.database)
                 .await
                 .map_err(LoginError::from)?;
             // Best-effort removal of the keychain entry.
-            let _ = self.secrets_store.remove_private_key_for_pubkey(pubkey);
+            let _ = self
+                .shared
+                .secrets_store
+                .remove_private_key_for_pubkey(pubkey);
             tracing::info!(
                 target: "whitenoise::accounts",
                 "Cleaned up partial login for {}",
                 pubkey.to_hex()
             );
         }
+
+        // All fallible cleanup succeeded — now consume the marker so a retry
+        // (if anything still went wrong upstream) is a no-op rather than a
+        // re-run of destructive cleanup.
+        self.account_manager.take_pending_login(pubkey);
         Ok(())
     }
 
@@ -499,21 +510,15 @@ impl Whitenoise {
     }
 
     /// Merge newly-discovered relay lists into the pending-login stash and
-    /// return a snapshot.  The DashMap lock is released before returning so
-    /// the caller is free to do async work with the result.
+    /// return a snapshot.
     pub(super) fn merge_into_stash(
         &self,
         pubkey: &PublicKey,
         discovered: DiscoveredRelayLists,
     ) -> core::result::Result<DiscoveredRelayLists, LoginError> {
-        let mut stash = self
-            .pending_logins
-            .get_mut(pubkey)
-            .ok_or(LoginError::NoLoginInProgress)?;
-        stash.merge(discovered);
-        let snapshot = stash.clone();
-        drop(stash);
-        Ok(snapshot)
+        self.account_manager
+            .merge_pending_login(pubkey, discovered)
+            .ok_or(LoginError::NoLoginInProgress)
     }
 
     pub(super) async fn sync_discovered_relay_lists(
@@ -643,8 +648,8 @@ mod tests {
             .await
             .unwrap();
         whitenoise
-            .pending_logins
-            .insert(keys.public_key(), discovered);
+            .account_manager
+            .stash_pending_login(&keys.public_key(), discovered);
     }
 
     /// Create an external-signer account, register its signer, and insert a
@@ -663,7 +668,9 @@ mod tests {
             .insert_external_signer(pubkey, keys.clone())
             .await
             .unwrap();
-        whitenoise.pending_logins.insert(pubkey, discovered);
+        whitenoise
+            .account_manager
+            .stash_pending_login(&pubkey, discovered);
     }
 
     /// Like `setup_partial_pending_login` but also writes relay associations to
@@ -677,21 +684,21 @@ mod tests {
             .create_base_account_with_private_key(keys)
             .await
             .unwrap();
-        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = discovered.relays(relay_type);
             if !relays.is_empty() {
-                user.add_relays(relays, relay_type, &whitenoise.database)
+                user.add_relays(relays, relay_type, &whitenoise.shared.database)
                     .await
                     .unwrap();
             }
         }
         whitenoise
-            .pending_logins
-            .insert(keys.public_key(), discovered);
+            .account_manager
+            .stash_pending_login(&keys.public_key(), discovered);
     }
 
     /// Like `setup_partial_pending_login_external_signer` but also writes relay
@@ -710,16 +717,18 @@ mod tests {
             .insert_external_signer(pubkey, keys.clone())
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = discovered.relays(relay_type);
             if !relays.is_empty() {
-                user.add_relays(relays, relay_type, &whitenoise.database)
+                user.add_relays(relays, relay_type, &whitenoise.shared.database)
                     .await
                     .unwrap();
             }
         }
-        whitenoise.pending_logins.insert(pubkey, discovered);
+        whitenoise
+            .account_manager
+            .stash_pending_login(&pubkey, discovered);
     }
 
     // -----------------------------------------------------------------------
@@ -1207,10 +1216,11 @@ mod tests {
             .create_test_identity_with_keys(&keys)
             .await
             .unwrap();
-        let original_synced_at = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
-            .await
-            .unwrap()
-            .last_synced_at;
+        let original_synced_at =
+            Account::find_by_pubkey(&original.pubkey, &whitenoise.shared.database)
+                .await
+                .unwrap()
+                .last_synced_at;
         assert!(
             original_synced_at.is_some(),
             "create_identity must set last_synced_at"
@@ -1235,7 +1245,7 @@ mod tests {
             "Should return the same account row"
         );
 
-        let after = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
+        let after = Account::find_by_pubkey(&original.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(
@@ -1244,7 +1254,9 @@ mod tests {
         );
 
         assert!(
-            !whitenoise.pending_logins.contains_key(&original.pubkey),
+            !whitenoise
+                .account_manager
+                .has_pending_login(&original.pubkey),
             "Should not create a pending login for an already-active account"
         );
     }
@@ -1262,16 +1274,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            Account::find_by_pubkey(&pubkey, &whitenoise.database)
+            Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
                 .await
                 .is_ok()
         );
-        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
-        assert!(
-            !whitenoise
-                .background_task_cancellation
-                .contains_key(&pubkey)
-        );
+        assert!(!whitenoise.account_manager.has_pending_login(&pubkey));
+        assert!(whitenoise.account_manager.get_session(&pubkey).is_none());
 
         let result = whitenoise
             .login_start(keys.secret_key().to_secret_hex())
@@ -1284,7 +1292,7 @@ mod tests {
             "DB row without active session must not short-circuit to Complete"
         );
         assert!(
-            whitenoise.pending_logins.contains_key(&pubkey),
+            whitenoise.account_manager.has_pending_login(&pubkey),
             "Relay discovery path must stash a pending login"
         );
 
@@ -1303,7 +1311,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.status, LoginStatus::NeedsRelayLists);
-        assert!(whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(whitenoise.account_manager.has_pending_login(&pubkey));
 
         let result2 = whitenoise
             .login_start(keys.secret_key().to_secret_hex())
@@ -1345,7 +1353,7 @@ mod tests {
             Ok(login_result) => {
                 assert_eq!(login_result.status, LoginStatus::NeedsRelayLists);
                 assert_eq!(login_result.account.pubkey, pubkey);
-                assert!(whitenoise.pending_logins.contains_key(&pubkey));
+                assert!(whitenoise.account_manager.has_pending_login(&pubkey));
                 let _ = whitenoise.login_cancel(&pubkey).await;
             }
             Err(e) => {
@@ -1374,7 +1382,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, LoginStatus::NeedsRelayLists);
-        assert!(whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(whitenoise.account_manager.has_pending_login(&pubkey));
 
         // Now publish default relays to complete the login.
         let result = whitenoise
@@ -1384,13 +1392,13 @@ mod tests {
 
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(result.account.pubkey, pubkey);
-        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(!whitenoise.account_manager.has_pending_login(&pubkey));
 
         // Verify all three relay types are stored.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = result
                 .account
-                .relays(relay_type, &whitenoise)
+                .relays(relay_type, &whitenoise.shared)
                 .await
                 .unwrap();
             assert!(
@@ -1417,7 +1425,11 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(result.account.pubkey, pubkey);
 
-        let nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        let nip65 = result
+            .account
+            .nip65_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(
             !nip65.is_empty(),
             "Expected NIP-65 relays to be stored after login"
@@ -1438,8 +1450,8 @@ mod tests {
             .find_or_create_relay_by_url(&RelayUrl::parse("wss://first-run.example.com").unwrap())
             .await
             .unwrap();
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: Some(vec![nip65_relay.clone()]),
                 inbox: None,
@@ -1447,8 +1459,8 @@ mod tests {
             },
         );
 
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1456,12 +1468,14 @@ mod tests {
             },
         );
 
-        let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
+        let stash = whitenoise
+            .account_manager
+            .get_pending_login(&pubkey)
+            .unwrap();
         assert!(
             stash.nip65.is_none(),
             "Second insert must overwrite the first stash"
         );
-        drop(stash);
 
         let _ = whitenoise.login_cancel(&pubkey).await;
     }
@@ -1488,8 +1502,8 @@ mod tests {
             .create_base_account_with_private_key(&keys)
             .await
             .unwrap();
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1510,7 +1524,7 @@ mod tests {
             "Account should be deleted after cancel"
         );
         assert!(
-            !whitenoise.pending_logins.contains_key(&pubkey),
+            !whitenoise.account_manager.has_pending_login(&pubkey),
             "Pending login should be removed after cancel"
         );
     }
@@ -1520,8 +1534,8 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let pubkey = Keys::generate().public_key();
 
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1531,7 +1545,7 @@ mod tests {
 
         let result = whitenoise.login_cancel(&pubkey).await;
         assert!(result.is_ok());
-        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(!whitenoise.account_manager.has_pending_login(&pubkey));
     }
 
     #[tokio::test]
@@ -1564,8 +1578,8 @@ mod tests {
             .create_base_account_with_private_key(&keys)
             .await
             .unwrap();
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1591,8 +1605,8 @@ mod tests {
             .find_or_create_relay_by_url(&RelayUrl::parse("wss://r.example.com").unwrap())
             .await
             .unwrap();
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: Some(vec![nip65_relay]),
                 inbox: None,
@@ -1601,7 +1615,7 @@ mod tests {
         );
 
         whitenoise.login_cancel(&pubkey).await.unwrap();
-        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(!whitenoise.account_manager.has_pending_login(&pubkey));
         assert!(whitenoise.find_account_by_pubkey(&pubkey).await.is_err());
     }
 
@@ -1627,12 +1641,12 @@ mod tests {
         )
         .await;
 
-        let account = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let account = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         let nip65_before = user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(
@@ -1644,10 +1658,10 @@ mod tests {
         whitenoise.login_cancel(&pubkey).await.unwrap();
 
         assert!(whitenoise.find_account_by_pubkey(&pubkey).await.is_err());
-        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(!whitenoise.account_manager.has_pending_login(&pubkey));
 
         let nip65_after = user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(
@@ -1696,7 +1710,7 @@ mod tests {
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = result
                 .account
-                .relays(relay_type, &whitenoise)
+                .relays(relay_type, &whitenoise.shared)
                 .await
                 .unwrap();
             assert!(
@@ -1729,7 +1743,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !whitenoise.pending_logins.contains_key(&pubkey),
+            !whitenoise.account_manager.has_pending_login(&pubkey),
             "pending_logins must be cleared after successful publish"
         );
     }
@@ -1771,7 +1785,7 @@ mod tests {
             .unwrap();
         assert_eq!(complete.status, LoginStatus::Complete);
         assert!(
-            !whitenoise.pending_logins.contains_key(&pubkey),
+            !whitenoise.account_manager.has_pending_login(&pubkey),
             "Stash must be removed after login_publish_default_relays"
         );
     }
@@ -1805,7 +1819,11 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
 
-        let stored_nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        let stored_nip65 = result
+            .account
+            .nip65_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(
             stored_nip65.len(),
             1,
@@ -1819,7 +1837,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1828,7 +1846,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1865,7 +1883,11 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
 
-        let stored_inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        let stored_inbox = result
+            .account
+            .inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(stored_inbox.len(), 1);
         assert_eq!(
             stored_inbox[0].url, inbox_url,
@@ -1874,7 +1896,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1883,7 +1905,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1922,7 +1944,7 @@ mod tests {
 
         let stored_kp = result
             .account
-            .key_package_relays(&whitenoise)
+            .key_package_relays(&whitenoise.shared)
             .await
             .unwrap();
         assert_eq!(stored_kp.len(), 1);
@@ -1933,7 +1955,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1941,7 +1963,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1982,19 +2004,29 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2036,14 +2068,19 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2053,7 +2090,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2097,21 +2134,26 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
             "NIP-65 must get defaults"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2181,7 +2223,10 @@ mod tests {
             LoginStatus::NeedsRelayLists,
             "Still missing inbox+key_package → must stay NeedsRelayLists"
         );
-        let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
+        let stash = whitenoise
+            .account_manager
+            .get_pending_login(&pubkey)
+            .unwrap();
         assert_eq!(
             stash.nip65.as_ref().map_or(0, |v| v.len()),
             1,
@@ -2189,7 +2234,6 @@ mod tests {
         );
         assert!(stash.inbox.is_none());
         assert!(stash.key_package.is_none());
-        drop(stash);
 
         let _ = whitenoise.login_cancel(&pubkey).await;
     }
@@ -2235,7 +2279,7 @@ mod tests {
             "Stash already complete → must complete login"
         );
         assert!(
-            !whitenoise.pending_logins.contains_key(&pubkey),
+            !whitenoise.account_manager.has_pending_login(&pubkey),
             "pending_logins must be cleared after Complete"
         );
         assert_eq!(result.account.pubkey, pubkey);
@@ -2265,7 +2309,7 @@ mod tests {
 
         assert_eq!(result.status, LoginStatus::NeedsRelayLists);
         assert!(
-            whitenoise.pending_logins.contains_key(&pubkey),
+            whitenoise.account_manager.has_pending_login(&pubkey),
             "Stash must persist when still incomplete"
         );
 
@@ -2367,23 +2411,33 @@ mod tests {
             "login_with_custom_relay must return Complete when merged stash is complete"
         );
         assert!(
-            !whitenoise.pending_logins.contains_key(&pubkey),
+            !whitenoise.account_manager.has_pending_login(&pubkey),
             "pending_logins must be cleared after Complete"
         );
         assert_eq!(result.account.pubkey, pubkey);
 
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_relay.url
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_relay.url
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2421,26 +2475,37 @@ mod tests {
         )
         .await;
 
-        {
-            let mut stash = whitenoise.pending_logins.get_mut(&pubkey).unwrap();
-            stash.merge(DiscoveredRelayLists {
-                nip65: None,
-                inbox: Some(vec![inbox_relay.clone()]),
-                key_package: Some(vec![kp_relay.clone()]),
-            });
-            assert!(stash.is_complete(), "Stash must be complete after merge");
-        }
+        let merged = whitenoise
+            .account_manager
+            .merge_pending_login(
+                &pubkey,
+                DiscoveredRelayLists {
+                    nip65: None,
+                    inbox: Some(vec![inbox_relay.clone()]),
+                    key_package: Some(vec![kp_relay.clone()]),
+                },
+            )
+            .unwrap();
+        assert!(merged.is_complete(), "Stash must be complete after merge");
 
-        let account = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let account = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
-        user.add_relays(&[inbox_relay], RelayType::Inbox, &whitenoise.database)
-            .await
-            .unwrap();
-        user.add_relays(&[kp_relay], RelayType::KeyPackage, &whitenoise.database)
-            .await
-            .unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
+        user.add_relays(
+            &[inbox_relay],
+            RelayType::Inbox,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        user.add_relays(
+            &[kp_relay],
+            RelayType::KeyPackage,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let result = whitenoise
             .login_publish_default_relays(&pubkey)
@@ -2449,17 +2514,27 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
 
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
-            RelayUrl::parse("ws://localhost:7777").unwrap()
-        );
-        assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             RelayUrl::parse("ws://localhost:7777").unwrap()
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
+            RelayUrl::parse("ws://localhost:7777").unwrap()
+        );
+        assert_eq!(
+            result
+                .account
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2485,7 +2560,7 @@ mod tests {
         assert_eq!(result.status, LoginStatus::NeedsRelayLists);
         assert_eq!(result.account.pubkey, pubkey);
         assert_eq!(result.account.account_type, AccountType::External);
-        assert!(whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(whitenoise.account_manager.has_pending_login(&pubkey));
 
         let _ = whitenoise.login_cancel(&pubkey).await;
     }
@@ -2528,8 +2603,8 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let pubkey = Keys::generate().public_key();
 
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -2552,7 +2627,7 @@ mod tests {
             other => panic!("Expected LoginError::Internal, got: {:?}", other),
         }
 
-        whitenoise.pending_logins.remove(&pubkey);
+        whitenoise.account_manager.take_pending_login(&pubkey);
     }
 
     #[tokio::test]
@@ -2583,7 +2658,7 @@ mod tests {
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = result
                 .account
-                .relays(relay_type, &whitenoise)
+                .relays(relay_type, &whitenoise.shared)
                 .await
                 .unwrap();
             assert!(
@@ -2616,7 +2691,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !whitenoise.pending_logins.contains_key(&pubkey),
+            !whitenoise.account_manager.has_pending_login(&pubkey),
             "pending_logins must be cleared after external signer publish"
         );
     }
@@ -2640,8 +2715,8 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let pubkey = Keys::generate().public_key();
 
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -2658,7 +2733,7 @@ mod tests {
             "Must error when signer is missing from the registry"
         );
 
-        whitenoise.pending_logins.remove(&pubkey);
+        whitenoise.account_manager.take_pending_login(&pubkey);
     }
 
     #[tokio::test]
@@ -2691,14 +2766,19 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
 
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must not be overwritten"
         );
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2707,7 +2787,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2746,14 +2826,19 @@ mod tests {
         assert_eq!(result.account.account_type, AccountType::External);
 
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must not be overwritten"
         );
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2762,7 +2847,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2802,7 +2887,7 @@ mod tests {
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2812,7 +2897,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2821,7 +2906,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2863,19 +2948,29 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2917,14 +3012,19 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2934,7 +3034,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2978,21 +3078,26 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
             "NIP-65 must receive defaults"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -3041,8 +3146,8 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let pubkey = Keys::generate().public_key();
 
-        whitenoise.pending_logins.insert(
-            pubkey,
+        whitenoise.account_manager.stash_pending_login(
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -3066,7 +3171,7 @@ mod tests {
             other => panic!("Expected LoginError::Internal, got: {:?}", other),
         }
 
-        whitenoise.pending_logins.remove(&pubkey);
+        whitenoise.account_manager.take_pending_login(&pubkey);
     }
 
     #[tokio::test]
@@ -3099,7 +3204,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, LoginStatus::NeedsRelayLists);
-        let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
+        let stash = whitenoise
+            .account_manager
+            .get_pending_login(&pubkey)
+            .unwrap();
         assert_eq!(
             stash.nip65.as_ref().map_or(0, |v| v.len()),
             1,
@@ -3107,7 +3215,6 @@ mod tests {
         );
         assert!(stash.inbox.is_none());
         assert!(stash.key_package.is_none());
-        drop(stash);
 
         let _ = whitenoise.login_cancel(&pubkey).await;
     }
@@ -3153,7 +3260,7 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(result.account.account_type, AccountType::External);
         assert!(
-            !whitenoise.pending_logins.contains_key(&pubkey),
+            !whitenoise.account_manager.has_pending_login(&pubkey),
             "Stash must be cleared after Complete"
         );
         assert_eq!(result.account.pubkey, pubkey);
@@ -3185,7 +3292,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, LoginStatus::NeedsRelayLists);
-        assert!(whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(whitenoise.account_manager.has_pending_login(&pubkey));
 
         let _ = whitenoise.login_cancel(&pubkey).await;
     }
@@ -3220,10 +3327,12 @@ mod tests {
             .create_base_account_with_private_key(&keys)
             .await
             .unwrap();
-        whitenoise.pending_logins.insert(pubkey, partial);
+        whitenoise
+            .account_manager
+            .stash_pending_login(&pubkey, partial);
 
         assert!(
-            whitenoise.pending_logins.contains_key(&pubkey),
+            whitenoise.account_manager.has_pending_login(&pubkey),
             "User with only 10002 must be held in pending state"
         );
 
@@ -3236,7 +3345,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3245,7 +3354,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),

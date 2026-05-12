@@ -50,7 +50,11 @@ impl TestCase for SetChatPinOrderTestCase {
 
         let updated = context
             .whitenoise
-            .set_chat_pin_order(account, &group.mls_group_id, self.pin_order)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group.mls_group_id)
+            .set_pin_order(self.pin_order)
             .await?;
 
         assert_eq!(

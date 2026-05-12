@@ -50,11 +50,11 @@ impl TestCase for UpdateMetadataTestCase {
 
         let account = context.get_account(&self.account_name)?;
         account
-            .update_metadata(&self.metadata, context.whitenoise)
+            .update_metadata(&self.metadata, &context.whitenoise)
             .await?;
 
         // Verify the update worked
-        let updated_metadata = account.metadata(context.whitenoise).await?;
+        let updated_metadata = account.metadata(&context.whitenoise).await?;
         assert_eq!(
             updated_metadata.name, self.metadata.name,
             "Name was not updated correctly"

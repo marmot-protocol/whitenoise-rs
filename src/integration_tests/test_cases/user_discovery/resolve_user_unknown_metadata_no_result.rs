@@ -68,7 +68,7 @@ impl TestCase for ResolveUserUnknownMetadataNoResultTestCase {
         );
 
         let stored_relays = user
-            .relays_by_type(RelayType::Nip65, context.whitenoise)
+            .relays_by_type(RelayType::Nip65, &context.whitenoise)
             .await?;
         assert!(
             !stored_relays.is_empty(),

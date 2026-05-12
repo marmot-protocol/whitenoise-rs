@@ -40,7 +40,9 @@ async fn delete_all_relay_key_packages_for_test_setup(
     for round in 0..MAX_DELETE_ROUNDS {
         let key_packages = context
             .whitenoise
-            .fetch_all_key_packages_for_account(account)
+            .require_session(&account.pubkey)?
+            .key_packages()
+            .fetch_all()
             .await?;
 
         if key_packages.is_empty() {
@@ -51,12 +53,9 @@ async fn delete_all_relay_key_packages_for_test_setup(
         let delete_mls_stored_keys_this_round = delete_mls_stored_keys && round == 0;
         let deleted = context
             .whitenoise
-            .delete_key_packages_for_account(
-                account,
-                key_packages,
-                delete_mls_stored_keys_this_round,
-                1,
-            )
+            .require_session(&account.pubkey)?
+            .key_packages()
+            .delete_batch(key_packages, delete_mls_stored_keys_this_round, 1)
             .await?;
 
         total_deleted += deleted;
@@ -78,7 +77,9 @@ async fn delete_all_relay_key_packages_for_test_setup(
     // clear setup error into a flake.
     let remaining = context
         .whitenoise
-        .fetch_all_key_packages_for_account(account)
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .fetch_all()
         .await?;
     if !remaining.is_empty() {
         return Err(WhitenoiseError::Internal(format!(
@@ -120,7 +121,9 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         context.add_account(&self.account_name, account.clone());
 
         // Verify account has key package relays configured
-        let kp_relays = account.key_package_relays(context.whitenoise).await?;
+        let kp_relays = account
+            .key_package_relays(&context.whitenoise.shared)
+            .await?;
         assert!(
             !kp_relays.is_empty(),
             "Account should have key package relays configured"
@@ -167,7 +170,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
 
         // Run maintenance
         let task = KeyPackageMaintenance;
-        task.execute(context.whitenoise).await?;
+        task.execute(context.whitenoise.clone()).await?;
 
         let after_publish = wait_for_key_packages(
             context,
@@ -219,7 +222,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         tracing::info!("✓ Verified 1 expired key package exists");
 
         // Run maintenance - should publish new and delete expired
-        task.execute(context.whitenoise).await?;
+        task.execute(context.whitenoise.clone()).await?;
 
         // Verify rotation: old one deleted, new one published
         let after_rotate = wait_for_key_packages(
@@ -261,7 +264,7 @@ async fn wait_for_key_packages<F>(
 where
     F: Fn(&[Event]) -> bool + Copy,
 {
-    let whitenoise = context.whitenoise;
+    let whitenoise = &context.whitenoise;
     let account = account.clone();
 
     retry(
@@ -271,7 +274,9 @@ where
             let account = account.clone();
             async move {
                 let key_packages = whitenoise
-                    .fetch_all_key_packages_for_account(&account)
+                    .require_session(&account.pubkey)?
+                    .key_packages()
+                    .fetch_all()
                     .await?;
 
                 if predicate(&key_packages) {
@@ -329,13 +334,9 @@ async fn publish_backdated_key_package(
 
     context
         .whitenoise
-        .track_published_key_package_for_testing(
-            &account.pubkey,
-            &key_package_data.hash_ref,
-            &event_id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-        )
+        .require_session(&account.pubkey)?
+        .key_packages()
+        .track_published_for_testing(&key_package_data.hash_ref, &event_id.to_hex())
         .await?;
 
     tracing::debug!(

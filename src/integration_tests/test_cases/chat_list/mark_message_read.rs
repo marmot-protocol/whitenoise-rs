@@ -38,7 +38,10 @@ impl TestCase for MarkMessageReadTestCase {
 
         let updated_account_group = context
             .whitenoise
-            .mark_message_read(account, &message_id)
+            .require_session(&account.pubkey)
+            .unwrap()
+            .membership()
+            .mark_message_read(&message_id)
             .await?;
 
         // Verify the last_read_message_id was actually updated

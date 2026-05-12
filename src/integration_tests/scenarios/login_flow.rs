@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::integration_tests::{core::*, test_cases::login_flow::*};
@@ -20,7 +22,7 @@ pub struct LoginFlowScenario {
 }
 
 impl LoginFlowScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

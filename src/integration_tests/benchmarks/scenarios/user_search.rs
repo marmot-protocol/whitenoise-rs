@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -80,21 +82,22 @@ impl BenchmarkScenario for UserSearchBenchmark {
 
     async fn run_benchmark(
         &mut self,
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
     ) -> Result<BenchmarkResult, WhitenoiseError> {
-        let mut context = ScenarioContext::new(whitenoise);
+        let mut context = ScenarioContext::new(whitenoise.clone());
 
         tracing::info!("Setting up benchmark: {}", self.name());
         self.setup(&mut context).await?;
 
         let searcher = context.get_account("searcher")?;
         let searcher_pubkey = searcher.pubkey;
+        let session = whitenoise.require_session(&searcher.pubkey)?;
 
         let target_pubkey = PublicKey::parse(SEARCHER_NPUB)
             .map_err(|e| WhitenoiseError::InvalidInput(format!("Invalid searcher npub: {}", e)))?;
 
         // Follow the target so their social graph becomes our radius 1
-        whitenoise.follow_user(searcher, &target_pubkey).await?;
+        session.social().follow_user(&target_pubkey).await?;
 
         // Clear perf samples accumulated during setup/follow so only
         // actual search timings appear in the breakdown.
@@ -112,7 +115,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
             // === Cold search (no cache) ===
             tracing::info!("=== Cold search: '{}' ===", query);
             let cold =
-                run_search_timed(whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
+                run_search_timed(&whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
 
             log_timings("Cold", query, &cold);
             all_timings.push(cold.time_to_target.unwrap_or(cold.time_to_complete));
@@ -120,7 +123,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
             // === Warm search (cache populated from cold run) ===
             tracing::info!("=== Warm search: '{}' ===", query);
             let warm =
-                run_search_timed(whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
+                run_search_timed(&whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
 
             log_timings("Warm", query, &warm);
             all_timings.push(warm.time_to_target.unwrap_or(warm.time_to_complete));

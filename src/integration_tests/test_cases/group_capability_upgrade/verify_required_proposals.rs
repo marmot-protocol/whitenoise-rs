@@ -30,7 +30,7 @@ impl VerifyRequiredProposalsTestCase {
 impl TestCase for VerifyRequiredProposalsTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group_id = context.get_group(&self.group_name)?.mls_group_id.clone();
-        let wn = context.whitenoise;
+        let wn = context.whitenoise.clone();
 
         for account_name in &self.account_names {
             let account = context.get_account(account_name)?.clone();
@@ -43,6 +43,7 @@ impl TestCase for VerifyRequiredProposalsTestCase {
                     let group_id = group_id.clone();
                     let expected = expected.clone();
                     let account_name = account_name.clone();
+                    let wn = wn.clone();
 
                     async move {
                         let required = wn.group_required_proposals(&account, &group_id).await?;

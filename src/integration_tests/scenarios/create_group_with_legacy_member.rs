@@ -21,12 +21,14 @@ use crate::integration_tests::{core::*, test_cases::shared::*};
 use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId};
 use crate::{Whitenoise, WhitenoiseError};
 
+use std::sync::Arc;
+
 pub struct CreateGroupWithLegacyMemberScenario {
     context: ScenarioContext,
 }
 
 impl CreateGroupWithLegacyMemberScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }
@@ -55,7 +57,7 @@ impl Scenario for CreateGroupWithLegacyMemberScenario {
         let peer_pubkey: PublicKey = peer_account.pubkey;
 
         let peer_relays = peer_account
-            .key_package_relays(self.context.whitenoise)
+            .key_package_relays(&self.context.whitenoise.shared)
             .await?;
         if peer_relays.is_empty() {
             return Err(WhitenoiseError::Internal(
@@ -99,8 +101,10 @@ impl Scenario for CreateGroupWithLegacyMemberScenario {
         let members = self
             .context
             .whitenoise
-            .group_members(&creator_account, &group.mls_group_id)
-            .await?;
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&group.mls_group_id)?;
 
         if !members.contains(&peer_pubkey) {
             return Err(WhitenoiseError::Internal(format!(

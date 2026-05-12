@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{LazyLock, Mutex};
+
+use std::sync::{Arc, LazyLock, Mutex};
 use thiserror::Error;
 
 use crate::RelayType;
@@ -20,8 +21,11 @@ use crate::perf_instrument;
 use crate::types::ImageType;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::groups::blossom_error::BlossomError;
+use crate::whitenoise::groups::media::{blossom_client, require_https};
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::secrets_store::SecretsStoreError;
+use crate::whitenoise::session::MediaOps;
+use crate::whitenoise::shared::SharedServices;
 use crate::whitenoise::user_streaming::{UserUpdate, UserUpdateTrigger};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
@@ -280,7 +284,7 @@ impl Account {
         let keys = keys.unwrap_or_else(Keys::generate);
 
         let (user, _created) =
-            User::find_or_create_by_pubkey(&keys.public_key(), &whitenoise.database).await?;
+            User::find_or_create_by_pubkey(&keys.public_key(), &whitenoise.shared.database).await?;
 
         let account = Account {
             id: None,
@@ -302,7 +306,7 @@ impl Account {
         pubkey: PublicKey,
     ) -> Result<Account> {
         let (user, _created) =
-            User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await?;
+            User::find_or_create_by_pubkey(&pubkey, &whitenoise.shared.database).await?;
 
         let account = Account {
             id: None,
@@ -341,31 +345,31 @@ impl Account {
     ///   - `RelayType::Nip65` - General purpose relays for reading/writing events (kind 10002)
     ///   - `RelayType::Inbox` - Specialized relays for receiving private messages (kind 10050)
     ///   - `RelayType::KeyPackage` - Relays that store MLS key packages (kind 10051)
-    /// * `whitenoise` - The Whitenoise instance for database operations
+    /// * `shared` - The shared services holder (provides database access)
     #[perf_instrument("accounts")]
     pub async fn relays(
         &self,
         relay_type: RelayType,
-        whitenoise: &Whitenoise,
+        shared: &Arc<SharedServices>,
     ) -> Result<Vec<Relay>> {
-        let user = self.user(&whitenoise.database).await?;
-        let relays = user.relays(relay_type, &whitenoise.database).await?;
+        let user = self.user(&shared.database).await?;
+        let relays = user.relays(relay_type, &shared.database).await?;
         Ok(relays)
     }
 
     /// Helper method to retrieve the NIP-65 relays for this account.
     #[perf_instrument("accounts")]
-    pub(crate) async fn nip65_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
-        let user = self.user(&whitenoise.database).await?;
-        let relays = user.relays(RelayType::Nip65, &whitenoise.database).await?;
+    pub(crate) async fn nip65_relays(&self, shared: &Arc<SharedServices>) -> Result<Vec<Relay>> {
+        let user = self.user(&shared.database).await?;
+        let relays = user.relays(RelayType::Nip65, &shared.database).await?;
         Ok(relays)
     }
 
     /// Helper method to retrieve the inbox relays for this account.
     #[perf_instrument("accounts")]
-    pub(crate) async fn inbox_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
-        let user = self.user(&whitenoise.database).await?;
-        let relays = user.relays(RelayType::Inbox, &whitenoise.database).await?;
+    pub(crate) async fn inbox_relays(&self, shared: &Arc<SharedServices>) -> Result<Vec<Relay>> {
+        let user = self.user(&shared.database).await?;
+        let relays = user.relays(RelayType::Inbox, &shared.database).await?;
         Ok(relays)
     }
 
@@ -378,9 +382,9 @@ impl Account {
     #[perf_instrument("accounts")]
     pub(crate) async fn effective_inbox_relays(
         &self,
-        whitenoise: &Whitenoise,
+        shared: &Arc<SharedServices>,
     ) -> Result<Vec<Relay>> {
-        let inbox = self.inbox_relays(whitenoise).await?;
+        let inbox = self.inbox_relays(shared).await?;
         if !inbox.is_empty() {
             return Ok(inbox);
         }
@@ -389,16 +393,17 @@ impl Account {
             "Account {} has no inbox relays, falling back to NIP-65 relays for giftwrap subscription",
             self.pubkey.to_hex()
         );
-        self.nip65_relays(whitenoise).await
+        self.nip65_relays(shared).await
     }
 
     /// Helper method to retrieve the key package relays for this account.
     #[perf_instrument("accounts")]
-    pub(crate) async fn key_package_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
-        let user = self.user(&whitenoise.database).await?;
-        let relays = user
-            .relays(RelayType::KeyPackage, &whitenoise.database)
-            .await?;
+    pub(crate) async fn key_package_relays(
+        &self,
+        shared: &Arc<SharedServices>,
+    ) -> Result<Vec<Relay>> {
+        let user = self.user(&shared.database).await?;
+        let relays = user.relays(RelayType::KeyPackage, &shared.database).await?;
         Ok(relays)
     }
 
@@ -424,8 +429,8 @@ impl Account {
         relay_type: RelayType,
         whitenoise: &Whitenoise,
     ) -> Result<()> {
-        let user = self.user(&whitenoise.database).await?;
-        user.add_relay(relay, relay_type, &whitenoise.database)
+        let user = self.user(&whitenoise.shared.database).await?;
+        user.add_relay(relay, relay_type, &whitenoise.shared.database)
             .await?;
 
         whitenoise
@@ -457,8 +462,8 @@ impl Account {
         relay_type: RelayType,
         whitenoise: &Whitenoise,
     ) -> Result<()> {
-        let user = self.user(&whitenoise.database).await?;
-        user.remove_relay(relay, relay_type, &whitenoise.database)
+        let user = self.user(&whitenoise.shared.database).await?;
+        user.remove_relay(relay, relay_type, &whitenoise.shared.database)
             .await?;
         whitenoise
             .background_publish_account_relay_list(self, relay_type, None)
@@ -478,7 +483,7 @@ impl Account {
     /// * `whitenoise` - The Whitenoise instance used to access the database
     #[perf_instrument("accounts")]
     pub async fn metadata(&self, whitenoise: &Whitenoise) -> Result<Metadata> {
-        let user = self.user(&whitenoise.database).await?;
+        let user = self.user(&whitenoise.shared.database).await?;
         Ok(user.metadata.clone())
     }
 
@@ -499,12 +504,12 @@ impl Account {
         whitenoise: &Whitenoise,
     ) -> Result<()> {
         tracing::debug!(target: "whitenoise::accounts", "Updating metadata for account: {:?}", self.pubkey);
-        let mut user = self.user(&whitenoise.database).await?;
+        let mut user = self.user(&whitenoise.shared.database).await?;
         user.metadata = metadata.clone();
         user.mark_metadata_known_now();
-        let saved_user = user.save(&whitenoise.database).await?;
+        let saved_user = user.save(&whitenoise.shared.database).await?;
         let user_pubkey = saved_user.pubkey;
-        whitenoise.user_stream_manager.emit(
+        whitenoise.shared.user_stream_manager.emit(
             &user_pubkey,
             UserUpdate {
                 trigger: UserUpdateTrigger::LocalMetadataChanged,
@@ -530,7 +535,7 @@ impl Account {
         server: Url,
         whitenoise: &Whitenoise,
     ) -> Result<String> {
-        let client = Whitenoise::blossom_client(&server)?;
+        let client = blossom_client(&server)?;
         let signer = whitenoise.get_signer_for_account(self)?;
         let data = tokio::fs::read(file_path).await?;
 
@@ -541,12 +546,12 @@ impl Account {
             Some(&signer),
         );
 
-        let descriptor = tokio::time::timeout(Whitenoise::BLOSSOM_TIMEOUT, upload_future)
+        let descriptor = tokio::time::timeout(MediaOps::BLOSSOM_TIMEOUT, upload_future)
             .await
-            .map_err(|_| BlossomError::Timeout(Whitenoise::BLOSSOM_TIMEOUT))?
+            .map_err(|_| BlossomError::Timeout(MediaOps::BLOSSOM_TIMEOUT))?
             .map_err(BlossomError::client)?;
 
-        Whitenoise::require_https(&descriptor.url)?;
+        require_https(&descriptor.url)?;
 
         Ok(descriptor.url.to_string())
     }
@@ -609,26 +614,29 @@ mod tests {
     async fn test_effective_inbox_relays_returns_inbox_when_present() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, _keys) = create_test_account(&whitenoise).await;
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
 
         let inbox_url = RelayUrl::parse("wss://inbox.example.com").unwrap();
         let nip65_url = RelayUrl::parse("wss://nip65.example.com").unwrap();
 
-        let inbox_relay = Relay::find_or_create_by_url(&inbox_url, &whitenoise.database)
+        let inbox_relay = Relay::find_or_create_by_url(&inbox_url, &whitenoise.shared.database)
             .await
             .unwrap();
-        let nip65_relay = Relay::find_or_create_by_url(&nip65_url, &whitenoise.database)
-            .await
-            .unwrap();
-
-        user.add_relay(&inbox_relay, RelayType::Inbox, &whitenoise.database)
-            .await
-            .unwrap();
-        user.add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+        let nip65_relay = Relay::find_or_create_by_url(&nip65_url, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let result = account.effective_inbox_relays(&whitenoise).await.unwrap();
+        user.add_relay(&inbox_relay, RelayType::Inbox, &whitenoise.shared.database)
+            .await
+            .unwrap();
+        user.add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.shared.database)
+            .await
+            .unwrap();
+
+        let result = account
+            .effective_inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].url, inbox_url);
@@ -638,18 +646,21 @@ mod tests {
     async fn test_effective_inbox_relays_falls_back_to_nip65() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, _keys) = create_test_account(&whitenoise).await;
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
 
         // Only add NIP-65 relays — no inbox relays
         let nip65_url = RelayUrl::parse("wss://nip65.example.com").unwrap();
-        let nip65_relay = Relay::find_or_create_by_url(&nip65_url, &whitenoise.database)
+        let nip65_relay = Relay::find_or_create_by_url(&nip65_url, &whitenoise.shared.database)
             .await
             .unwrap();
-        user.add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+        user.add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let result = account.effective_inbox_relays(&whitenoise).await.unwrap();
+        let result = account
+            .effective_inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].url, nip65_url);
@@ -661,7 +672,10 @@ mod tests {
         let (account, _keys) = create_test_account(&whitenoise).await;
 
         // No relays at all
-        let result = account.effective_inbox_relays(&whitenoise).await.unwrap();
+        let result = account
+            .effective_inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
 
         assert!(result.is_empty());
     }
@@ -670,9 +684,13 @@ mod tests {
     async fn test_update_metadata_emits_local_metadata_changed_update() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = create_test_account(&whitenoise).await;
-        let account = account.save(&whitenoise.database).await.unwrap();
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
 
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         let default_relays = whitenoise.load_default_relays().await.unwrap();
         whitenoise
@@ -999,7 +1017,7 @@ mod tests {
         assert!(persisted.id.is_some());
         assert_eq!(persisted.account_type, AccountType::External);
 
-        let found = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let found = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(found.pubkey, pubkey);
@@ -1012,7 +1030,10 @@ mod tests {
         let keys = nostr_sdk::Keys::generate();
         let pubkey = keys.public_key();
         let _account = Account::new_external(&whitenoise, pubkey).await.unwrap();
-        let result = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        let result = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&pubkey);
         assert!(
             result.is_err(),
             "External account creation should not store any keys"
@@ -1072,7 +1093,7 @@ mod tests {
         let random_pk = nostr_sdk::Keys::generate().public_key();
         assert!(whitenoise.find_account_by_pubkey(&random_pk).await.is_err());
 
-        let user = account1.user(&whitenoise.database).await.unwrap();
+        let user = account1.user(&whitenoise.shared.database).await.unwrap();
         assert_eq!(user.pubkey, account1.pubkey);
 
         let metadata = account1.metadata(&whitenoise).await.unwrap();
@@ -1086,13 +1107,29 @@ mod tests {
 
         let (account, keys) = create_test_account(&whitenoise).await;
         let account = whitenoise.persist_account(&account).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
-        assert!(account.nip65_relays(&whitenoise).await.unwrap().is_empty());
-        assert!(account.inbox_relays(&whitenoise).await.unwrap().is_empty());
         assert!(
             account
-                .key_package_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            account
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1115,10 +1152,16 @@ mod tests {
             .await
             .unwrap();
 
-        let nip65 = account.relays(RelayType::Nip65, &whitenoise).await.unwrap();
-        let inbox = account.relays(RelayType::Inbox, &whitenoise).await.unwrap();
+        let nip65 = account
+            .relays(RelayType::Nip65, &whitenoise.shared)
+            .await
+            .unwrap();
+        let inbox = account
+            .relays(RelayType::Inbox, &whitenoise.shared)
+            .await
+            .unwrap();
         let kp = account
-            .relays(RelayType::KeyPackage, &whitenoise)
+            .relays(RelayType::KeyPackage, &whitenoise.shared)
             .await
             .unwrap();
         assert_eq!(nip65.len(), default_relays.len());
@@ -1127,7 +1170,7 @@ mod tests {
 
         let test_relay = Relay::find_or_create_by_url(
             &RelayUrl::parse("wss://test.relay.example").unwrap(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1135,14 +1178,14 @@ mod tests {
             .add_relay(&test_relay, RelayType::Nip65, &whitenoise)
             .await
             .unwrap();
-        let relays_after_add = account.nip65_relays(&whitenoise).await.unwrap();
+        let relays_after_add = account.nip65_relays(&whitenoise.shared).await.unwrap();
         assert_eq!(relays_after_add.len(), default_relays.len() + 1);
 
         account
             .remove_relay(&test_relay, RelayType::Nip65, &whitenoise)
             .await
             .unwrap();
-        let relays_after_remove = account.nip65_relays(&whitenoise).await.unwrap();
+        let relays_after_remove = account.nip65_relays(&whitenoise.shared).await.unwrap();
         assert_eq!(relays_after_remove.len(), default_relays.len());
     }
 
@@ -1152,19 +1195,35 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = create_test_account(&whitenoise).await;
         let account = whitenoise.persist_account(&account).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
-        assert!(account.nip65_relays(&whitenoise).await.unwrap().is_empty());
-        assert!(account.inbox_relays(&whitenoise).await.unwrap().is_empty());
         assert!(
             account
-                .key_package_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            account
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty()
         );
 
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         let url1 = RelayUrl::parse("ws://127.0.0.1:19010").unwrap();
         let url2 = RelayUrl::parse("ws://127.0.0.1:19011").unwrap();
         let url3 = RelayUrl::parse("ws://127.0.0.1:19012").unwrap();
@@ -1172,29 +1231,39 @@ mod tests {
         let relay2 = whitenoise.find_or_create_relay_by_url(&url2).await.unwrap();
         let relay3 = whitenoise.find_or_create_relay_by_url(&url3).await.unwrap();
 
-        user.add_relays(&[relay1], RelayType::Nip65, &whitenoise.database)
+        user.add_relays(&[relay1], RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
-        user.add_relays(&[relay2], RelayType::Inbox, &whitenoise.database)
+        user.add_relays(&[relay2], RelayType::Inbox, &whitenoise.shared.database)
             .await
             .unwrap();
-        user.add_relays(&[relay3], RelayType::KeyPackage, &whitenoise.database)
-            .await
-            .unwrap();
+        user.add_relays(
+            &[relay3],
+            RelayType::KeyPackage,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
-        let nip65 = account.nip65_relays(&whitenoise).await.unwrap();
+        let nip65 = account.nip65_relays(&whitenoise.shared).await.unwrap();
         assert_eq!(nip65.len(), 1);
         assert_eq!(nip65[0].url, url1);
 
-        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
+        let inbox = account.inbox_relays(&whitenoise.shared).await.unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].url, url2);
 
-        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+        let kp = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(kp.len(), 1);
         assert_eq!(kp[0].url, url3);
 
-        let all_nip65 = account.relays(RelayType::Nip65, &whitenoise).await.unwrap();
+        let all_nip65 = account
+            .relays(RelayType::Nip65, &whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(all_nip65.len(), 1);
         assert_eq!(all_nip65[0].url, url1);
     }
@@ -1251,19 +1320,27 @@ mod tests {
         use nostr_sdk::prelude::*;
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let accounts = Account::all(&whitenoise.database).await.unwrap();
+        let accounts = Account::all(&whitenoise.shared.database).await.unwrap();
         assert!(accounts.is_empty());
 
         let (account1, keys1) = create_test_account(&whitenoise).await;
         let (account2, keys2) = create_test_account(&whitenoise).await;
 
-        account1.save(&whitenoise.database).await.unwrap();
-        account2.save(&whitenoise.database).await.unwrap();
+        account1.save(&whitenoise.shared.database).await.unwrap();
+        account2.save(&whitenoise.shared.database).await.unwrap();
 
-        whitenoise.secrets_store.store_private_key(&keys1).unwrap();
-        whitenoise.secrets_store.store_private_key(&keys2).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys1)
+            .unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys2)
+            .unwrap();
 
-        let loaded_accounts = Account::all(&whitenoise.database).await.unwrap();
+        let loaded_accounts = Account::all(&whitenoise.shared.database).await.unwrap();
         assert_eq!(loaded_accounts.len(), 2);
         let pubkeys: Vec<PublicKey> = loaded_accounts.iter().map(|a| a.pubkey).collect();
         assert!(pubkeys.contains(&account1.pubkey));

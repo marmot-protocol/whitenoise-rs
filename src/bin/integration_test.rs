@@ -43,12 +43,13 @@ async fn main() -> Result<(), WhitenoiseError> {
         RelayUrl::parse("ws://localhost:8080").unwrap(),
         RelayUrl::parse("ws://localhost:7777").unwrap(),
     ]);
-    if let Err(err) = Whitenoise::initialize_whitenoise(config).await {
-        tracing::error!("Failed to initialize Whitenoise: {}", err);
-        std::process::exit(1);
-    }
-
-    let whitenoise = Whitenoise::get_instance()?;
+    let whitenoise = match Whitenoise::new(config).await {
+        Ok(wn) => wn,
+        Err(err) => {
+            tracing::error!("Failed to initialize Whitenoise: {}", err);
+            std::process::exit(1);
+        }
+    };
 
     match args.scenario {
         Some(scenario_name) => {

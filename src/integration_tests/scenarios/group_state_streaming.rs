@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::{
     core::*,
     test_cases::{group_membership::*, group_state_streaming::*, shared::*},
@@ -33,7 +35,7 @@ impl GroupStateStreamingScenario {
     const KICK_GROUP: &'static str = "gss_kick_group";
     const ISOLATION_GROUP: &'static str = "gss_isolation_group";
 
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

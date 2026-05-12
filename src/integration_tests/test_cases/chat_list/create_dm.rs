@@ -41,8 +41,10 @@ impl TestCase for CreateDmTestCase {
 
         let dm_group = context
             .whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
             .create_group(
-                creator,
                 vec![other.pubkey],
                 NostrGroupConfigData::new(
                     String::new(),

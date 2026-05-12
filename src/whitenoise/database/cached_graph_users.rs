@@ -402,7 +402,7 @@ mod tests {
             Some(vec![follow1, follow2]),
         );
 
-        let saved = user.upsert(&whitenoise.database).await.unwrap();
+        let saved = user.upsert(&whitenoise.shared.database).await.unwrap();
 
         assert!(saved.id.is_some());
         assert_eq!(saved.pubkey, keys.public_key());
@@ -426,7 +426,7 @@ mod tests {
             Some(Metadata::new().name("Original Name")),
             Some(vec![]),
         );
-        let saved1 = user1.upsert(&whitenoise.database).await.unwrap();
+        let saved1 = user1.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Update with new data
         let user2 = CachedGraphUser::new(
@@ -434,7 +434,7 @@ mod tests {
             Some(Metadata::new().name("Updated Name")),
             Some(vec![Keys::generate().public_key()]),
         );
-        let saved2 = user2.upsert(&whitenoise.database).await.unwrap();
+        let saved2 = user2.upsert(&whitenoise.shared.database).await.unwrap();
 
         // ID should remain the same
         assert_eq!(saved1.id, saved2.id);
@@ -462,7 +462,7 @@ mod tests {
         .bind(keys.public_key().to_hex())
         .bind(old_time)
         .bind(old_time)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -470,14 +470,14 @@ mod tests {
         let before = CachedGraphUser::find_fresh_batch_with_ttl(
             &[keys.public_key()],
             10000,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         assert_eq!(before.len(), 1);
 
         // Run cleanup
-        let deleted = CachedGraphUser::cleanup_stale(&whitenoise.database)
+        let deleted = CachedGraphUser::cleanup_stale(&whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -487,7 +487,7 @@ mod tests {
         let after = CachedGraphUser::find_fresh_batch_with_ttl(
             &[keys.public_key()],
             10000,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -501,19 +501,20 @@ mod tests {
 
         // Create a fresh entry
         let user = CachedGraphUser::new(keys.public_key(), Some(Metadata::new()), Some(vec![]));
-        user.upsert(&whitenoise.database).await.unwrap();
+        user.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Run cleanup
-        let deleted = CachedGraphUser::cleanup_stale(&whitenoise.database)
+        let deleted = CachedGraphUser::cleanup_stale(&whitenoise.shared.database)
             .await
             .unwrap();
 
         assert_eq!(deleted, 0);
 
         // Verify it still exists
-        let after = CachedGraphUser::find_fresh_batch(&[keys.public_key()], &whitenoise.database)
-            .await
-            .unwrap();
+        let after =
+            CachedGraphUser::find_fresh_batch(&[keys.public_key()], &whitenoise.shared.database)
+                .await
+                .unwrap();
         assert_eq!(after.len(), 1);
     }
 
@@ -531,7 +532,7 @@ mod tests {
         .bind(keys.public_key().to_hex())
         .bind(two_hours_ago)
         .bind(two_hours_ago)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -539,7 +540,7 @@ mod tests {
         let result_1h = CachedGraphUser::find_fresh_batch_with_ttl(
             &[keys.public_key()],
             1,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -549,7 +550,7 @@ mod tests {
         let result_3h = CachedGraphUser::find_fresh_batch_with_ttl(
             &[keys.public_key()],
             3,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -570,18 +571,18 @@ mod tests {
         .bind(keys.public_key().to_hex())
         .bind(two_hours_ago)
         .bind(two_hours_ago)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         // With 3-hour TTL, should not be deleted
-        let deleted_3h = CachedGraphUser::cleanup_stale_with_ttl(3, &whitenoise.database)
+        let deleted_3h = CachedGraphUser::cleanup_stale_with_ttl(3, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(deleted_3h, 0);
 
         // With 1-hour TTL, should be deleted
-        let deleted_1h = CachedGraphUser::cleanup_stale_with_ttl(1, &whitenoise.database)
+        let deleted_1h = CachedGraphUser::cleanup_stale_with_ttl(1, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(deleted_1h, 1);
@@ -591,7 +592,7 @@ mod tests {
     async fn find_fresh_batch_returns_empty_for_empty_input() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let result = CachedGraphUser::find_fresh_batch(&[], &whitenoise.database)
+        let result = CachedGraphUser::find_fresh_batch(&[], &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -611,19 +612,19 @@ mod tests {
             Some(Metadata::new().name("User1")),
             Some(vec![]),
         );
-        user1.upsert(&whitenoise.database).await.unwrap();
+        user1.upsert(&whitenoise.shared.database).await.unwrap();
 
         let user2 = CachedGraphUser::new(
             keys2.public_key(),
             Some(Metadata::new().name("User2")),
             Some(vec![]),
         );
-        user2.upsert(&whitenoise.database).await.unwrap();
+        user2.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Batch fetch both
         let result = CachedGraphUser::find_fresh_batch(
             &[keys1.public_key(), keys2.public_key()],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -650,7 +651,7 @@ mod tests {
             Some(Metadata::new().name("Fresh")),
             Some(vec![]),
         );
-        fresh.upsert(&whitenoise.database).await.unwrap();
+        fresh.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Insert stale entry directly
         let old_time = (Utc::now() - Duration::hours(25)).timestamp_millis();
@@ -661,14 +662,14 @@ mod tests {
         .bind(stale_keys.public_key().to_hex())
         .bind(old_time)
         .bind(old_time)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         // Batch fetch both
         let result = CachedGraphUser::find_fresh_batch(
             &[fresh_keys.public_key(), stale_keys.public_key()],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -691,12 +692,12 @@ mod tests {
             Some(Metadata::new().name("Exists")),
             Some(vec![]),
         );
-        user.upsert(&whitenoise.database).await.unwrap();
+        user.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Batch fetch both
         let result = CachedGraphUser::find_fresh_batch(
             &[existing_keys.public_key(), missing_keys.public_key()],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -718,14 +719,14 @@ mod tests {
             Some(Metadata::new().name("Original")),
             Some(vec![follow1]),
         );
-        user.upsert(&whitenoise.database).await.unwrap();
+        user.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Now upsert metadata only
         let updated = CachedGraphUser::upsert_metadata_only(
             &keys.public_key(),
             &Metadata::new().name("Updated"),
             CONFIDENT_CACHE_TTL_MS,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -751,13 +752,13 @@ mod tests {
             Some(Metadata::new().name("Alice")),
             Some(vec![follow1]),
         );
-        user.upsert(&whitenoise.database).await.unwrap();
+        user.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Now upsert follows only
         let updated = CachedGraphUser::upsert_follows_only(
             &keys.public_key(),
             &[follow1, follow2],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -781,7 +782,7 @@ mod tests {
             &keys.public_key(),
             &Metadata::new().name("New"),
             CONFIDENT_CACHE_TTL_MS,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -803,7 +804,7 @@ mod tests {
         let saved = CachedGraphUser::upsert_follows_only(
             &keys.public_key(),
             &[follow1],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -837,7 +838,7 @@ mod tests {
         .bind(written_31m_ago)
         .bind(written_31m_ago)
         .bind(confident_expires)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -852,13 +853,13 @@ mod tests {
         .bind(written_31m_ago)
         .bind(written_31m_ago)
         .bind(uncertain_expires)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         let fresh = CachedGraphUser::find_fresh_metadata_batch(
             &[confident_pk, uncertain_pk],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -877,7 +878,7 @@ mod tests {
             &keys.public_key(),
             &Metadata::new().name("Test"),
             UNCERTAIN_CACHE_TTL_MS,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -910,14 +911,16 @@ mod tests {
         .bind(now)
         .bind(now)
         .bind(now)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
-        let fresh =
-            CachedGraphUser::find_fresh_metadata_batch(&[keys.public_key()], &whitenoise.database)
-                .await
-                .unwrap();
+        let fresh = CachedGraphUser::find_fresh_metadata_batch(
+            &[keys.public_key()],
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(
             fresh.is_empty(),

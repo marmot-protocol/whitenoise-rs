@@ -5,9 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{
-    Whitenoise, accounts::Account, error::WhitenoiseError, media_files::MediaFile,
-};
+use crate::whitenoise::media_files::MediaFile;
 
 /// A saved message draft for a specific account and group.
 ///
@@ -27,49 +25,6 @@ pub struct Draft {
     pub updated_at: DateTime<Utc>,
 }
 
-impl Whitenoise {
-    /// Saves a draft for (account, group).
-    ///
-    /// Uses upsert semantics: creates a new draft or updates an existing one.
-    /// Returns the persisted draft.
-    pub async fn save_draft(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        content: &str,
-        reply_to_id: Option<&EventId>,
-        media_attachments: &[MediaFile],
-    ) -> Result<Draft, WhitenoiseError> {
-        Draft::save(
-            &account.pubkey,
-            group_id,
-            content,
-            reply_to_id,
-            media_attachments,
-            &self.database,
-        )
-        .await
-    }
-
-    /// Loads the draft for (account, group), if any.
-    pub async fn load_draft(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<Option<Draft>, WhitenoiseError> {
-        Draft::find(&account.pubkey, group_id, &self.database).await
-    }
-
-    /// Deletes the draft for (account, group).
-    pub async fn delete_draft(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<(), WhitenoiseError> {
-        Draft::delete(&account.pubkey, group_id, &self.database).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use mdk_core::prelude::GroupId;
@@ -85,13 +40,15 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let draft = whitenoise
-            .save_draft(&account, &group_id, "hello", None, &[])
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let draft = session
+            .drafts()
+            .save(&group_id, "hello", None, &[])
             .await
             .unwrap();
 
@@ -111,17 +68,20 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let first = whitenoise
-            .save_draft(&account, &group_id, "first", None, &[])
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let first = session
+            .drafts()
+            .save(&group_id, "first", None, &[])
             .await
             .unwrap();
-        let second = whitenoise
-            .save_draft(&account, &group_id, "second", None, &[])
+        let second = session
+            .drafts()
+            .save(&group_id, "second", None, &[])
             .await
             .unwrap();
 
@@ -137,18 +97,21 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        whitenoise
-            .save_draft(&account, &group_id, "persisted", None, &[])
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .drafts()
+            .save(&group_id, "persisted", None, &[])
             .await
             .unwrap();
 
-        let loaded = whitenoise
-            .load_draft(&account, &group_id)
+        let loaded = session
+            .drafts()
+            .load(&group_id)
             .await
             .unwrap()
             .expect("draft should exist");
@@ -161,7 +124,8 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(b"test-group-id-00");
 
-        let loaded = whitenoise.load_draft(&account, &group_id).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let loaded = session.drafts().load(&group_id).await.unwrap();
         assert!(loaded.is_none());
     }
 
@@ -173,18 +137,20 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        whitenoise
-            .save_draft(&account, &group_id, "to delete", None, &[])
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .drafts()
+            .save(&group_id, "to delete", None, &[])
             .await
             .unwrap();
-        whitenoise.delete_draft(&account, &group_id).await.unwrap();
+        session.drafts().delete(&group_id).await.unwrap();
 
-        let loaded = whitenoise.load_draft(&account, &group_id).await.unwrap();
+        let loaded = session.drafts().load(&group_id).await.unwrap();
         assert!(loaded.is_none());
     }
 
@@ -194,7 +160,8 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(b"test-group-id-00");
 
-        let result = whitenoise.delete_draft(&account, &group_id).await;
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let result = session.drafts().delete(&group_id).await;
         assert!(result.is_ok());
     }
 }

@@ -2,10 +2,13 @@ use std::{fmt, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
+use mdk_core::prelude::MDK;
+use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::perf_instrument;
+use crate::whitenoise::database::Database;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -71,7 +74,7 @@ impl GroupInformation {
         let (group_info, _was_created) = Self::find_or_create_by_mls_group_id(
             mls_group_id,
             Some(group_type),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await?;
         Ok(group_info)
@@ -91,7 +94,7 @@ impl GroupInformation {
         let (group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
             mls_group_id,
             Some(Self::infer_group_type_from_group_name(&group.name)),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await?;
         Ok(group_info)
@@ -105,34 +108,42 @@ impl GroupInformation {
         mls_group_ids: &[GroupId],
         whitenoise: &Whitenoise,
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
-        // First try to get existing records
-        let existing =
-            GroupInformation::find_by_mls_group_ids(mls_group_ids, &whitenoise.database).await?;
+        if mls_group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
+        Self::get_by_mls_group_ids_with_mdk(mls_group_ids, &mdk, &whitenoise.shared.database).await
+    }
 
-        // Create a map for quick lookups, but continue to preserve input order
+    /// Get group information for multiple MLS group IDs using an existing MDK instance.
+    ///
+    /// Session-compatible variant that avoids requiring `&Whitenoise`. Missing
+    /// groups will be created with a type inferred from the group name.
+    #[perf_instrument("group_info")]
+    pub(crate) async fn get_by_mls_group_ids_with_mdk(
+        mls_group_ids: &[GroupId],
+        mdk: &MDK<MdkSqliteStorage>,
+        database: &Database,
+    ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
+        let existing = Self::find_by_mls_group_ids(mls_group_ids, database).await?;
+
         let mut existing_map: std::collections::HashMap<GroupId, GroupInformation> = existing
             .into_iter()
             .map(|gi| (gi.mls_group_id.clone(), gi))
             .collect();
-
-        let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
 
         let mut results = Vec::new();
         for mls_group_id in mls_group_ids {
             if let Some(existing_info) = existing_map.remove(mls_group_id) {
                 results.push(existing_info);
             } else {
-                // Create missing record with a type inferred from the group name
                 let group = mdk
                     .get_group(mls_group_id)?
                     .ok_or(WhitenoiseError::GroupNotFound)?;
                 let group_type = Self::infer_group_type_from_group_name(&group.name);
-                let (new_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
-                    mls_group_id,
-                    Some(group_type),
-                    &whitenoise.database,
-                )
-                .await?;
+                let (new_info, _was_created) =
+                    Self::find_or_create_by_mls_group_id(mls_group_id, Some(group_type), database)
+                        .await?;
                 results.push(new_info);
             }
         }
@@ -270,7 +281,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group = whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -301,7 +315,10 @@ mod tests {
         ]);
         config.name = "".to_string(); // Empty name for DirectMessage
         let group = whitenoise
-            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
             .await
             .unwrap();
 
@@ -398,7 +415,10 @@ mod tests {
         ]);
         config1.name = "".to_string(); // Empty name for DirectMessage
         let group1 = whitenoise
-            .create_group(&creator_account, vec![member1.pubkey], config1, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -406,7 +426,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group2 = whitenoise
-            .create_group(&creator_account, vec![member2.pubkey], config2, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, None)
             .await
             .unwrap();
 
@@ -414,7 +437,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group3 = whitenoise
-            .create_group(&creator_account, vec![member3.pubkey], config3, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member3.pubkey], config3, None)
             .await
             .unwrap();
 
@@ -467,7 +493,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group1 = whitenoise
-            .create_group(&creator_account, vec![member1.pubkey], config1, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -475,7 +504,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group2 = whitenoise
-            .create_group(&creator_account, vec![member2.pubkey], config2, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, None)
             .await
             .unwrap();
 
@@ -525,7 +557,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group1 = whitenoise
-            .create_group(&creator_account, vec![member1.pubkey], config1, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member1.pubkey], config1, None)
             .await
             .unwrap();
 
@@ -533,7 +568,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group2 = whitenoise
-            .create_group(&creator_account, vec![member2.pubkey], config2, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member2.pubkey], config2, None)
             .await
             .unwrap();
 
@@ -541,7 +579,10 @@ mod tests {
             creator_account.pubkey,
         ]);
         let group3 = whitenoise
-            .create_group(&creator_account, vec![member3.pubkey], config3, None)
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member3.pubkey], config3, None)
             .await
             .unwrap();
 

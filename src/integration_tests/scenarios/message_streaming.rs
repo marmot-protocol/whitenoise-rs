@@ -6,6 +6,8 @@
 //! 3. Subscribe and verify initial snapshot
 //! 4. Verify real-time stream updates
 
+use std::sync::Arc;
+
 use crate::integration_tests::{
     core::*,
     test_cases::{message_streaming::*, shared::*},
@@ -22,7 +24,7 @@ pub struct MessageStreamingScenario {
 impl MessageStreamingScenario {
     const GROUP_NAME: &'static str = "streaming_test_group";
 
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

@@ -211,7 +211,7 @@ impl TestCase for ResolveUserBlockingTestCase {
             let user_relays = user
                 .relays_by_type(
                     crate::whitenoise::relays::RelayType::Nip65,
-                    context.whitenoise,
+                    &context.whitenoise,
                 )
                 .await?;
 

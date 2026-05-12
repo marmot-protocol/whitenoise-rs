@@ -47,7 +47,7 @@ wn groups list               # see your MLS groups
 wn messages subscribe <id>   # stream live messages from a group
 ```
 
-See [`src/cli/README.md`](src/cli/README.md) for the full command reference, IPC protocol, and architecture notes.
+See [`crates/whitenoise-cli/src/cli/README.md`](crates/whitenoise-cli/src/cli/README.md) for the full command reference, IPC protocol, and architecture notes.
 
 ## Releases
 

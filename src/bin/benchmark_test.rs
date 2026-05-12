@@ -73,7 +73,7 @@ struct Args {
     ///
     /// `--login` writes DB keys to `<data-dir>/benchmark_keyring.txt`.
     /// Passing `--seed-nsec <NSEC>` reads that sidecar and injects the keys
-    /// back into the mock keyring before `initialize_whitenoise` is called.
+    /// back into the mock keyring before `Whitenoise::new` is called.
     /// The nsec is required so the Nostr private key is also re-seeded (some
     /// startup paths read the account keys from the keyring).
     #[clap(long, value_name = "NSEC")]
@@ -208,7 +208,7 @@ fn save_keyring_sidecar(
 /// Restores keyring entries from the sidecar file written by `save_keyring_sidecar`,
 /// and also re-seeds the Nostr private key.
 ///
-/// Must be called BEFORE `Whitenoise::initialize_whitenoise` so database
+/// Must be called BEFORE `Whitenoise::new` so that database
 /// encryption keys are present before existing encrypted databases are opened.
 fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(), WhitenoiseError> {
     // Must initialise the mock store before any keyring_core::Entry calls.
@@ -275,27 +275,35 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     // Warm-init runs: restore DB encryption keys from the sidecar written by
     // the preceding --login run, and re-seed the Nostr private key. Both must be
-    // in the mock keyring BEFORE initialize_whitenoise opens encrypted DBs.
+    // in the mock keyring BEFORE Whitenoise::new opens encrypted DBs.
     if let Some(ref nsec) = args.seed_nsec {
         restore_keyring_sidecar(&args.data_dir, nsec)?;
     }
 
     let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir, KEYRING_SERVICE)
         .with_database_key_id(BENCHMARK_WHITENOISE_DB_KEY_ID);
-    if let Err(err) = Whitenoise::initialize_whitenoise(config).await {
-        tracing::error!("Failed to initialize Whitenoise: {}", err);
-        std::process::exit(1);
-    }
+    let whitenoise = match Whitenoise::new(config).await {
+        Ok(wn) => wn,
+        Err(err) => {
+            tracing::error!("Failed to initialize Whitenoise: {}", err);
+            std::process::exit(1);
+        }
+    };
 
     if let Some(ref nsec) = args.login {
-        let whitenoise = Whitenoise::get_instance()?;
         let account = whitenoise.login(nsec.clone()).await?;
         tracing::info!("Logged in as {}", account.pubkey.to_hex());
+        let session = whitenoise.session(&account.pubkey).ok_or_else(|| {
+            WhitenoiseError::Internal(format!(
+                "Account session unavailable after login for {}",
+                account.pubkey.to_hex()
+            ))
+        })?;
 
         // Wait for the contact list to arrive from relays
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let follows = whitenoise.follows(&account).await?;
+            let follows = session.social().follows().await?;
             if !follows.is_empty() {
                 tracing::info!("Contact list synced: {} follows", follows.len());
                 break;
@@ -318,8 +326,6 @@ async fn main() -> Result<(), WhitenoiseError> {
     if args.init_only {
         return Ok(());
     }
-
-    let whitenoise = Whitenoise::get_instance()?;
 
     let results = match args.scenario {
         Some(ref scenario_name) => {

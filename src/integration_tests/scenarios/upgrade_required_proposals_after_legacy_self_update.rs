@@ -15,12 +15,14 @@ use crate::integration_tests::{
 use crate::whitenoise::groups::{RequiredProposal, RequiredProposalUpgradability};
 use crate::{Whitenoise, WhitenoiseError};
 
+use std::sync::Arc;
+
 pub struct UpgradeRequiredProposalsAfterLegacySelfUpdateScenario {
     context: ScenarioContext,
 }
 
 impl UpgradeRequiredProposalsAfterLegacySelfUpdateScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

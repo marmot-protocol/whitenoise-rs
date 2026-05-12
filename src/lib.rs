@@ -22,9 +22,6 @@ pub mod whitenoise;
 // only resolves inside this crate.
 pub(crate) use whitenoise_macros::perf_instrument;
 
-#[cfg(feature = "cli")]
-pub mod cli;
-
 // Integration tests module - included when integration-tests feature is enabled
 // This provides IDE support.
 #[cfg(feature = "integration-tests")]
@@ -68,6 +65,7 @@ pub use whitenoise::relays::{Relay, RelayType};
 pub use whitenoise::drafts::Draft;
 
 // Media files
+pub use whitenoise::database::aggregated_messages::PaginationOptions;
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
 
 // Mute list
@@ -113,9 +111,12 @@ pub use whitenoise::push_notifications::{
 
 // User search
 pub use whitenoise::user_search::{
-    MatchQuality, MatchResult, MatchedField, SearchUpdateTrigger, UserSearchResult,
-    UserSearchSubscription, UserSearchUpdate,
+    MatchQuality, MatchResult, MatchedField, SearchUpdateTrigger, UserSearchParams,
+    UserSearchResult, UserSearchSubscription, UserSearchUpdate,
 };
+
+// Chat list
+pub use whitenoise::chat_list::ChatListItem;
 
 // Zapstore version check
 pub use whitenoise::zapstore::fetch_latest_zapstore_version;

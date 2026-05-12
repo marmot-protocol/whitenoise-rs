@@ -45,7 +45,7 @@ impl TestCase for LoginStartHappyPathTestCase {
         // Verify relay lists were stored.
         let relays = result
             .account
-            .relays(RelayType::Nip65, context.whitenoise)
+            .relays(RelayType::Nip65, &context.whitenoise.shared)
             .await?;
         assert!(
             !relays.is_empty(),

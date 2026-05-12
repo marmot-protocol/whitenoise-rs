@@ -28,6 +28,7 @@ pub(super) async fn try_nip50_search(
         .limit(limit);
 
     let events = whitenoise
+        .shared
         .relay_control
         .ephemeral()
         .fetch_events_from(std::slice::from_ref(relay), filter)

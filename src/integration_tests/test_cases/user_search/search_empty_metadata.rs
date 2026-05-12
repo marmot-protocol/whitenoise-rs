@@ -40,6 +40,7 @@ impl TestCase for SearchEmptyMetadataTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let account = context.get_account(&self.account_name)?;
         let searcher_pubkey = account.pubkey;
+        let session = context.whitenoise.require_session(&account.pubkey)?;
 
         let target_keys = Keys::generate();
         let target_pubkey = target_keys.public_key();
@@ -64,10 +65,7 @@ impl TestCase for SearchEmptyMetadataTestCase {
         );
 
         // Step 3: Follow the target so they appear at radius 1
-        context
-            .whitenoise
-            .follow_user(account, &target_pubkey)
-            .await?;
+        session.social().follow_user(&target_pubkey).await?;
 
         // Step 4: Search immediately (before background metadata sync completes)
         let subscription = context

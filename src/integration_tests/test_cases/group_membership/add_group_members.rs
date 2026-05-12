@@ -46,17 +46,18 @@ impl TestCase for AddGroupMembersTestCase {
         // Get initial member count for verification
         let initial_members = context
             .whitenoise
-            .group_members(admin_account, &self.group_id)
-            .await?;
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .groups()
+            .members(&self.group_id)?;
 
         // Add members to the group
         let add_result = context
             .whitenoise
-            .add_members_to_group(
-                admin_account,
-                &self.group_id,
-                self.new_member_pubkeys.clone(),
-            )
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .groups()
+            .add_members(&self.group_id, self.new_member_pubkeys.clone())
             .await;
 
         // Handle expected failure vs success cases
@@ -90,8 +91,10 @@ impl TestCase for AddGroupMembersTestCase {
             || async {
                 let members = context
                     .whitenoise
-                    .group_members(admin_account, &self.group_id)
-                    .await?;
+                    .require_session(&admin_account.pubkey)
+                    .unwrap()
+                    .groups()
+                    .members(&self.group_id)?;
 
                 if members.len() == expected_count {
                     // Verify each new member is in the group

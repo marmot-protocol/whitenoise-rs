@@ -12,6 +12,19 @@ This crate (`whitenoise`) is a **library** (`cdylib` + `rlib`) that powers a [Fl
 - **MSRV**: 1.90.0 (pinned in `rust-toolchain.toml`)
 - **Async runtime**: Tokio (full features)
 
+## Active Architecture Refactor Context
+
+Branches cut from `arch-refactor` are expected to follow the session/projection refactor plan. Before making changes on
+this branch family, read these docs in order:
+
+1. `docs/session-projection-rearchitecture.md` — source of truth for the target architecture, ownership model,
+   account-session boundaries, and singleton removal.
+2. `docs/session-projection-implementation-plan.md` — phased landing plan with file-by-file implementation guidance.
+3. `docs/testing-strategy.md` — post-refactor testing model and how tests should migrate as the refactor lands.
+
+When implementing this refactor, keep changes aligned with these documents and update them if the plan materially
+changes.
+
 ## Development Commands
 
 **Use `just` recipes for ALL development tasks.** Run `just` with no arguments to see every available recipe.
