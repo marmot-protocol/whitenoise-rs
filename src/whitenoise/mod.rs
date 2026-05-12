@@ -4058,11 +4058,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Tear down subscriptions to simulate the welcome-processing
-            // cascade failure (group exists in MDK but not in group plane)
             let session = whitenoise
                 .session(&creator_account.pubkey)
                 .expect("session should exist");
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if session.group_handle.group_count().await == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("background group-plane refresh should settle");
+
+            // Tear down subscriptions to simulate the welcome-processing
+            // cascade failure (group exists in MDK but not in group plane)
             session.deactivate_subscriptions().await;
 
             // Re-activate inbox only (without groups) to isolate the test

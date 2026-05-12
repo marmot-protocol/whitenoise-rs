@@ -479,11 +479,23 @@ impl<'a> MessageOpsForGroup<'a> {
 
         let deletion_id = mdk_message.id.to_string();
         let target_ids = extract_deletion_target_ids(&mdk_message.tags);
+        let mut deleted_last_message = false;
 
         for target_id in &target_ids {
             if let Some(reaction) =
                 AggregatedMessage::find_reaction_by_id(target_id, self.group_id, self.db()).await?
             {
+                if reaction.author != mdk_message.pubkey {
+                    tracing::warn!(
+                        target: "whitenoise::session::messages",
+                        deletion_author = %mdk_message.pubkey.to_hex(),
+                        target_author = %reaction.author.to_hex(),
+                        target_id = %target_id,
+                        "Ignoring outgoing deletion whose author does not match reaction author"
+                    );
+                    continue;
+                }
+
                 if let Ok(parent_id) = extract_reaction_target_id(&reaction.tags)
                     && let Some(mut parent) = AggregatedMessage::find_by_id(
                         &parent_id,
@@ -514,25 +526,39 @@ impl<'a> MessageOpsForGroup<'a> {
                 continue;
             }
 
-            AggregatedMessage::mark_deleted(
-                target_id,
-                self.group_id,
-                &deletion_id,
-                self.pubkey(),
-                self.db(),
-            )
-            .await?;
-
             if let Some(mut msg) =
                 AggregatedMessage::find_by_id(target_id, self.group_id, self.pubkey(), self.db())
                     .await?
             {
+                if msg.author != mdk_message.pubkey {
+                    tracing::warn!(
+                        target: "whitenoise::session::messages",
+                        deletion_author = %mdk_message.pubkey.to_hex(),
+                        target_author = %msg.author.to_hex(),
+                        target_id = %target_id,
+                        "Ignoring outgoing deletion whose author does not match message author"
+                    );
+                    continue;
+                }
+
+                AggregatedMessage::mark_deleted(
+                    target_id,
+                    self.group_id,
+                    &deletion_id,
+                    self.pubkey(),
+                    self.db(),
+                )
+                .await?;
+
                 msg.is_deleted = true;
+                deleted_last_message |= last_message_id
+                    .as_ref()
+                    .is_some_and(|last_message_id| last_message_id == target_id);
                 self.emit(UpdateTrigger::MessageDeleted, msg);
             }
         }
 
-        Ok(last_message_id.is_some_and(|id| target_ids.contains(&id)))
+        Ok(deleted_last_message)
     }
 }
 
@@ -586,10 +612,7 @@ pub(crate) async fn cascade_delivery_failure(
             )
             .await
         }
-        5 => {
-            cascade_deletion_failure(event_id, tags, author, group_id, database, stream_manager)
-                .await
-        }
+        5 => cascade_deletion_failure(event_id, author, group_id, database, stream_manager).await,
         _ => {}
     }
 }
@@ -653,12 +676,19 @@ async fn cascade_reaction_failure(
 
 async fn cascade_deletion_failure(
     event_id: &str,
-    tags: &Tags,
     author: &PublicKey,
     group_id: &GroupId,
     database: &Database,
     stream_manager: &MessageStreamManager,
 ) {
+    let target_ids = retry_on_lock(|| async {
+        AggregatedMessage::find_deleted_target_ids_by_deletion_event_id(
+            event_id, group_id, database,
+        )
+        .await
+    })
+    .await;
+
     if let Err(e) = retry_on_lock(|| async {
         AggregatedMessage::unmark_deleted(event_id, group_id, database).await
     })
@@ -671,9 +701,20 @@ async fn cascade_deletion_failure(
         return;
     }
 
+    let target_ids = match target_ids {
+        Ok(target_ids) => target_ids,
+        Err(e) => {
+            tracing::error!(
+                target: "whitenoise::messages::delivery",
+                "Failed to restore reaction summaries for deletion {event_id} after retries: {e}",
+            );
+            return;
+        }
+    };
+
     // Restore each target. For reactions, re-add them to the parent's summary
     // (the optimistic delete path removed them). For messages, just re-emit.
-    for target_id in extract_deletion_target_ids(tags) {
+    for target_id in target_ids {
         // Check if the restored target is a reaction — if so, re-attach to parent
         if let Ok(Some(reaction)) =
             AggregatedMessage::find_reaction_by_id(&target_id, group_id, database).await
