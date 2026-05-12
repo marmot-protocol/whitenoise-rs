@@ -160,7 +160,7 @@ impl Whitenoise {
 
         let whitenoise = self.arc()?;
         let tid = crate::perf::current_trace_id();
-        tokio::spawn(crate::perf::with_trace_id(tid, async move {
+        self.spawn_background(crate::perf::with_trace_id(tid, async move {
             search_task(
                 &whitenoise,
                 tx,
@@ -171,7 +171,8 @@ impl Whitenoise {
                 Some(&NIP50_RELAY_URL),
             )
             .await;
-        }));
+        }))
+        .await;
 
         Ok(UserSearchSubscription { updates: rx })
     }

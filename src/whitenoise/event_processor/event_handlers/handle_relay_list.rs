@@ -73,7 +73,7 @@ impl Whitenoise {
             return;
         };
 
-        tokio::spawn(crate::perf::with_trace_id(tid, async move {
+        self.spawn_background(crate::perf::with_trace_id(tid, async move {
             let account =
                 match Account::find_by_pubkey(&user_pubkey, &whitenoise.shared.database).await {
                     Ok(account) => Some(account),
@@ -101,7 +101,8 @@ impl Whitenoise {
                     error
                 );
             }
-        }));
+        }))
+        .await;
     }
 }
 

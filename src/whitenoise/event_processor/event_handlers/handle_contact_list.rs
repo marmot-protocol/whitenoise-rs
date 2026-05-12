@@ -43,7 +43,8 @@ impl Whitenoise {
             .update_follows_from_event(contacts.clone(), session, &self.shared.database)
             .await?;
 
-        self.schedule_background_user_fetch(session, &contacts);
+        self.schedule_background_user_fetch(session, &contacts)
+            .await;
 
         self.shared
             .event_tracker
@@ -112,7 +113,11 @@ impl Whitenoise {
     ///
     /// This avoids the login bootstrap flood where each followed user triggers
     /// its own relay-list and metadata fetch workflow.
-    fn schedule_background_user_fetch(&self, session: &Arc<AccountSession>, pubkeys: &[PublicKey]) {
+    async fn schedule_background_user_fetch(
+        &self,
+        session: &Arc<AccountSession>,
+        pubkeys: &[PublicKey],
+    ) {
         if pubkeys.is_empty() {
             return;
         }
@@ -131,7 +136,7 @@ impl Whitenoise {
         };
 
         let tid = crate::perf::current_trace_id();
-        tokio::spawn(crate::perf::with_trace_id(tid, async move {
+        self.spawn_background(crate::perf::with_trace_id(tid, async move {
             tracing::info!(
                 target: "whitenoise::handle_contact_list",
                 "Starting discovery catch-up for {} followed users",
@@ -148,7 +153,8 @@ impl Whitenoise {
                 fetched,
                 total
             );
-        }));
+        }))
+        .await;
     }
 
     /// Fetches relay lists and metadata for a batch of users via the discovery
@@ -472,6 +478,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.repos.follows.all().await.unwrap().len(), 1);
+        whitenoise.wait_for_pending_background_tasks().await;
 
         // Process newer event - should replace
         let second_event = build_contact_list_event(&keys, &[second_contact], Some(t2)).await;
@@ -483,6 +490,7 @@ mod tests {
         let follows = session.repos.follows.all().await.unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(follows[0].pubkey, second_contact);
+        whitenoise.wait_for_pending_background_tasks().await;
 
         // Process empty list - should clear all follows
         let empty_event = build_contact_list_event(&keys, &[], Some(t3)).await;
@@ -528,6 +536,7 @@ mod tests {
             )
             .await
             .unwrap();
+        whitenoise.wait_for_pending_background_tasks().await;
         whitenoise
             .handle_contact_list(
                 &session2,
@@ -536,6 +545,7 @@ mod tests {
             )
             .await
             .unwrap();
+        whitenoise.wait_for_pending_background_tasks().await;
 
         let follows1 = session1.repos.follows.all().await.unwrap();
         let follows2 = session2.repos.follows.all().await.unwrap();

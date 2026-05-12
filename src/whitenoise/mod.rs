@@ -232,6 +232,15 @@ pub struct Whitenoise {
     /// `AccountSession`) upgrade this. Never upgrade in a context that expects
     /// the instance to outlive the holder.
     pub(crate) this: Weak<Whitenoise>,
+    /// Handles for fire-and-forget background tasks (discovery catch-up,
+    /// user-search workers, welcome-finalization, relay-list refresh, etc.).
+    /// Mirrors [`Self::scheduler_handles`] for non-scheduler async work that
+    /// would otherwise be dropped and run unobserved past shutdown.
+    ///
+    /// Tests use [`Self::wait_for_pending_background_tasks`] to drain pending
+    /// work before asserting; production drains on shutdown so a stopping
+    /// process doesn't leave half-finished DB writes racing with teardown.
+    background_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Process-lifetime cache used exclusively by [`Whitenoise::ensure_initialized`]
@@ -271,6 +280,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
             .field("account_manager", &"<REDACTED>")
+            .field("background_handles", &"<REDACTED>")
             .finish()
     }
 }
@@ -388,6 +398,7 @@ impl Whitenoise {
                 scheduler_handles: Mutex::new(Vec::new()),
                 account_manager: session::AccountManager::default(),
                 this: weak.clone(),
+                background_handles: Mutex::new(Vec::new()),
             }
         })
     }
@@ -995,6 +1006,7 @@ impl Whitenoise {
 
         self.shutdown_event_processing().await?;
         self.shutdown_scheduled_tasks().await;
+        self.wait_for_pending_background_tasks().await;
 
         tracing::info!(target: "whitenoise::shutdown", "Graceful shutdown complete");
         Ok(())
@@ -1264,6 +1276,70 @@ impl Whitenoise {
         self.scheduler_handles.lock().await.len()
     }
 
+    /// Spawn a fire-and-forget background task and register its handle so it
+    /// can be awaited at shutdown (production) or between sequential calls
+    /// (tests).
+    ///
+    /// Use this anywhere a handler needs to kick off work that outlives the
+    /// request (discovery catch-up, relay-list refresh, welcome finalization,
+    /// user-search streaming). The raw `tokio::spawn` pattern drops the
+    /// `JoinHandle`, which both leaks the task past shutdown and lets it race
+    /// with subsequent DB writes in deterministic tests.
+    ///
+    /// Opportunistically prunes already-finished handles before pushing so a
+    /// long-lived process doesn't accumulate completed `JoinHandle`s
+    /// indefinitely between drain points.
+    pub(crate) async fn spawn_background<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(future);
+        let mut handles = self.background_handles.lock().await;
+        handles.retain(|h| !h.is_finished());
+        handles.push(handle);
+    }
+
+    /// Drains and awaits every registered background task.
+    ///
+    /// Production shutdown calls this so half-finished DB writes don't race
+    /// with teardown. Tests call this between sequential handler invocations
+    /// to make per-handler background spawns observable before asserting.
+    ///
+    /// Loops until the registry is empty after a drain pass, so a spawned task
+    /// that itself spawns another via [`Self::spawn_background`] doesn't slip
+    /// past the wait. Assumes upstream producers (event processing in
+    /// production, the test thread in tests) are quiesced before this is
+    /// called — production shutdown satisfies this by ordering
+    /// `shutdown_event_processing` first.
+    pub(crate) async fn wait_for_pending_background_tasks(&self) {
+        loop {
+            let drained: Vec<JoinHandle<()>> = {
+                let mut handles = self.background_handles.lock().await;
+                if handles.is_empty() {
+                    break;
+                }
+                handles.drain(..).collect()
+            };
+            for handle in drained {
+                if let Err(e) = handle.await {
+                    if e.is_panic() {
+                        tracing::error!(
+                            target: "whitenoise::background_handles",
+                            "Background task panicked: {:?}",
+                            e
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "whitenoise::background_handles",
+                            "Background task cancelled: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "integration-tests")]
     #[perf_instrument("whitenoise")]
     pub async fn wipe_database(&self) -> Result<()> {
@@ -1433,11 +1509,6 @@ pub mod test_utils {
                 scheduler_shutdown,
             },
         );
-        whitenoise
-            .shared
-            .relay_control
-            .start_telemetry_persistors()
-            .await;
 
         (whitenoise, event_receiver, data_temp, logs_temp)
     }
@@ -4281,6 +4352,76 @@ mod tests {
                 handles.is_empty(),
                 "Scheduler handles should be empty when no tasks are registered"
             );
+        }
+
+        #[tokio::test]
+        async fn test_spawn_background_registers_and_wait_drains() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            // Spawn N tasks and verify they land in the registry.
+            for _ in 0..5 {
+                let counter = counter.clone();
+                whitenoise
+                    .spawn_background(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    })
+                    .await;
+            }
+
+            // Drain awaits every task to completion.
+            whitenoise.wait_for_pending_background_tasks().await;
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::Relaxed),
+                5,
+                "All registered tasks must complete before wait returns"
+            );
+            assert!(
+                whitenoise.background_handles.lock().await.is_empty(),
+                "Registry must be empty after drain"
+            );
+
+            // Spawning more after a drain works (prune-on-push is non-destructive).
+            let counter_inner = counter.clone();
+            whitenoise
+                .spawn_background(async move {
+                    counter_inner.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+                })
+                .await;
+            whitenoise.wait_for_pending_background_tasks().await;
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::Relaxed),
+                105,
+                "Post-drain spawn must also be awaited"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_spawn_background_prunes_finished_handles_on_push() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            // First spawn a task that completes immediately, then wait briefly so
+            // the JoinHandle reports `is_finished() == true` before the second push.
+            whitenoise.spawn_background(async {}).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+            // Sanity: the first handle is sitting in the vec, finished but unreaped.
+            assert_eq!(whitenoise.background_handles.lock().await.len(), 1);
+
+            // Second spawn should retain only non-finished handles → drop the first.
+            whitenoise
+                .spawn_background(async {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                })
+                .await;
+            let len_after_second_push = whitenoise.background_handles.lock().await.len();
+            assert_eq!(
+                len_after_second_push, 1,
+                "Finished handle must be pruned on the next push; only the live one remains"
+            );
+
+            whitenoise.wait_for_pending_background_tasks().await;
         }
 
         #[tokio::test]

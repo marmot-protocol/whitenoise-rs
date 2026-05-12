@@ -208,7 +208,7 @@ impl Whitenoise {
         let account_owned = account.clone();
         let session_owned = session.clone();
         let whitenoise = self.arc()?;
-        tokio::spawn(crate::perf::with_trace_id(tid, async move {
+        self.spawn_background(crate::perf::with_trace_id(tid, async move {
             Self::background_finalize_welcome(
                 whitenoise,
                 account_owned,
@@ -219,7 +219,8 @@ impl Whitenoise {
                 welcomer_pubkey,
             )
             .await;
-        }));
+        }))
+        .await;
 
         Ok(())
     }
