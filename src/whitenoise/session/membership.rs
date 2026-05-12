@@ -230,28 +230,56 @@ impl<'a> MembershipOpsForGroup<'a> {
 
     // ── Accept / decline ──────────────────────────────────────────
 
-    /// Accept a group invite (DB-only, no push-token side effects).
-    ///
-    /// Callers that need push-token sharing should use
-    /// `Whitenoise::accept_account_group` until push ops move to the session
-    /// in Phase 13.
+    /// Accept a group invite. Updates the DB membership row and, best-effort,
+    /// shares the local push token to the newly-accepted group.
     pub async fn accept(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
-        Ok(account_group
+        let accepted = account_group
             .update_user_confirmation(true, self.pool())
-            .await?)
+            .await?;
+
+        if let Err(error) = self
+            .session
+            .push()
+            .share_local_token_to_group(self.group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::session::membership",
+                account = %self.pubkey().to_hex(),
+                group = %hex::encode(self.group_id.as_slice()),
+                error = %error,
+                "Failed to share local push token after accepting group"
+            );
+        }
+
+        Ok(accepted)
     }
 
-    /// Decline a group invite (DB-only, no push-token side effects).
-    ///
-    /// Callers that need push-token removal should use
-    /// `Whitenoise::decline_account_group` until push ops move to the session
-    /// in Phase 13.
+    /// Decline a group invite. Updates the DB membership row and, best-effort,
+    /// removes any push token previously shared to the group.
     pub async fn decline(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
-        Ok(account_group
+        let declined = account_group
             .update_user_confirmation(false, self.pool())
-            .await?)
+            .await?;
+
+        if let Err(error) = self
+            .session
+            .push()
+            .remove_local_token_from_group(self.group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::session::membership",
+                account = %self.pubkey().to_hex(),
+                group = %hex::encode(self.group_id.as_slice()),
+                error = %error,
+                "Failed to remove local push token after declining group"
+            );
+        }
+
+        Ok(declined)
     }
 
     // ── Pin ───────────────────────────────────────────────────────

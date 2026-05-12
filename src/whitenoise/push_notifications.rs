@@ -3348,10 +3348,9 @@ mod tests {
         if let Some(eid) = event_id_1 {
             assert!(
                 whitenoise
-                    .session(&account.pubkey)
-                    .unwrap()
+                    .shared
                     .pending_push_token_responses
-                    .contains_key(&(group_id.clone(), eid)),
+                    .contains_key(&(account.pubkey, group_id.clone(), eid)),
                 "first request must have a pending response scheduled"
             );
         }
@@ -3361,10 +3360,9 @@ mod tests {
         if let Some(eid) = event_id_2 {
             assert!(
                 !whitenoise
-                    .session(&account.pubkey)
-                    .unwrap()
+                    .shared
                     .pending_push_token_responses
-                    .contains_key(&(group_id.clone(), eid)),
+                    .contains_key(&(account.pubkey, group_id.clone(), eid)),
                 "rate-limited request must not schedule a pending response"
             );
         }

@@ -2362,10 +2362,9 @@ mod tests {
 
         assert!(
             whitenoise
-                .session(&member_account.pubkey)
-                .unwrap()
+                .shared
                 .pending_push_token_responses
-                .contains_key(&(fake_group_id.clone(), fake_event_id))
+                .contains_key(&(member_account.pubkey, fake_group_id.clone(), fake_event_id))
         );
 
         // Schedule with the same key hits the duplicate-dedup early-return;
@@ -2378,10 +2377,9 @@ mod tests {
 
         assert!(
             whitenoise
-                .session(&member_account.pubkey)
-                .unwrap()
+                .shared
                 .pending_push_token_responses
-                .contains_key(&(fake_group_id.clone(), fake_event_id)),
+                .contains_key(&(member_account.pubkey, fake_group_id.clone(), fake_event_id)),
             "pending entry should still be present after duplicate request"
         );
     }
