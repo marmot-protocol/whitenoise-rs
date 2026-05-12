@@ -1082,9 +1082,7 @@ mod tests {
 
     /// Persists an `External` account and registers a session with no signer attached.
     /// Used to exercise operations that should fail because the signer is missing.
-    async fn register_session_without_signer(
-        whitenoise: &std::sync::Arc<Whitenoise>,
-    ) -> Account {
+    async fn register_session_without_signer(whitenoise: &std::sync::Arc<Whitenoise>) -> Account {
         let mut account = create_local_account_struct();
         account.id = None;
         account.account_type = AccountType::External;
