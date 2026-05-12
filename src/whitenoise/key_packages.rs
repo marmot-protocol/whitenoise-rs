@@ -10,7 +10,6 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::{Result, WhitenoiseError};
-#[cfg(test)]
 use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId, RequiredProposal};
 use crate::whitenoise::relays::Relay;
 
@@ -207,7 +206,6 @@ pub(crate) fn validate_marmot_key_package_baseline(
 
 /// Extracts the Marmot key package capabilities (extensions + proposals) from
 /// the event's tags as structured enums for downstream policy checks.
-#[cfg(test)]
 pub(crate) fn marmot_key_package_capabilities(event: &Event) -> KeyPackageCapabilities {
     use std::collections::BTreeSet;
 

@@ -208,7 +208,6 @@ impl From<u16> for RequiredProposal {
 /// Iteration order over `members` is preserved; iteration over each member's
 /// missing proposals is `BTreeSet`-ordered (deterministic for tests).
 /// Returns `None` when every member's proposals cover `required`.
-#[cfg(test)]
 pub(crate) fn find_member_missing_required_proposal(
     members: &[(PublicKey, KeyPackageCapabilities)],
     required: &BTreeSet<RequiredProposal>,

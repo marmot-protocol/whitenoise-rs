@@ -63,10 +63,20 @@ impl PublishedKeyPackagesRepo {
     }
 
     /// Backdate `consumed_at` into the past for testing cleanup eligibility.
+    ///
+    /// Mirrors [`PublishedKeyPackage::mark_consumed`] by updating ALL rows
+    /// sharing the same `key_package_hash_ref` as the row matching `event_id`.
+    /// Dual-published kind:30443/kind:443 twins must stay in sync — otherwise
+    /// the un-backdated twin's recent `consumed_at` keeps tripping the
+    /// `NOT EXISTS` clause in `find_eligible_for_cleanup`.
     #[cfg(feature = "integration-tests")]
     pub async fn backdate_consumed_at(&self, event_id: &str, age_secs: i64) -> Result<()> {
         sqlx::query(
-            "UPDATE published_key_packages SET consumed_at = unixepoch() - ? WHERE event_id = ?",
+            "UPDATE published_key_packages
+             SET consumed_at = unixepoch() - ?
+             WHERE key_package_hash_ref = (
+                 SELECT key_package_hash_ref FROM published_key_packages WHERE event_id = ?
+             )",
         )
         .bind(age_secs)
         .bind(event_id)
