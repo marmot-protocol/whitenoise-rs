@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use clap::Parser;
 use keyring_core::Entry;
-use nostr_sdk::Keys;
+use nostr_sdk::{Keys, RelayUrl};
 
 use ::whitenoise::init_tracing_with_perf_layer;
 use ::whitenoise::integration_tests::benchmarks::chrome_trace::write_perfetto_trace;
@@ -281,7 +281,11 @@ async fn main() -> Result<(), WhitenoiseError> {
     }
 
     let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir, KEYRING_SERVICE)
-        .with_database_key_id(BENCHMARK_WHITENOISE_DB_KEY_ID);
+        .with_database_key_id(BENCHMARK_WHITENOISE_DB_KEY_ID)
+        .with_discovery_relays(vec![
+            RelayUrl::parse("ws://localhost:8080").unwrap(),
+            RelayUrl::parse("ws://localhost:7777").unwrap(),
+        ]);
     let whitenoise = match Whitenoise::new(config).await {
         Ok(wn) => wn,
         Err(err) => {
