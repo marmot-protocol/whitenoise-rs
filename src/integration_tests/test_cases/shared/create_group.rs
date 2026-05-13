@@ -61,6 +61,7 @@ impl TestCase for CreateGroupTestCase {
                     None, // image_nonce
                     context.test_relays(),
                     admin_pubkeys,
+                    None,
                 ),
                 None,
             )

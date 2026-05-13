@@ -1686,6 +1686,7 @@ pub mod test_utils {
             Some([2u8; 12]), // 12-byte nonce
             vec![RelayUrl::parse("ws://localhost:8080/").unwrap()],
             admins,
+            None,
         )
     }
 
@@ -4095,6 +4096,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+
+            assert_eq!(
+                whitenoise
+                    .shared
+                    .relay_control
+                    .group_plane_account_group_count(&creator_account.pubkey)
+                    .await,
+                0,
+                "test setup should leave MDK with one group and the group plane empty"
+            );
 
             let is_operational = whitenoise
                 .is_account_subscriptions_operational(&creator_account)

@@ -107,6 +107,8 @@ pub struct AccountSession {
     activation_lock: Mutex<()>,
     /// In-memory coordination for delayed MIP-05 token-list responses.
     pub(crate) pending_push_token_responses: Arc<DashMap<(GroupId, EventId), ()>>,
+    /// Bounds concurrently-active delayed MIP-05 token-list response tasks.
+    token_response_semaphore: Arc<Semaphore>,
 }
 
 impl AccountSession {
@@ -152,6 +154,9 @@ impl AccountSession {
             inbox: RwLock::new(None),
             activation_lock: Mutex::new(()),
             pending_push_token_responses: Arc::new(DashMap::new()),
+            token_response_semaphore: Arc::new(Semaphore::new(
+                crate::whitenoise::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,
+            )),
         })
     }
 
@@ -290,7 +295,28 @@ impl AccountSession {
         use crate::whitenoise::push_notifications::respond_to_token_request_with;
 
         let key = (group_id.clone(), request_event_id);
-        self.pending_push_token_responses.insert(key, ());
+        if self
+            .pending_push_token_responses
+            .insert(key.clone(), ())
+            .is_some()
+        {
+            return;
+        }
+
+        let permit = match self.token_response_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %self.account_pubkey.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    request_event_id = %request_event_id.to_hex(),
+                    "Dropping MIP-05 token-list response task: concurrency limit reached"
+                );
+                self.pending_push_token_responses.remove(&key);
+                return;
+            }
+        };
 
         let mdk = Arc::clone(&self.mdk);
         let account_db = Arc::clone(&self.account_db);
@@ -305,6 +331,7 @@ impl AccountSession {
                 _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                 _ = cancel_rx.changed() => {
                     pending.remove(&(group_id, request_event_id));
+                    drop(permit);
                     return;
                 }
             }
@@ -333,6 +360,8 @@ impl AccountSession {
                     "Failed to send delayed MIP-05 token-list response"
                 );
             }
+
+            drop(permit);
         });
     }
 
@@ -756,11 +785,13 @@ pub(crate) mod test_helpers {
 mod tests {
     use std::sync::Arc;
 
-    use nostr_sdk::Keys;
+    use mdk_core::prelude::GroupId;
+    use nostr_sdk::{EventId, Keys};
 
     use super::AccountManager;
     use super::test_helpers::test_session;
     use crate::whitenoise::accounts::DiscoveredRelayLists;
+    use crate::whitenoise::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS;
 
     fn test_pubkey() -> nostr_sdk::PublicKey {
         Keys::generate().public_key()
@@ -927,6 +958,52 @@ mod tests {
         session.cancel();
         rx.changed().await.expect("channel not dropped");
         assert!(*rx.borrow(), "should be cancelled after cancel()");
+    }
+
+    #[tokio::test]
+    async fn schedule_pending_token_response_dedupes_duplicate_request() {
+        let pk = test_pubkey();
+        let session = test_session(pk).await;
+        let group_id = GroupId::from_slice(&[3; 32]);
+        let request_event_id = EventId::all_zeros();
+
+        session.schedule_pending_token_response(group_id.clone(), request_event_id);
+        session.schedule_pending_token_response(group_id.clone(), request_event_id);
+
+        assert_eq!(
+            session.pending_push_token_responses.len(),
+            1,
+            "duplicate token response keys should share one pending response"
+        );
+        assert!(
+            session
+                .pending_push_token_responses
+                .contains_key(&(group_id, request_event_id))
+        );
+
+        session.cancel();
+    }
+
+    #[tokio::test]
+    async fn schedule_pending_token_response_drops_when_concurrency_is_exhausted() {
+        let pk = test_pubkey();
+        let session = test_session(pk).await;
+        let group_id = GroupId::from_slice(&[4; 32]);
+        let request_event_id = EventId::all_zeros();
+        let _permit = session
+            .token_response_semaphore
+            .clone()
+            .try_acquire_many_owned(MAX_CONCURRENT_TOKEN_RESPONSE_TASKS as u32)
+            .expect("all permits should be initially available");
+
+        session.schedule_pending_token_response(group_id.clone(), request_event_id);
+
+        assert!(
+            !session
+                .pending_push_token_responses
+                .contains_key(&(group_id, request_event_id)),
+            "saturated scheduler should drop the response key so requesters can retry"
+        );
     }
 
     #[tokio::test]

@@ -990,7 +990,7 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use mdk_core::mip05::{
         ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
@@ -1000,8 +1000,8 @@ mod tests {
 
     use super::*;
     use crate::whitenoise::{
-        aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus,
-        push_notifications::GroupPushToken, test_utils::*,
+        aggregated_message::AggregatedMessage, group_information::GroupInformation,
+        message_aggregator::DeliveryStatus, push_notifications::GroupPushToken, test_utils::*,
     };
 
     fn make_token_tag(seed: u8) -> TokenTag {
@@ -1023,6 +1023,66 @@ mod tests {
             member_account,
         )
         .await
+    }
+
+    async fn setup_three_member_accepted_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_one: &Account,
+        member_two: &Account,
+    ) -> GroupId {
+        let group_id =
+            setup_three_member_group(whitenoise, admin_account, member_one, member_two).await;
+
+        GroupInformation::create_for_group(whitenoise, &group_id, None, "Test group")
+            .await
+            .unwrap();
+
+        for account in [admin_account, member_one, member_two] {
+            let (account_group, _) =
+                AccountGroup::get_or_create(whitenoise, &account.pubkey, &group_id, None)
+                    .await
+                    .unwrap();
+            account_group.accept(whitenoise).await.unwrap();
+        }
+
+        group_id
+    }
+
+    async fn assert_cached_peer_tokens(
+        session: &Arc<AccountSession>,
+        group_id: &GroupId,
+        expected_tokens: &[(&Account, u32, &TokenTag)],
+    ) {
+        let stored = GroupPushToken::find_by_account_and_group(
+            &session.account_pubkey,
+            group_id,
+            &session.account_db.inner.pool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stored.len(),
+            expected_tokens.len(),
+            "receiver should cache exactly the other participants' push tokens"
+        );
+
+        for (account, leaf_index, token_tag) in expected_tokens {
+            let cached_token = stored
+                .iter()
+                .find(|token| token.member_pubkey == account.pubkey)
+                .expect("expected participant token should be cached");
+            assert_eq!(cached_token.account_pubkey, session.account_pubkey);
+            assert_eq!(cached_token.mls_group_id, *group_id);
+            assert_eq!(cached_token.leaf_index, *leaf_index);
+            assert_eq!(cached_token.server_pubkey, token_tag.server_pubkey);
+            assert_eq!(cached_token.relay_hint, Some(token_tag.relay_hint.clone()));
+            assert_eq!(
+                cached_token.encrypted_token,
+                token_tag.encrypted_token.to_base64()
+            );
+        }
     }
 
     /// Test handling of different MLS message types: regular messages, reactions, and deletions
@@ -1934,6 +1994,210 @@ mod tests {
         .await
         .unwrap();
         assert!(cached_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_updates_token_request_cache_inside_response_cooldown() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+
+        let first_token = make_token_tag(10);
+        let first_request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![first_token])
+                .unwrap();
+        let first_request_id = first_request.id.expect("447 rumor must have an event id");
+        let first_event = admin_mdk
+            .create_message(&group_id, first_request, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_session, &member_account, first_event)
+            .await
+            .unwrap();
+
+        let replacement_token = make_token_tag(11);
+        let expected_encrypted_token = replacement_token.encrypted_token.to_base64();
+        let replacement_request = build_token_request_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            vec![replacement_token],
+        )
+        .unwrap();
+        let replacement_request_id = replacement_request
+            .id
+            .expect("447 replacement rumor must have an event id");
+        let replacement_event = admin_mdk
+            .create_message(&group_id, replacement_request, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_session, &member_account, replacement_event)
+            .await
+            .unwrap();
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &member_session.account_db.inner.pool,
+        )
+        .await
+        .unwrap();
+        let admin_token = stored
+            .iter()
+            .find(|token| token.leaf_index == admin_leaf_index)
+            .expect("admin token should stay cached");
+        assert_eq!(
+            admin_token.encrypted_token, expected_encrypted_token,
+            "rapid re-gossip should refresh cached encrypted token state"
+        );
+
+        assert!(
+            member_session
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), first_request_id)),
+            "the first token request should still schedule one token-list response"
+        );
+        assert!(
+            !member_session
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), replacement_request_id)),
+            "a rate-limited re-gossip must not schedule another token-list response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_gossips_token_requests_to_all_other_participants() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+        let member_one = members[0].0.clone();
+        let member_two = members[1].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_one, &member_two]).await;
+
+        let group_id = setup_three_member_accepted_group(
+            &whitenoise,
+            &admin_account,
+            &member_one,
+            &member_two,
+        )
+        .await;
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let member_one_session = whitenoise.require_session(&member_one.pubkey).unwrap();
+        let member_two_session = whitenoise.require_session(&member_two.pubkey).unwrap();
+
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let member_one_mdk = whitenoise
+            .create_mdk_for_account(member_one.pubkey)
+            .unwrap();
+        let member_two_mdk = whitenoise
+            .create_mdk_for_account(member_two.pubkey)
+            .unwrap();
+        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+        let member_one_leaf_index = member_one_mdk.own_leaf_index(&group_id).unwrap();
+        let member_two_leaf_index = member_two_mdk.own_leaf_index(&group_id).unwrap();
+
+        let admin_token = make_token_tag(30);
+        let admin_request = build_token_request_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            vec![admin_token.clone()],
+        )
+        .unwrap();
+        let admin_event = admin_mdk
+            .create_message(&group_id, admin_request, None)
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_one_session, &member_one, admin_event.clone())
+            .await
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_two_session, &member_two, admin_event)
+            .await
+            .unwrap();
+
+        let member_one_token = make_token_tag(31);
+        let member_one_request = build_token_request_rumor(
+            member_one.pubkey,
+            Timestamp::now(),
+            vec![member_one_token.clone()],
+        )
+        .unwrap();
+        let member_one_event = member_one_mdk
+            .create_message(&group_id, member_one_request, None)
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, member_one_event.clone())
+            .await
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_two_session, &member_two, member_one_event)
+            .await
+            .unwrap();
+
+        let member_two_token = make_token_tag(32);
+        let member_two_request = build_token_request_rumor(
+            member_two.pubkey,
+            Timestamp::now(),
+            vec![member_two_token.clone()],
+        )
+        .unwrap();
+        let member_two_event = member_two_mdk
+            .create_message(&group_id, member_two_request, None)
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, member_two_event.clone())
+            .await
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_one_session, &member_one, member_two_event)
+            .await
+            .unwrap();
+
+        assert_cached_peer_tokens(
+            &admin_session,
+            &group_id,
+            &[
+                (&member_one, member_one_leaf_index, &member_one_token),
+                (&member_two, member_two_leaf_index, &member_two_token),
+            ],
+        )
+        .await;
+        assert_cached_peer_tokens(
+            &member_one_session,
+            &group_id,
+            &[
+                (&admin_account, admin_leaf_index, &admin_token),
+                (&member_two, member_two_leaf_index, &member_two_token),
+            ],
+        )
+        .await;
+        assert_cached_peer_tokens(
+            &member_two_session,
+            &group_id,
+            &[
+                (&admin_account, admin_leaf_index, &admin_token),
+                (&member_one, member_one_leaf_index, &member_one_token),
+            ],
+        )
+        .await;
+
+        admin_session.cancel();
+        member_one_session.cancel();
+        member_two_session.cancel();
     }
 
     #[tokio::test]
