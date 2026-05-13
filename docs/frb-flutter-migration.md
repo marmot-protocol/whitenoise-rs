@@ -95,8 +95,10 @@ just frb-check
 
 `.github/workflows/frb-codegen.yml`:
 
-1. **Gate job** — verifies `github.actor` is in the codeowner allowlist
-   (hardcoded; mirror `.github/CODEOWNERS`). Non-codeowner pushes skip cleanly.
+1. **Gate job** — parses the wildcard rule from `.github/CODEOWNERS` at
+   runtime and verifies `github.actor` is one of those user logins.
+   Non-codeowner pushes skip cleanly. Team entries (`org/team`) cause the
+   gate to fail fast since user-login matching can't resolve them.
 2. **Codegen job**:
    - Checks out master at the pushed SHA into `source/`.
    - Checks out the `flutter-package` orphan branch into `source/.frb-staging/`.
@@ -202,7 +204,9 @@ Once the orphan branch exists, the Flutter team needs a separate PR on
 
 ## Codeowner gating
 
-The CI workflow only regenerates when `github.actor` is in the allowlist
-hardcoded in `.github/workflows/frb-codegen.yml`. Keep that list in sync with
-`.github/CODEOWNERS`. Non-codeowner pushes to master skip the codegen job
-silently — no orphan-branch update.
+The CI workflow derives the allowlist from `.github/CODEOWNERS` at runtime
+(parsing the wildcard rule). `github.actor` is matched against the parsed
+user logins, so the gate stays in sync with the file automatically. Team
+entries (`org/team`) cause the gate to fail fast — extend the workflow to
+query the GitHub Teams API if you need that. Non-codeowner pushes to master
+skip the codegen job silently; no orphan-branch update.
