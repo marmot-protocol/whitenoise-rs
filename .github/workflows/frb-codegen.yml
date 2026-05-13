@@ -19,21 +19,31 @@ concurrency:
 
 jobs:
   gate:
-    name: Verify pusher is a codeowner
+    name: Verify actor is a codeowner
     runs-on: ubuntu-latest
     outputs:
       authorized: ${{ steps.check.outputs.authorized }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/CODEOWNERS
+          sparse-checkout-cone-mode: false
       - id: check
         env:
           ACTOR: ${{ github.actor }}
-          EVENT: ${{ github.event_name }}
         run: |
-          codeowners=(erskingardner dannym-arx mubarakcoded jgmontoya)
-          if [[ "$EVENT" == "workflow_dispatch" ]]; then
-            echo "Manual dispatch by $ACTOR — bypassing actor check."
-            echo "authorized=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          # Read the wildcard rule from CODEOWNERS so the allowlist can't
+          # drift from the source of truth. Lines look like:
+          #   * @user1 @user2 @team/foo
+          # Strip the leading @ so $ACTOR (a bare login) matches.
+          mapfile -t codeowners < <(
+            awk '/^\*[[:space:]]/ {for (i=2; i<=NF; i++) print $i}' \
+              .github/CODEOWNERS | sed 's/^@//'
+          )
+          if [[ ${#codeowners[@]} -eq 0 ]]; then
+            echo "✗ Could not parse codeowners from .github/CODEOWNERS." >&2
+            exit 1
           fi
           for owner in "${codeowners[@]}"; do
             if [[ "$ACTOR" == "$owner" ]]; then
@@ -54,12 +64,17 @@ jobs:
       FRB_VERSION: "2.11.1"
       STAGING: ".frb-staging"
     steps:
-      - name: Checkout source (master)
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.sha }}
           fetch-depth: 1
           path: source
+
+      - name: Capture real source SHA
+        id: src
+        working-directory: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout flutter-package orphan branch
         uses: actions/checkout@v4
@@ -67,6 +82,9 @@ jobs:
           ref: flutter-package
           fetch-depth: 1
           path: source/.frb-staging
+          # Don't persist the default token: we set our own auth header in
+          # the push step (avoids token-in-URL leakage via `git remote -v`).
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -101,7 +119,7 @@ jobs:
       - name: Vendor wrapper crate into staging
         working-directory: source
         env:
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ steps.src.outputs.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -113,15 +131,18 @@ jobs:
             "s#^whitenoise = { path = \"../..\" }\$#whitenoise = { git = \"https://github.com/${REPO}\", rev = \"${SOURCE_SHA}\" }#" \
             "${STAGING}/rust/Cargo.toml"
 
-          if grep -q 'path = "../.."' "${STAGING}/rust/Cargo.toml"; then
-            echo "Dep rewrite failed — Cargo.toml still references path = ../.." >&2
+          # Tighter validation: any remaining `whitenoise = { path = ` line
+          # means the rewrite failed. Print the file so CI logs are useful.
+          if grep -q '^whitenoise = { path = ' "${STAGING}/rust/Cargo.toml"; then
+            echo "Dep rewrite failed. ${STAGING}/rust/Cargo.toml content:" >&2
+            cat "${STAGING}/rust/Cargo.toml" >&2
             exit 1
           fi
 
       - name: Refresh provenance marker
         working-directory: source
         env:
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ steps.src.outputs.sha }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
         run: |
@@ -136,8 +157,7 @@ jobs:
         working-directory: source/.frb-staging
         env:
           GH_TOKEN: ${{ secrets.FRB_PR_TOKEN || secrets.GITHUB_TOKEN }}
-          SOURCE_SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.src.outputs.sha }}
         run: |
           set -euo pipefail
           git config user.email "frb-codegen-bot@marmot-protocol.org"
@@ -151,13 +171,16 @@ jobs:
 
           git commit -q -m "frb: regenerate from ${SOURCE_SHA}"
 
-          # Use the workflow token for the push only.
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          # Auth via extraheader instead of embedding the token in the
+          # remote URL. The header lives only in this worktree's local git
+          # config and never appears in `git remote -v` output.
+          git config --local "http.https://github.com/.extraheader" \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
           git push origin flutter-package
 
       - name: Summary
         env:
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ steps.src.outputs.sha }}
         run: |
           {
             echo "### FRB regen complete"

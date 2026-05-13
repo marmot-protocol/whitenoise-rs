@@ -119,8 +119,9 @@ The `flutter-package` orphan branch must exist on `origin` before the
 workflow can update it. Bootstrap once:
 
 ```sh
-# 1. Create an empty orphan branch
-git worktree add --orphan -b flutter-package /tmp/fp-bootstrap
+# 1. Create an empty orphan branch in a fresh worktree directory
+BOOTSTRAP_DIR=$(mktemp -d)
+git worktree add --orphan -b flutter-package "${BOOTSTRAP_DIR}"
 
 # 2. Seed it with the package shape (pubspec, cargokit, platform dirs,
 #    LICENSE, README, .gitignore, analysis_options) — see the layout under
@@ -129,22 +130,21 @@ git worktree add --orphan -b flutter-package /tmp/fp-bootstrap
 #    fresh `lib/src/rust/` produced by running codegen.
 
 # 3. Vendor the wrapper crate
-cp -r crates/whitenoise-frb /tmp/fp-bootstrap/rust
+cp -r crates/whitenoise-frb "${BOOTSTRAP_DIR}/rust"
 SHA=$(git rev-parse HEAD)
 sed -i "s#whitenoise = { path = \"../..\" }#whitenoise = { git = \"https://github.com/marmot-protocol/whitenoise-rs\", rev = \"${SHA}\" }#" \
-    /tmp/fp-bootstrap/rust/Cargo.toml
+    "${BOOTSTRAP_DIR}/rust/Cargo.toml"
 
-# 4. Run codegen against the bootstrap
-ln -s /tmp/fp-bootstrap .frb-staging
+# 4. Run codegen against the bootstrap (real worktree, not a symlink)
+git worktree add .frb-staging flutter-package  # already created above
 just frb-generate
-rm .frb-staging
 
 # 5. Commit and push
-git -C /tmp/fp-bootstrap add -A
-git -C /tmp/fp-bootstrap -c user.email=frb-codegen-bot@marmot-protocol.org \
+git -C "${BOOTSTRAP_DIR}" add -A
+git -C "${BOOTSTRAP_DIR}" -c user.email=frb-codegen-bot@marmot-protocol.org \
     -c user.name="frb-codegen-bot" \
     commit -m "frb: bootstrap flutter-package from ${SHA}"
-git -C /tmp/fp-bootstrap push origin flutter-package
+git -C "${BOOTSTRAP_DIR}" push origin flutter-package
 ```
 
 After step 5, the workflow can take over.

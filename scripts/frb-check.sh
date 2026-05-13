@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lint and compile-check the FRB wrapper crate. The repo-wide check-clippy.sh
-# only inspects the root `whitenoise` crate, so this catches wrapper-only
-# regressions (added Rust APIs that don't compile, missing trait impls, etc.).
+# Lint, format-check, and compile-check the FRB wrapper crate. Used by the
+# codegen workflow; safe to run locally. Catches wrapper-only regressions
+# (added Rust APIs that don't compile, missing trait impls, drift in the
+# generated `frb_generated.rs` after a regen, etc.).
 
-echo "🔍 Checking rust_lib_whitenoise..."
+echo "🔍 Format-checking rust_lib_whitenoise..."
+cargo fmt --package rust_lib_whitenoise --check
+
+echo "🔍 Linting rust_lib_whitenoise..."
 cargo clippy \
     --no-deps \
     --package rust_lib_whitenoise \

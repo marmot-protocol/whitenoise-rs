@@ -26,7 +26,10 @@ if [[ -d "${STAGING}/.git" || -f "${STAGING}/.git" ]]; then
 
     echo "✓ ${STAGING}/ already exists as a worktree of '${BRANCH}'."
     echo "  Refreshing from origin..."
-    git -C "${STAGING}" fetch --quiet origin "${BRANCH}" || true
+    if ! git -C "${STAGING}" fetch --quiet origin "${BRANCH}"; then
+        echo "  warning: fetch failed — reset will use the cached upstream ref" >&2
+        echo "           (it may be stale; check connectivity / credentials)." >&2
+    fi
     if git -C "${STAGING}" rev-parse "@{upstream}" >/dev/null 2>&1; then
         git -C "${STAGING}" reset --hard "@{upstream}"
     fi
