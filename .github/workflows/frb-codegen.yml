@@ -1,0 +1,168 @@
+name: FRB codegen
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or SHA to regenerate from"
+        required: false
+        default: "master"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: frb-codegen-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Verify pusher is a codeowner
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - id: check
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          codeowners=(erskingardner dannym-arx mubarakcoded jgmontoya)
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            echo "Manual dispatch by $ACTOR — bypassing actor check."
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for owner in "${codeowners[@]}"; do
+            if [[ "$ACTOR" == "$owner" ]]; then
+              echo "$ACTOR is a codeowner — proceeding."
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "$ACTOR is not in the codeowner allowlist — skipping codegen."
+          echo "authorized=false" >> "$GITHUB_OUTPUT"
+
+  codegen:
+    name: Regenerate bindings and update flutter-package branch
+    needs: gate
+    if: needs.gate.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    env:
+      FRB_VERSION: "2.11.1"
+      STAGING: ".frb-staging"
+    steps:
+      - name: Checkout source (master)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+          fetch-depth: 1
+          path: source
+
+      - name: Checkout flutter-package orphan branch
+        uses: actions/checkout@v4
+        with:
+          ref: flutter-package
+          fetch-depth: 1
+          path: source/.frb-staging
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "source -> target"
+
+      - name: Install flutter_rust_bridge_codegen
+        run: |
+          cargo install flutter_rust_bridge_codegen \
+            --version "${FRB_VERSION}" \
+            --locked
+
+      - name: Install Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Run codegen into staging worktree
+        working-directory: source
+        run: bash scripts/frb-generate.sh
+
+      - name: Lint wrapper crate
+        working-directory: source
+        run: bash scripts/frb-check.sh
+
+      - name: Vendor wrapper crate into staging
+        working-directory: source
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rm -rf "${STAGING}/rust"
+          mkdir -p "${STAGING}/rust"
+          cp -r crates/whitenoise-frb/. "${STAGING}/rust/"
+
+          sed -i \
+            "s#^whitenoise = { path = \"../..\" }\$#whitenoise = { git = \"https://github.com/${REPO}\", rev = \"${SOURCE_SHA}\" }#" \
+            "${STAGING}/rust/Cargo.toml"
+
+          if grep -q 'path = "../.."' "${STAGING}/rust/Cargo.toml"; then
+            echo "Dep rewrite failed — Cargo.toml still references path = ../.." >&2
+            exit 1
+          fi
+
+      - name: Refresh provenance marker
+        working-directory: source
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          {
+            echo "Regenerated from: ${REPO}@${SOURCE_SHA}"
+            echo "Run: ${RUN_ID}"
+            echo "UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "flutter_rust_bridge: ${FRB_VERSION}"
+          } > "${STAGING}/REGENERATED.txt"
+
+      - name: Commit and push if changed
+        working-directory: source/.frb-staging
+        env:
+          GH_TOKEN: ${{ secrets.FRB_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git config user.email "frb-codegen-bot@marmot-protocol.org"
+          git config user.name  "frb-codegen-bot"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to publish — bindings already current."
+            exit 0
+          fi
+
+          git commit -q -m "frb: regenerate from ${SOURCE_SHA}"
+
+          # Use the workflow token for the push only.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push origin flutter-package
+
+      - name: Summary
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "### FRB regen complete"
+            echo
+            echo "- Source commit: \`${SOURCE_SHA}\`"
+            echo "- Updated branch: \`flutter-package\`"
+            echo "- Consumers: bump their git ref or run \`flutter pub upgrade\`."
+          } >> "${GITHUB_STEP_SUMMARY}"

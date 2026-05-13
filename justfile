@@ -445,6 +445,25 @@ install-tools:
     @bash scripts/install-dev-tools.sh
 
 ######################
+# Flutter Rust Bridge
+######################
+
+# Set up .frb-staging/ as a worktree of the flutter-package orphan branch.
+# Run this once before `just frb-generate`. Safe to re-run (refreshes from
+# origin if a worktree already exists).
+frb-stage:
+    @bash scripts/frb-stage.sh
+
+# Regenerate the FRB bindings (Rust glue + Dart) from crates/whitenoise-frb/
+# into .frb-staging/. Requires `just frb-stage` to have run first.
+frb-generate:
+    @bash scripts/frb-generate.sh
+
+# Verify the wrapper compiles after a regen (CI guard against API drift).
+frb-check:
+    @bash scripts/frb-check.sh
+
+######################
 # Build
 ######################
 

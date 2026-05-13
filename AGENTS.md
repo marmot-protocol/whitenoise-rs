@@ -231,6 +231,32 @@ The integration test framework uses a **Scenarios + TestCases** pattern:
 
 See `src/integration_tests/README.md` for the full framework documentation, including how to add new scenarios and test cases.
 
+## Flutter Rust Bridge
+
+The Dart bindings consumed by the Flutter app are generated from
+`crates/whitenoise-frb/` (the FFI wrapper crate) and published to a dedicated
+`flutter-package` orphan branch on every codeowner push to `master`. The
+Flutter app consumes that branch as a git dependency — no codegen runs on the
+Flutter side anymore.
+
+**Master is Rust-only.** The Flutter package shape (pubspec, cargokit,
+platform dirs, generated Dart bindings, vendored Rust source) lives **only**
+on the orphan branch — nothing about the Flutter package is committed to
+master.
+
+| Concern | Location |
+|---|---|
+| Wrapper crate (Rust) | `crates/whitenoise-frb/` (master) |
+| FRB config | `flutter_rust_bridge.yaml` (master) |
+| Flutter package | `flutter-package` orphan branch (no shared history with master) |
+| Local staging worktree | `.frb-staging/` (gitignored; created by `just frb-stage`) |
+| Local regen | `just frb-stage && just frb-generate` |
+| Wrapper lint | `just frb-check` |
+| CI regen | `.github/workflows/frb-codegen.yml` |
+
+Full architecture, rollout sequence, and bootstrap instructions:
+`docs/frb-flutter-migration.md`.
+
 ## CI Pipeline
 
 CI runs on push to `master` and on all PRs. The pipeline includes:

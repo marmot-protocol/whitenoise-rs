@@ -35,3 +35,7 @@ coverage/
 
 # Benchmark results
 benchmark_results/
+
+# Worktree of the `flutter-package` orphan branch, used as the dart_output
+# target for `just frb-generate`. Set up with `just frb-stage`.
+/.frb-staging

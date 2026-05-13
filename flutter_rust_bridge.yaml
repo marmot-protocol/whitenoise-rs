@@ -1,0 +1,9 @@
+rust_input: crate::api
+rust_root: crates/whitenoise-frb/
+# .frb-staging/ is a worktree of the `flutter-package` orphan branch — set up
+# locally with `just frb-stage`. The orphan branch is the canonical home of
+# the Flutter package shape (pubspec, cargokit, lib/, rust/). Master never
+# tracks generated Dart bindings.
+dart_output: .frb-staging/lib/src/rust
+web: false
+enable_lifetime: true

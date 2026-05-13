@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/whitenoise-macros", "crates/whitenoise-cli"]
+members = [".", "crates/whitenoise-macros", "crates/whitenoise-cli", "crates/whitenoise-frb"]
 
 [workspace.dependencies]
 mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "28ee7badf24195343f452246ce5f4dad4a99ddf2", features = [
