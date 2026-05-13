@@ -89,6 +89,16 @@ pub fn language_english() -> Language {
 }
 
 #[frb(sync)]
+pub fn language_chinese_simplified() -> Language {
+    Language::ChineseSimplified
+}
+
+#[frb(sync)]
+pub fn language_chinese_traditional() -> Language {
+    Language::ChineseTraditional
+}
+
+#[frb(sync)]
 pub fn language_spanish() -> Language {
     Language::Spanish
 }
@@ -133,6 +143,8 @@ pub fn language_to_string(language: &Language) -> String {
     match language {
         Language::System => "system".to_string(),
         Language::English => "en".to_string(),
+        Language::ChineseSimplified => "zh".to_string(),
+        Language::ChineseTraditional => "zh_Hant".to_string(),
         Language::Spanish => "es".to_string(),
         Language::French => "fr".to_string(),
         Language::German => "de".to_string(),

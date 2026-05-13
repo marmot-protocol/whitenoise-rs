@@ -72,6 +72,7 @@ impl From<FlutterGroupDataUpdate> for NostrGroupDataUpdate {
             image_nonce: group_data.image_nonce.map(Some),
             image_upload_key: None,
             nostr_group_id: None,
+            disappearing_message_secs: None,
             relays: group_data.relays.map(|relays| {
                 relays
                     .into_iter()
@@ -271,6 +272,7 @@ pub async fn create_group(
         image_nonce: None,
         relays: default_relay_urls_parsed()?,
         admins: admin_pubkeys,
+        disappearing_message_secs: None,
     };
 
     let member_pubkeys = member_pubkeys
