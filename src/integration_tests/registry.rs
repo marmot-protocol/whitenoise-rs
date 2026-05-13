@@ -254,7 +254,7 @@ mod tests {
     fn test_get_all_scenario_names() {
         // Test that all scenario names are returned
         let names = get_all_scenario_names();
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 23);
         assert!(names.contains(&"account-management"));
         assert!(names.contains(&"basic-messaging"));
         assert!(names.contains(&"drafts"));
@@ -267,5 +267,6 @@ mod tests {
         assert!(names.contains(&"create-group-with-legacy-member"));
         assert!(names.contains(&"add-member-to-strict-group-rejected"));
         assert!(names.contains(&"upgrade-required-proposals-after-legacy-self-update"));
+        assert!(names.contains(&"mute-list"));
     }
 }
