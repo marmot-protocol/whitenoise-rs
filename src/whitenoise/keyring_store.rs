@@ -6,13 +6,55 @@ use std::sync::Arc;
 use keyring_core::api::{CredentialApi, CredentialStoreApi};
 use keyring_core::{Credential, CredentialPersistence, CredentialStore, Entry, Error, Result};
 
+#[cfg(any(
+    test,
+    all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )
+))]
 pub(crate) const SECRET_SERVICE_TARGET: &str = "whitenoise";
 
+#[cfg(any(
+    test,
+    all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )
+))]
 pub(crate) struct TargetedCredentialStore {
     inner: Arc<CredentialStore>,
     target: &'static str,
 }
 
+#[cfg(any(
+    test,
+    all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )
+))]
 impl TargetedCredentialStore {
     pub(crate) fn new(inner: Arc<CredentialStore>, target: &'static str) -> Arc<Self> {
         Arc::new(Self { inner, target })
@@ -28,6 +70,20 @@ impl TargetedCredentialStore {
     }
 }
 
+#[cfg(any(
+    test,
+    all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )
+))]
 impl fmt::Debug for TargetedCredentialStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TargetedCredentialStore")
@@ -37,6 +93,20 @@ impl fmt::Debug for TargetedCredentialStore {
     }
 }
 
+#[cfg(any(
+    test,
+    all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )
+))]
 impl CredentialStoreApi for TargetedCredentialStore {
     fn vendor(&self) -> String {
         self.inner.vendor()

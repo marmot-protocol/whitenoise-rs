@@ -651,6 +651,14 @@ impl Whitenoise {
         }
     }
 
+    #[cfg(any(
+        test,
+        feature = "integration-tests",
+        feature = "benchmark-tests",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "windows"
+    ))]
     fn set_default_keyring_store<S>(
         store: keyring_core::Result<Arc<S>>,
         store_name: &str,
