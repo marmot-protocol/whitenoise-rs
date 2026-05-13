@@ -76,6 +76,7 @@ scenario_registry! {
     "app-settings" => AppSettingsScenario,
     "drafts" => DraftsScenario,
     "metadata-management" => MetadataManagementScenario,
+    "mute-list" => MuteListScenario,
     "basic-messaging" => BasicMessagingScenario,
     "follow-management" => FollowManagementScenario,
     "subscription-processing" => SubscriptionProcessingScenario,
