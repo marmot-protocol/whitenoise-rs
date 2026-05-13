@@ -6,7 +6,7 @@ use crate::types::MessageWithTokens;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
-use crate::whitenoise::database::{Database, retry_on_lock};
+use crate::whitenoise::database::{Database, DatabaseError, retry_on_lock};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::message_aggregator::processor::{
     extract_deletion_target_ids, extract_reaction_target_id,
@@ -637,7 +637,7 @@ async fn cascade_reaction_failure(
         }
     };
 
-    let result = retry_on_lock(|| async {
+    let result: std::result::Result<Option<ChatMessage>, DatabaseError> = retry_on_lock(|| async {
         let Some(mut parent) =
             AggregatedMessage::find_by_id(&target_id, group_id, author, database).await?
         else {

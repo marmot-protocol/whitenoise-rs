@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
-    database::processed_events::ProcessedEvent,
+    database::{processed_events::ProcessedEvent, retry_on_lock},
     error::{Result, WhitenoiseError},
     session::AccountSession,
     utils::timestamp_to_datetime,
@@ -39,9 +39,10 @@ impl Whitenoise {
         }
 
         let contacts = crate::nostr_manager::utils::pubkeys_from_event(&event);
-        let newly_created = account
-            .update_follows_from_event(contacts.clone(), session, &self.shared.database)
-            .await?;
+        let newly_created = retry_on_lock(|| {
+            account.update_follows_from_event(contacts.clone(), session, &self.shared.database)
+        })
+        .await?;
 
         self.schedule_background_user_fetch(session, &contacts)
             .await;
@@ -554,6 +555,77 @@ mod tests {
         assert_eq!(follows2.len(), 1);
         assert_eq!(follows1[0].pubkey, contact1);
         assert_eq!(follows2[0].pubkey, contact2);
+    }
+
+    /// Locks in the "minimum-writes" guarantee that the contention fix
+    /// introduced: `update_follows_from_event` must INSERT into the shared
+    /// `users` table exactly once per new contact and zero times when
+    /// re-ingesting a contact set whose pubkeys are already known. Without
+    /// this guarantee, the loop could regress to an N-write storm under
+    /// `ON CONFLICT DO UPDATE` semantics.
+    #[tokio::test]
+    async fn test_handle_contact_list_writes_only_for_unknown_contacts() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let keys = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        let baseline_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&whitenoise.shared.database.pool)
+            .await
+            .unwrap();
+
+        let contact1 = Keys::generate().public_key();
+        let contact2 = Keys::generate().public_key();
+        let initial = build_contact_list_event(
+            &keys,
+            &[contact1, contact2],
+            Some(Timestamp::from(1_700_000_000)),
+        )
+        .await;
+        whitenoise
+            .handle_contact_list(&session, &account, initial)
+            .await
+            .unwrap();
+        // handle_contact_list spawns a discovery catch-up task that can
+        // surface metadata events and write `users` rows. Draining the
+        // spawn registry first keeps the COUNT(*) assertion deterministic.
+        whitenoise.wait_for_pending_background_tasks().await;
+
+        let users_after_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&whitenoise.shared.database.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            users_after_first - baseline_users,
+            2,
+            "ingesting 2 unknown contacts must create exactly 2 user rows"
+        );
+
+        let same_contacts_newer = build_contact_list_event(
+            &keys,
+            &[contact1, contact2],
+            Some(Timestamp::from(1_700_000_100)),
+        )
+        .await;
+        whitenoise
+            .handle_contact_list(&session, &account, same_contacts_newer)
+            .await
+            .unwrap();
+        whitenoise.wait_for_pending_background_tasks().await;
+
+        let users_after_reingest: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&whitenoise.shared.database.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            users_after_reingest, users_after_first,
+            "re-ingesting the same contact set must not create any new user rows"
+        );
     }
 
     /// Verifies the cross-account write guard: passing an `Account` whose

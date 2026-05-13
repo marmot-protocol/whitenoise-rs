@@ -233,14 +233,25 @@ impl Account {
             .collect();
         let contacts_len = unique_contacts.len();
 
-        // Resolve / create user rows in the shared DB so we can return the
-        // newly-created subset for downstream metadata fetches. Done outside
-        // the per-account transaction; idempotent on retry.
-        let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
+        // Pre-filter against the shared `users` table in one batched read so
+        // the per-contact upsert only fires for genuinely new pubkeys. This
+        // shrinks the shared-DB write window from "the entire contact-list
+        // loop inside one transaction" to "one INSERT statement per unknown
+        // contact", which the WAL writer lock now releases between
+        // iterations. The function remains idempotent on retry.
+        let known: HashSet<PublicKey> = User::find_by_pubkeys(&unique_contacts, database)
+            .await?
+            .into_iter()
+            .map(|user| user.pubkey)
+            .collect();
+
         let mut newly_created_users = Vec::new();
         for pubkey in &unique_contacts {
-            let (_user, newly_created) = User::find_or_create_by_pubkey_tx(pubkey, &mut tx).await?;
-            if newly_created {
+            if known.contains(pubkey) {
+                continue;
+            }
+            let (_user, was_new) = User::find_or_create_by_pubkey(pubkey, database).await?;
+            if was_new {
                 newly_created_users.push(*pubkey);
                 tracing::debug!(
                     target: "whitenoise::database::accounts",
@@ -249,7 +260,6 @@ impl Account {
                 );
             }
         }
-        tx.commit().await.map_err(DatabaseError::Sqlx)?;
 
         // Replace the per-account follow set in one transaction.
         session.repos.follows.replace_all(&unique_contacts).await?;
