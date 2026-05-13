@@ -3417,4 +3417,47 @@ mod tests {
         assert!(!result.is_archived());
         assert!(result.archived_at.is_none());
     }
+
+    /// `clear_chat` does a best-effort draft deletion for the group
+    /// (`session/membership.rs:407-413`). The existing `test_clear_chat_*`
+    /// suite covers the timestamp + aggregated-message side effects but
+    /// nothing exercises the draft delete — a regression that removed the
+    /// `drafts.delete(group_id)` call would slip past.
+    #[tokio::test]
+    async fn test_clear_chat_deletes_draft_for_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[145; 32]);
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        // Stamp a draft for the group.
+        session
+            .drafts()
+            .save(&group_id, "wip", None, &[])
+            .await
+            .unwrap();
+        assert!(
+            session.drafts().load(&group_id).await.unwrap().is_some(),
+            "draft must exist before clear_chat"
+        );
+
+        session
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
+            .unwrap();
+
+        assert!(
+            session.drafts().load(&group_id).await.unwrap().is_none(),
+            "clear_chat must delete the draft for the group"
+        );
+    }
 }
