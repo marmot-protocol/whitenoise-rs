@@ -51,4 +51,19 @@ if command -v cargo >/dev/null 2>&1; then
         echo "warning: cargo fmt failed on rust_lib_whitenoise; check above output." >&2
 fi
 
+# Vendor the wrapper crate so cargokit (driven by ${STAGING}/{linux,android,...}
+# CMakeLists / build.gradle) compiles the freshly generated frb_generated.rs.
+# Without this, the .so embeds a stale content hash from the last CI vendor
+# while the Dart side has the new hash, producing a runtime
+# "Content hash on Dart side ... is different from Rust side" mismatch.
+#
+# Locally we keep `whitenoise = { path = "../.." }` — from ${STAGING}/rust/
+# that resolves to the master worktree root where the `whitenoise` crate
+# lives. CI rewrites this dep to a git rev because the orphan branch it
+# pushes has no shared history with master.
+echo "Vendoring wrapper crate into ${STAGING}/rust/..."
+rm -rf "${STAGING}/rust"
+mkdir -p "${STAGING}/rust"
+cp -r crates/whitenoise-frb/. "${STAGING}/rust/"
+
 echo "Done. Inspect changes with: git -C ${STAGING} diff"
