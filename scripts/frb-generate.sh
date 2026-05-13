@@ -47,8 +47,7 @@ fi
 
 if command -v cargo >/dev/null 2>&1; then
     echo "Formatting generated Rust file..."
-    cargo fmt --package rust_lib_whitenoise || \
-        echo "warning: cargo fmt failed on rust_lib_whitenoise; check above output." >&2
+    cargo fmt --package rust_lib_whitenoise
 fi
 
 # Vendor the wrapper crate so cargokit (driven by ${STAGING}/{linux,android,...}
