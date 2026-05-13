@@ -395,8 +395,9 @@ update:
 # - RUSTSEC-2024-0384: instant unmaintained (transitive via rust-nostr, low risk)
 # - RUSTSEC-2026-0002: lru unsound (transitive via nostr-sdk, awaiting upstream fix)
 # - RUSTSEC-2026-0037: quinn-proto DoS via malformed QUIC handshake (transitive via nostr-blossom → reqwest → quinn; awaiting upstream fix)
+# - RUSTSEC-2026-0124: libcrux-chacha20poly1305 panic (transitive optional hpke-rs libcrux backend; not selected by our all-features/all-targets graph, awaiting upstream fix)
 audit:
-    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0037
+    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0037 --ignore RUSTSEC-2026-0124
 
 # Generate and open documentation
 doc:
