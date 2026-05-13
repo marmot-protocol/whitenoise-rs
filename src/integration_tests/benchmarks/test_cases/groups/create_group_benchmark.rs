@@ -64,6 +64,7 @@ impl BenchmarkTestCase for CreateGroupBenchmark {
             None,
             context.test_relays(),
             admin_pubkeys,
+            None,
         );
 
         // Time only the create_group call

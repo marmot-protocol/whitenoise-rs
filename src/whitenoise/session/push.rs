@@ -19,9 +19,9 @@ use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::push_notifications::{
-    PushPlatform, PushRegistration, TOKEN_REQUEST_COOLDOWN, TokenRateKind,
-    is_push_group_message_kind, publish_push_group_message_with, respond_to_token_request_with,
-    validate_raw_token,
+    GroupPushDebugInfo, GroupPushTokenDebugEntry, LocalPushRegistrationDebugInfo, PushPlatform,
+    PushRegistration, TOKEN_REQUEST_COOLDOWN, TokenRateKind, is_push_group_message_kind,
+    publish_push_group_message_with, respond_to_token_request_with, validate_raw_token,
 };
 
 /// Maximum number of groups to publish push token events to concurrently.
@@ -131,21 +131,72 @@ impl<'a> PushOps<'a> {
 
     /// Returns a non-sensitive summary of cached push-token state for a group.
     #[perf_instrument("push_notifications")]
-    pub async fn get_group_debug_info(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<crate::whitenoise::push_notifications::GroupPushDebugInfo> {
+    pub async fn get_group_debug_info(&self, group_id: &GroupId) -> Result<GroupPushDebugInfo> {
         let cached_tokens = self
             .session
             .repos
             .group_push_tokens
             .find_by_group(group_id)
             .await?;
+        let active_leaf_map = self
+            .session
+            .mdk
+            .group_leaf_map(group_id)
+            .unwrap_or_default();
+        let local_leaf_index = self.session.mdk.own_leaf_index(group_id).ok();
+        let notifications_enabled = self.session.repos.settings.notifications_enabled().await?;
+        let registration = self.registration().await?;
+        let shareable = registration
+            .as_ref()
+            .map(PushRegistration::token_tag)
+            .transpose()?
+            .flatten()
+            .is_some();
+        let local_token_cached = local_leaf_index.is_some_and(|leaf_index| {
+            cached_tokens.iter().any(|token| {
+                token.leaf_index == leaf_index && token.member_pubkey == self.session.account_pubkey
+            })
+        });
         let last_token_list_updated_at = cached_tokens.iter().map(|token| token.updated_at).max();
 
-        Ok(crate::whitenoise::push_notifications::GroupPushDebugInfo {
+        let tokens: Vec<GroupPushTokenDebugEntry> = cached_tokens
+            .iter()
+            .map(|token| {
+                let active_member_pubkey = active_leaf_map.get(&token.leaf_index);
+                GroupPushTokenDebugEntry {
+                    member_pubkey: token.member_pubkey,
+                    leaf_index: token.leaf_index,
+                    server_pubkey: token.server_pubkey,
+                    has_relay_hint: token.relay_hint.is_some(),
+                    active_leaf: active_member_pubkey.is_some(),
+                    member_matches_active_leaf: active_member_pubkey
+                        .is_some_and(|pubkey| pubkey == &token.member_pubkey),
+                    is_local_member: token.member_pubkey == self.session.account_pubkey,
+                    updated_at: token.updated_at,
+                }
+            })
+            .collect();
+        let active_token_count = tokens
+            .iter()
+            .filter(|token| token.active_leaf && token.member_matches_active_leaf)
+            .count();
+        let stale_token_count = tokens.len() - active_token_count;
+        let missing_relay_hint_count = tokens.iter().filter(|token| !token.has_relay_hint).count();
+
+        Ok(GroupPushDebugInfo {
             total_token_count: cached_tokens.len(),
+            active_token_count,
+            stale_token_count,
+            missing_relay_hint_count,
             last_token_list_updated_at,
+            local_registration: LocalPushRegistrationDebugInfo {
+                registered: registration.is_some(),
+                shareable,
+                notifications_enabled,
+                local_leaf_index,
+                local_token_cached,
+            },
+            tokens,
         })
     }
 
@@ -173,6 +224,15 @@ impl<'a> PushOps<'a> {
                     )
                 })?;
 
+                let request_event_id = message.event.id;
+                self.merge_token_request(
+                    &message.mls_group_id,
+                    message.event.pubkey,
+                    leaf_index,
+                    request,
+                )
+                .await?;
+
                 if !self.check_token_request_rate(
                     &message.mls_group_id,
                     leaf_index,
@@ -187,15 +247,7 @@ impl<'a> PushOps<'a> {
                     return Ok(true);
                 }
 
-                self.merge_token_request(
-                    &message.mls_group_id,
-                    message.event.pubkey,
-                    leaf_index,
-                    request,
-                )
-                .await?;
-
-                if let Some(request_event_id) = message.event.id {
+                if let Some(request_event_id) = request_event_id {
                     self.session.schedule_pending_token_response(
                         message.mls_group_id.clone(),
                         request_event_id,
