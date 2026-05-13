@@ -3290,4 +3290,131 @@ mod tests {
         assert!(!ag.is_message_visible(cleared_at));
         assert!(ag.is_message_visible(after));
     }
+
+    // ── MembershipOpsForGroup column-flip tests ──────────────────────────────
+    //
+    // These exercise the wrapper's column-flip logic without spinning up a
+    // real MLS group. The chat-list emission side effect is covered by the
+    // full-stack tests in `chat_list.rs` (which DO create a real group via
+    // `create_group(...)` and assert stream frames). These cheaper tests
+    // verify only the DB write contract: idempotency short-circuit and
+    // correct column state on transition.
+
+    #[tokio::test]
+    async fn test_archive_sets_archived_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[120; 32]);
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        let archived = session
+            .membership()
+            .for_group(&group_id)
+            .archive()
+            .await
+            .unwrap();
+
+        assert!(archived.is_archived());
+        assert!(archived.archived_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_archive_is_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[121; 32]);
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        let first = session
+            .membership()
+            .for_group(&group_id)
+            .archive()
+            .await
+            .unwrap();
+        let second = session
+            .membership()
+            .for_group(&group_id)
+            .archive()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.archived_at, second.archived_at,
+            "second archive must no-op and preserve the original timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unarchive_clears_archived_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[122; 32]);
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        session
+            .membership()
+            .for_group(&group_id)
+            .archive()
+            .await
+            .unwrap();
+
+        let unarchived = session
+            .membership()
+            .for_group(&group_id)
+            .unarchive()
+            .await
+            .unwrap();
+
+        assert!(!unarchived.is_archived());
+        assert!(unarchived.archived_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unarchive_on_unarchived_chat_is_no_op() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[123; 32]);
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        // No archive first — unarchive must no-op (no mutation, no error). The
+        // function still does a DB read via `require_account_group`; the early
+        // return only avoids the mutation, not the read.
+        let result = session
+            .membership()
+            .for_group(&group_id)
+            .unarchive()
+            .await
+            .unwrap();
+
+        assert!(!result.is_archived());
+        assert!(result.archived_at.is_none());
+    }
 }
