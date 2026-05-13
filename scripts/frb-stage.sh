@@ -9,7 +9,22 @@ STAGING=".frb-staging"
 BRANCH="flutter-package"
 
 if [[ -d "${STAGING}/.git" || -f "${STAGING}/.git" ]]; then
-    echo "✓ ${STAGING}/ already exists as a worktree."
+    # Refuse to touch ${STAGING}/ unless it's actually a worktree of the
+    # ${BRANCH} branch — a misplaced clone or wrong-branch worktree must not
+    # be silently fast-forwarded or hard-reset.
+    current_branch=$(git -C "${STAGING}" symbolic-ref --short HEAD 2>/dev/null || echo "")
+    if [[ "${current_branch}" != "${BRANCH}" ]]; then
+        echo "✗ ${STAGING}/ exists but is not on '${BRANCH}'." >&2
+        if [[ -z "${current_branch}" ]]; then
+            echo "  HEAD is detached or not a symbolic ref." >&2
+        else
+            echo "  Currently on: '${current_branch}'" >&2
+        fi
+        echo "  Move or delete ${STAGING}/ manually, then re-run." >&2
+        exit 1
+    fi
+
+    echo "✓ ${STAGING}/ already exists as a worktree of '${BRANCH}'."
     echo "  Refreshing from origin..."
     git -C "${STAGING}" fetch --quiet origin "${BRANCH}" || true
     if git -C "${STAGING}" rev-parse "@{upstream}" >/dev/null 2>&1; then

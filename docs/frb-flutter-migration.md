@@ -14,29 +14,33 @@ dedicated `flutter-package` orphan branch (no shared history with master). CI
 regenerates and updates that branch on every codeowner push to `master`. The
 Flutter app consumes the orphan branch as a normal git dependency.
 
-```text
-┌──────────────────────────────────┐  push to master   ┌─────────────────────┐
-│ whitenoise-rs/master             │ ────────────────► │ frb-codegen.yml     │
-│  crates/whitenoise-frb/  (wrap)  │                   │  - clone orphan     │
-│  flutter_rust_bridge.yaml        │                   │  - codegen → orphan │
-│  scripts/, workflow              │                   │  - vendor wrapper   │
-│  (no flutter-package/)           │                   │  - push orphan      │
-└──────────────────────────────────┘                   └─────────────────────┘
-                                                                  │
-                                                                  ▼
-                                                  ┌──────────────────────────┐
-                                                  │ whitenoise-rs            │
-                                                  │  flutter-package (orphan)│
-                                                  │   pubspec, cargokit,     │
-                                                  │   lib/src/rust/, rust/   │
-                                                  └──────────────────────────┘
-                                                                  │
-                                                                  ▼
-                                                  ┌──────────────────────────┐
-                                                  │ marmot-protocol/whitenoise│
-                                                  │  pubspec.yaml git dep on │
-                                                  │  flutter-package branch  │
-                                                  └──────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph master["whitenoise-rs / master (Rust-only)"]
+        wrap["crates/whitenoise-frb/<br/>(wrapper crate)"]
+        cfg["flutter_rust_bridge.yaml"]
+        scripts["scripts/, workflow"]
+    end
+
+    subgraph ci["frb-codegen.yml (CI)"]
+        s1["clone flutter-package<br/>orphan branch"]
+        s2["run codegen<br/>(dart bindings)"]
+        s3["vendor wrapper crate<br/>(rewrite path dep → git rev)"]
+        s4["force-push orphan branch<br/>(only if changed)"]
+        s1 --> s2 --> s3 --> s4
+    end
+
+    subgraph orphan["whitenoise-rs / flutter-package (orphan branch)"]
+        pkg["pubspec.yaml, cargokit/<br/>lib/src/rust/*.dart<br/>rust/ (vendored wrapper)"]
+    end
+
+    subgraph app["marmot-protocol/whitenoise (Flutter app)"]
+        dep["pubspec.yaml<br/>rust_lib_whitenoise:<br/>git ref: flutter-package"]
+    end
+
+    master -- "codeowner push" --> ci
+    ci -- "force-push" --> orphan
+    orphan -- "flutter pub get<br/>(git dep)" --> app
 ```
 
 ## Where things live
