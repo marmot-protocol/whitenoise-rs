@@ -1034,7 +1034,10 @@ impl AggregatedMessage {
         Ok(())
     }
 
-    /// Mark a message or reaction as deleted
+    /// Mark a message or reaction as deleted when its author matches `target_author`.
+    ///
+    /// The author predicate enforces deletion ownership. If the cached target's
+    /// author differs, this is a no-op.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn mark_deleted(
         message_id: &str,
@@ -1056,6 +1059,25 @@ impl AggregatedMessage {
         .await?;
 
         Ok(())
+    }
+
+    /// Return targets marked deleted by a specific deletion event.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn find_deleted_target_ids_by_deletion_event_id(
+        deletion_event_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+    ) -> Result<Vec<String>> {
+        let target_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT message_id FROM aggregated_messages
+             WHERE deletion_event_id = ? AND mls_group_id = ? AND kind IN (7, 9)",
+        )
+        .bind(deletion_event_id)
+        .bind(group_id.as_slice())
+        .fetch_all(&database.pool)
+        .await?;
+
+        Ok(target_ids)
     }
 
     /// Reverse a deletion by clearing `deletion_event_id` for targets of a specific deletion.
@@ -1604,20 +1626,23 @@ impl AggregatedMessage {
             .collect())
     }
 
-    /// Find orphaned deletions targeting a specific message.
-    /// Returns deletions (kind 5) that reference the target `message_id`.
-    /// Callers must check `author` before applying — only deletions whose
-    /// author matches the target's author are valid.
+    /// Find authorized orphaned deletions targeting a specific message.
+    ///
+    /// An orphaned deletion is a cached kind-5 deletion whose target message had
+    /// not arrived yet. The `target_author` filter leaves cross-author deletion
+    /// events in the cache as audit records without replaying them.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_orphaned_deletions(
         message_id: &str,
         group_id: &GroupId,
+        target_author: &PublicKey,
         database: &Database,
     ) -> Result<Vec<AggregatedMessage>> {
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
             "SELECT * FROM aggregated_messages am
              WHERE am.kind = 5
                AND am.mls_group_id = ?
+               AND am.author = ?
                AND EXISTS (
                  SELECT 1 FROM json_each(am.tags) AS tag
                  WHERE json_extract(tag.value, '$[0]') = 'e'
@@ -1625,6 +1650,7 @@ impl AggregatedMessage {
                )",
         )
         .bind(group_id.as_slice())
+        .bind(target_author.to_hex())
         .bind(message_id)
         .fetch_all(&database.pool)
         .await
@@ -1956,6 +1982,52 @@ mod tests {
         assert_eq!(count_after, 1);
 
         // But the message should have deletion_event_id set
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].is_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_mark_deleted_requires_matching_author() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[213; 32]);
+
+        let author = Keys::generate().public_key();
+        let other_author = Keys::generate().public_key();
+        let message = create_test_chat_message(213, author);
+        AggregatedMessage::insert_message(&message, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+
+        let wrong_deletion_event_id = format!("{:0>64x}", 0xde1213u64);
+        AggregatedMessage::mark_deleted(
+            &message.id,
+            &group_id,
+            &wrong_deletion_event_id,
+            &other_author,
+            db,
+        )
+        .await
+        .unwrap();
+
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].is_deleted);
+
+        let deletion_event_id = format!("{:0>64x}", 0xde1214u64);
+        AggregatedMessage::mark_deleted(&message.id, &group_id, &deletion_event_id, &author, db)
+            .await
+            .unwrap();
+
         let messages =
             AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
                 .await
@@ -3040,6 +3112,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(orphans.len(), 0, "Deleted reaction should be excluded");
+    }
+
+    #[tokio::test]
+    async fn test_find_orphaned_deletions_filters_author_mismatch() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[187; 32]);
+
+        let target_author = Keys::generate().public_key();
+        let other_author = Keys::generate().public_key();
+        let parent_id = format!("{:0>64x}", 0xba187u64);
+        let authorized_deletion_id = format!("{:0>64x}", 0xde187u64);
+        let unauthorized_deletion_id = format!("{:0>64x}", 0xde188u64);
+        let tags_json = serde_json::to_string(&vec![vec!["e", &parent_id]]).unwrap();
+        let empty_tokens = serde_json::to_string(&Vec::<SerializableToken>::new()).unwrap();
+        let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
+        let empty_media = serde_json::to_string(&Vec::<MediaFile>::new()).unwrap();
+
+        for (deletion_id, author) in [
+            (&authorized_deletion_id, &target_author),
+            (&unauthorized_deletion_id, &other_author),
+        ] {
+            sqlx::query(
+                "INSERT INTO aggregated_messages
+                 (message_id, mls_group_id, author, created_at, kind, content, tags,
+                  content_tokens, reactions, media_attachments)
+                 VALUES (?, ?, ?, ?, 5, '', ?, ?, ?, ?)",
+            )
+            .bind(deletion_id)
+            .bind(group_id.as_slice())
+            .bind(author.to_hex())
+            .bind(1000i64)
+            .bind(&tags_json)
+            .bind(&empty_tokens)
+            .bind(&empty_reactions)
+            .bind(&empty_media)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let orphans =
+            AggregatedMessage::find_orphaned_deletions(&parent_id, &group_id, &target_author, db)
+                .await
+                .unwrap();
+
+        assert_eq!(orphans.len(), 1, "Only same-author deletion should replay");
+        assert_eq!(orphans[0].event_id.to_string(), authorized_deletion_id);
+        assert_eq!(orphans[0].author, target_author);
     }
 
     #[tokio::test]

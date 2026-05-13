@@ -255,29 +255,28 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<()> {
+        // Capture the pre-deletion last message so authorized deletes can emit
+        // LastMessageDeleted after cache_deletion mutates the target row.
         let last_message_id = self.get_last_message_id(account_pubkey, group_id).await;
-
-        for (trigger, msg) in self
+        let updates = self
             .cache_deletion(account_pubkey, group_id, message)
-            .await?
-        {
+            .await?;
+        let deleted_last_message = last_message_id.as_ref().is_some_and(|last_message_id| {
+            updates.iter().any(|(trigger, msg)| {
+                matches!(trigger, UpdateTrigger::MessageDeleted) && &msg.id == last_message_id
+            })
+        });
+
+        for (trigger, msg) in updates {
             self.emit_message_update(group_id, trigger, msg);
         }
 
-        // Check if the deleted message was the last message.
-        // This check must happen AFTER get_last_message_id but the
-        // result is only valid for the FIRST handler (before cache_deletion
-        // modifies shared state). We emit for ALL subscribed accounts because
-        // subsequent handlers will see incorrect post-deletion state.
-        if let Some(last_message_id) = last_message_id {
-            let deleted_ids = extract_deletion_target_ids(&message.tags);
-            if deleted_ids.contains(&last_message_id) {
-                self.emit_chat_list_update_for_group(
-                    group_id,
-                    ChatListUpdateTrigger::LastMessageDeleted,
-                )
-                .await;
-            }
+        if deleted_last_message {
+            self.emit_chat_list_update_for_group(
+                group_id,
+                ChatListUpdateTrigger::LastMessageDeleted,
+            )
+            .await;
         }
 
         Ok(())
@@ -787,7 +786,7 @@ impl Whitenoise {
                     target: "whitenoise::cache",
                     deletion_author = %deletion_author.to_hex(),
                     target_author = %reaction.author.to_hex(),
-                    target_id = target_id,
+                    target_id = %target_id,
                     "Ignoring deletion whose author does not match reaction author"
                 );
                 return Ok(None);
@@ -821,7 +820,7 @@ impl Whitenoise {
                     target: "whitenoise::cache",
                     deletion_author = %deletion_author.to_hex(),
                     target_author = %msg.author.to_hex(),
-                    target_id = target_id,
+                    target_id = %target_id,
                     "Ignoring deletion whose author does not match message author"
                 );
                 return Ok(None);
@@ -915,6 +914,7 @@ impl Whitenoise {
         let orphaned_deletions = AggregatedMessage::find_orphaned_deletions(
             &message.id,
             group_id,
+            &message.author,
             &session.account_db.inner,
         )
         .await?;
@@ -967,30 +967,21 @@ impl Whitenoise {
             .await?;
         }
 
-        // Apply orphaned deletions, but only those whose author matches the
-        // target message author. Cross-author deletions never legitimately
-        // apply and would let a malicious peer wipe other members' content.
+        // Apply orphaned deletions through the same path used for live deletes.
+        // `find_orphaned_deletions` has already filtered to matching authors.
         for deletion in orphaned_deletions {
-            if deletion.author != message.author {
-                tracing::warn!(
-                    target: "whitenoise::cache",
-                    deletion_author = %deletion.author.to_hex(),
-                    target_author = %message.author.to_hex(),
-                    target_id = %message.id,
-                    "Ignoring orphaned deletion whose author does not match message author"
-                );
-                continue;
+            if let Some((UpdateTrigger::MessageDeleted, deleted_message)) = self
+                .apply_single_deletion(
+                    account_pubkey,
+                    &deletion.author,
+                    &message.id,
+                    &deletion.event_id,
+                    group_id,
+                )
+                .await?
+            {
+                message = deleted_message;
             }
-
-            message.is_deleted = true;
-            AggregatedMessage::mark_deleted(
-                &message.id,
-                group_id,
-                &deletion.event_id.to_string(),
-                &deletion.author,
-                &session.account_db.inner,
-            )
-            .await?;
         }
 
         Ok(message)
@@ -1209,6 +1200,234 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(cached_msg.is_deleted, "Message should be marked as deleted");
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_rejects_cross_author_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let mut message_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Protected admin message".to_string(),
+        );
+        message_inner.ensure_id();
+        let message_id = message_inner.id.unwrap();
+        let message_event = admin_mdk
+            .create_message(&group_id, message_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .await
+            .unwrap();
+
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let mut deletion_inner = UnsignedEvent::new(
+            member_account.pubkey,
+            Timestamp::now(),
+            Kind::EventDeletion,
+            vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
+            String::new(),
+        );
+        deletion_inner.ensure_id();
+        let deletion_event = member_mdk
+            .create_message(&group_id, deletion_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .await
+            .unwrap();
+
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            &group_id,
+            &admin_account.pubkey,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!cached_msg.is_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_rejects_cross_author_orphaned_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let mut message_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Late protected admin message".to_string(),
+        );
+        message_inner.ensure_id();
+        let future_message_id = message_inner.id.unwrap();
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+
+        let mut deletion_inner = UnsignedEvent::new(
+            member_account.pubkey,
+            Timestamp::now(),
+            Kind::EventDeletion,
+            vec![Tag::parse(vec!["e", &future_message_id.to_string()]).unwrap()],
+            String::new(),
+        );
+        deletion_inner.ensure_id();
+        let deletion_event = member_mdk
+            .create_message(&group_id, deletion_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .await
+            .unwrap();
+
+        let message_event = admin_mdk
+            .create_message(&group_id, message_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .await
+            .unwrap();
+
+        let cached_msg = AggregatedMessage::find_by_id(
+            &future_message_id.to_string(),
+            &group_id,
+            &admin_account.pubkey,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!cached_msg.is_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_rejects_cross_author_reaction_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let mut message_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Reaction parent".to_string(),
+        );
+        message_inner.ensure_id();
+        let message_id = message_inner.id.unwrap();
+        let message_event = admin_mdk
+            .create_message(&group_id, message_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .await
+            .unwrap();
+
+        let mut reaction_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Reaction,
+            vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
+            "+".to_string(),
+        );
+        reaction_inner.ensure_id();
+        let reaction_id = reaction_inner.id.unwrap();
+        let reaction_event = admin_mdk
+            .create_message(&group_id, reaction_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, reaction_event)
+            .await
+            .unwrap();
+
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let mut deletion_inner = UnsignedEvent::new(
+            member_account.pubkey,
+            Timestamp::now(),
+            Kind::EventDeletion,
+            vec![Tag::parse(vec!["e", &reaction_id.to_string()]).unwrap()],
+            String::new(),
+        );
+        deletion_inner.ensure_id();
+        let deletion_event = member_mdk
+            .create_message(&group_id, deletion_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .await
+            .unwrap();
+
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            &group_id,
+            &admin_account.pubkey,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let total_reactions: usize = cached_msg
+            .reactions
+            .by_emoji
+            .values()
+            .map(|reaction| reaction.count)
+            .sum();
+        assert_eq!(total_reactions, 1);
+
+        let cached_reaction = AggregatedMessage::find_reaction_by_id(
+            &reaction_id.to_string(),
+            &group_id,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap();
+        assert!(cached_reaction.is_some());
     }
 
     #[tokio::test]

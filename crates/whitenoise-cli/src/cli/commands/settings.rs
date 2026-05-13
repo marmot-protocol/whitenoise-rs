@@ -19,7 +19,7 @@ pub enum SettingsCmd {
 
     /// Set the language
     Language {
-        /// Language: system, en, es, fr, de, it, pt, ru, tr
+        /// Language: system, en, zh, zh_Hans, zh_Hant, es, fr, de, it, pt, ru, tr
         lang: String,
     },
 }
@@ -53,4 +53,21 @@ async fn language(socket: &Path, json: bool, lang: &str) -> crate::cli::Result<(
     )
     .await?;
     output::print_and_exit(&resp, json)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Command;
+
+    use super::*;
+
+    #[test]
+    fn language_help_lists_chinese_locale_aliases() {
+        let mut command = SettingsCmd::augment_subcommands(Command::new("settings"));
+        let language = command.find_subcommand_mut("language").unwrap();
+        let help = language.render_long_help().to_string();
+
+        assert!(help.contains("zh_Hans"));
+        assert!(help.contains("zh_Hant"));
+    }
 }
