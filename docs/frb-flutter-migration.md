@@ -14,7 +14,7 @@ dedicated `flutter-package` orphan branch (no shared history with master). CI
 regenerates and updates that branch on every codeowner push to `master`. The
 Flutter app consumes the orphan branch as a normal git dependency.
 
-```
+```text
 ┌──────────────────────────────────┐  push to master   ┌─────────────────────┐
 │ whitenoise-rs/master             │ ────────────────► │ frb-codegen.yml     │
 │  crates/whitenoise-frb/  (wrap)  │                   │  - clone orphan     │

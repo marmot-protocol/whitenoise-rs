@@ -95,10 +95,8 @@ impl TryFrom<MediaFile> for WhitenoiseMediaFile {
             encrypted_file_hash: hex::decode(&mf.encrypted_file_hash)?,
             mime_type: mf.mime_type,
             media_type: mf.media_type,
-            // Not exposed in the bridge type; the canonical values live
-            // in the media_files table and are unaffected by this snapshot.
-            nonce: None,
-            scheme_version: None,
+            nonce: mf.nonce,
+            scheme_version: mf.scheme_version,
             blossom_url: if mf.blossom_url.is_empty() {
                 None
             } else {
