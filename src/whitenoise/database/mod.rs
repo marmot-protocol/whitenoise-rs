@@ -89,6 +89,19 @@ impl DatabaseError {
     }
 }
 
+/// Trait implemented by error types that can identify a transient SQLite
+/// lock error. Lets [`retry_on_lock`] work uniformly for `DatabaseError` and
+/// higher-level wrappers like `WhitenoiseError`.
+pub(crate) trait IsLockError {
+    fn is_lock_error(&self) -> bool;
+}
+
+impl IsLockError for DatabaseError {
+    fn is_lock_error(&self) -> bool {
+        self.is_sqlite_lock_error()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Database {
     pub pool: SqlitePool,
@@ -397,10 +410,15 @@ impl Database {
 ///
 /// Uses linear backoff (100 ms × attempt) for up to 3 attempts.
 /// Returns on first success or first non-lock error.
-pub(crate) async fn retry_on_lock<F, Fut, T>(mut op: F) -> std::result::Result<T, DatabaseError>
+///
+/// Generic over the error type so the same helper covers both bare
+/// [`DatabaseError`] callers and handler-level callers returning
+/// [`crate::WhitenoiseError`].
+pub(crate) async fn retry_on_lock<F, Fut, T, E>(mut op: F) -> std::result::Result<T, E>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<T, DatabaseError>>,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: IsLockError,
 {
     const MAX_ATTEMPTS: u32 = 3;
     let mut attempt: u32 = 0;
@@ -409,7 +427,7 @@ where
         attempt += 1;
         match op().await {
             Ok(val) => return Ok(val),
-            Err(e) if e.is_sqlite_lock_error() && attempt < MAX_ATTEMPTS => {
+            Err(e) if e.is_lock_error() && attempt < MAX_ATTEMPTS => {
                 tracing::warn!(
                     target: "whitenoise::database",
                     "SQLite lock on attempt {attempt}/{MAX_ATTEMPTS}, \
@@ -1280,6 +1298,52 @@ mod tests {
             async move {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err::<(), _>(DatabaseError::Sqlx(sqlx::Error::RowNotFound))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Handler-level callers return [`WhitenoiseError`], not [`DatabaseError`].
+    /// The retry helper must classify a lock error reached through the
+    /// [`WhitenoiseError::Database`] variant the same way it does the bare
+    /// [`DatabaseError`].
+    #[tokio::test]
+    async fn test_retry_on_lock_retries_whitenoise_database_lock_error() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                let attempt = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(crate::WhitenoiseError::Database(make_lock_error("5")))
+                } else {
+                    Ok(7_i32)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A non-database [`WhitenoiseError`] must propagate without retrying so
+    /// that domain errors aren't masked by the retry loop.
+    #[tokio::test]
+    async fn test_retry_on_lock_no_retry_on_non_database_whitenoise_error() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(crate::WhitenoiseError::Initialization)
             }
         })
         .await;
