@@ -46,6 +46,7 @@ flowchart TD
 ## Where things live
 
 ### On `master` (Rust-only)
+
 | Concern | Path |
 |---|---|
 | FRB wrapper crate | `crates/whitenoise-frb/` |
@@ -55,6 +56,7 @@ flowchart TD
 | Local staging worktree | `.frb-staging/` (gitignored) |
 
 ### On `flutter-package` (orphan, no shared history)
+
 | Concern | Path |
 |---|---|
 | Pubspec | `pubspec.yaml` |
@@ -121,32 +123,32 @@ The `flutter-package` orphan branch must exist on `origin` before the
 workflow can update it. Bootstrap once:
 
 ```sh
-# 1. Create an empty orphan branch in a fresh worktree directory
-BOOTSTRAP_DIR=$(mktemp -d)
-git worktree add --orphan -b flutter-package "${BOOTSTRAP_DIR}"
+# 1. Create the orphan branch directly at the staging worktree path that
+#    flutter_rust_bridge.yaml's dart_output already targets. A branch can
+#    only be checked out in one worktree at a time, so reuse this one.
+git worktree add --orphan -b flutter-package .frb-staging
 
 # 2. Seed it with the package shape (pubspec, cargokit, platform dirs,
 #    LICENSE, README, .gitignore, analysis_options) — see the layout under
 #    "On flutter-package" above. The simplest source is to copy the files
-#    that whitenoise (Flutter app) currently has under rust_builder/, plus a
-#    fresh `lib/src/rust/` produced by running codegen.
+#    that whitenoise (Flutter app) currently has under rust_builder/.
 
 # 3. Vendor the wrapper crate
-cp -r crates/whitenoise-frb "${BOOTSTRAP_DIR}/rust"
+cp -r crates/whitenoise-frb .frb-staging/rust
 SHA=$(git rev-parse HEAD)
 sed -i "s#whitenoise = { path = \"../..\" }#whitenoise = { git = \"https://github.com/marmot-protocol/whitenoise-rs\", rev = \"${SHA}\" }#" \
-    "${BOOTSTRAP_DIR}/rust/Cargo.toml"
+    .frb-staging/rust/Cargo.toml
 
-# 4. Run codegen against the bootstrap (real worktree, not a symlink)
-git worktree add .frb-staging flutter-package  # already created above
+# 4. Run codegen into .frb-staging/lib/src/rust/
 just frb-generate
 
 # 5. Commit and push
-git -C "${BOOTSTRAP_DIR}" add -A
-git -C "${BOOTSTRAP_DIR}" -c user.email=frb-codegen-bot@marmot-protocol.org \
+git -C .frb-staging add -A
+git -C .frb-staging \
+    -c user.email=frb-codegen-bot@marmot-protocol.org \
     -c user.name="frb-codegen-bot" \
     commit -m "frb: bootstrap flutter-package from ${SHA}"
-git -C "${BOOTSTRAP_DIR}" push origin flutter-package
+git -C .frb-staging push origin flutter-package
 ```
 
 After step 5, the workflow can take over.
