@@ -51,6 +51,13 @@ pub use whitenoise::users::{KeyPackageStatus, User};
 // Settings and configuration
 pub use whitenoise::account_settings::AccountSettings;
 pub use whitenoise::app_settings::{AppSettings, Language, ThemeMode};
+pub use whitenoise::product_analytics::{
+    AptabaseAnalyticsConfig, PRODUCT_ANALYTICS_CONSENT_VERSION, PRODUCT_ANALYTICS_SCHEMA_VERSION,
+    ProductAnalyticsBackend, ProductAnalyticsConfig, ProductAnalyticsDeviceClass,
+    ProductAnalyticsEvent, ProductAnalyticsEventName, ProductAnalyticsFlushStatus,
+    ProductAnalyticsNumberProp, ProductAnalyticsSettings, ProductAnalyticsStringProp,
+    ProductAnalyticsTrackStatus,
+};
 
 // Groups and relays
 pub use whitenoise::accounts_groups::{AccountGroup, MuteDuration};

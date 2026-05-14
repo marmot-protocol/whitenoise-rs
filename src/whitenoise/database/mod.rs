@@ -27,6 +27,7 @@ pub mod group_push_tokens;
 pub mod media_files;
 pub mod mute_list;
 pub mod processed_events;
+pub mod product_analytics;
 pub mod published_events;
 pub mod published_key_packages;
 pub mod push_registrations;

@@ -23,6 +23,7 @@ use crate::whitenoise::group_state_streaming::GroupStateStreamManager;
 use crate::whitenoise::message_aggregator::MessageAggregator;
 use crate::whitenoise::message_streaming::MessageStreamManager;
 use crate::whitenoise::notification_streaming::NotificationStreamManager;
+use crate::whitenoise::product_analytics::ProductAnalytics;
 use crate::whitenoise::secrets_store::SecretsStore;
 use crate::whitenoise::storage::Storage;
 use crate::whitenoise::user_streaming::UserStreamManager;
@@ -46,6 +47,7 @@ pub struct SharedServices {
     pub(crate) archived_chat_list_stream_manager: ChatListStreamManager,
     pub(crate) group_state_stream_manager: GroupStateStreamManager,
     pub(crate) notification_stream_manager: NotificationStreamManager,
+    pub(crate) product_analytics: ProductAnalytics,
     pub(crate) user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     pub(crate) external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
     pub(crate) discovery_sync_worker: DiscoverySyncWorker,
@@ -86,7 +88,7 @@ impl SharedServices {
         message_aggregator: MessageAggregator,
     ) -> Self {
         Self {
-            config,
+            config: config.clone(),
             database,
             relay_control,
             event_tracker,
@@ -99,6 +101,7 @@ impl SharedServices {
             archived_chat_list_stream_manager: ChatListStreamManager::default(),
             group_state_stream_manager: GroupStateStreamManager::default(),
             notification_stream_manager: NotificationStreamManager::default(),
+            product_analytics: ProductAnalytics::new(config.product_analytics_config.clone()),
             user_resolution_guards: DashMap::new(),
             external_signers: DashMap::new(),
             discovery_sync_worker: DiscoverySyncWorker::new(),
