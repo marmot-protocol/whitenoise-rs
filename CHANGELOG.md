@@ -290,6 +290,7 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 [#580]: https://github.com/marmot-protocol/whitenoise-rs/pull/580
 [#591]: https://github.com/marmot-protocol/whitenoise-rs/pull/591
 [#714]: https://github.com/marmot-protocol/whitenoise-rs/pull/714
+[#833]: https://github.com/marmot-protocol/whitenoise-rs/pull/833
 
 
 <!-- Tags -->
