@@ -186,7 +186,7 @@ impl ProductAnalytics {
 
     async fn purge_pending_events(&self) {
         if let Some(command_sender) = &self.command_sender
-            && command_sender.try_send(WorkerCommand::Purge).is_err()
+            && command_sender.send(WorkerCommand::Purge).await.is_err()
         {
             tracing::debug!(
                 target: "whitenoise::product_analytics",
@@ -633,21 +633,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabling_consent_drops_purge_when_queue_is_full() {
+    async fn disabling_consent_waits_until_purge_is_delivered_when_queue_is_full() {
         let (db, _dir) = test_db().await;
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(1);
         sender
             .try_send(WorkerCommand::Track(Box::new(prepared_event("queued"))))
             .unwrap();
         let analytics = analytics_with_sender(sender);
         enable_settings(&db).await;
 
-        let settings = analytics
-            .set_enabled(&db, false, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+        let disable =
+            analytics.set_enabled(&db, false, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string());
+        tokio::pin!(disable);
+
+        tokio::select! {
+            result = &mut disable => panic!("purge should wait for queue capacity: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            WorkerCommand::Track(_)
+        ));
+
+        let settings = tokio::time::timeout(std::time::Duration::from_secs(1), disable)
             .await
+            .unwrap()
             .unwrap();
 
         assert!(!settings.enabled);
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            WorkerCommand::Purge
+        ));
     }
 
     #[tokio::test]

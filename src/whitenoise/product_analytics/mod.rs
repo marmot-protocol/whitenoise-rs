@@ -46,9 +46,7 @@ pub(crate) fn utc_now_millis() -> DateTime<Utc> {
 }
 
 impl ProductAnalyticsSettings {
-    pub(crate) async fn find_or_create_default(
-        database: &Database,
-    ) -> Result<ProductAnalyticsSettings> {
+    pub(crate) async fn find_or_create_default(database: &Database) -> Result<Self> {
         crate::whitenoise::database::product_analytics::find_or_create_settings(database).await
     }
 

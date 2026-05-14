@@ -50,6 +50,7 @@ impl ProductAnalyticsEvent {
         if event_name.is_empty() {
             return Err(analytics_error("event name must not be empty"));
         }
+        validate_schema_version(self)?;
 
         let mut keys = HashSet::new();
         for prop in &self.string_props {
@@ -70,7 +71,7 @@ impl ProductAnalyticsEvent {
             }
         }
 
-        Ok(())
+        validate_event_prop_combinations(self)
     }
 
     pub(crate) fn validated_props(&self) -> Result<Map<String, Value>> {
@@ -189,6 +190,58 @@ fn validate_string_prop_value(key: &str, value: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_schema_version(event: &ProductAnalyticsEvent) -> Result<()> {
+    let mut schema_versions = event
+        .number_props
+        .iter()
+        .filter(|prop| prop.key == "schema_version");
+    let Some(schema_version) = schema_versions.next() else {
+        return Err(analytics_error("unsupported or missing schema_version"));
+    };
+    if schema_versions.next().is_some()
+        || schema_version.value != f64::from(PRODUCT_ANALYTICS_SCHEMA_VERSION)
+    {
+        return Err(analytics_error("unsupported or missing schema_version"));
+    }
+    Ok(())
+}
+
+fn validate_event_prop_combinations(event: &ProductAnalyticsEvent) -> Result<()> {
+    match event.name {
+        ProductAnalyticsEventName::SettingChanged => {
+            let setting = event
+                .string_props
+                .iter()
+                .find(|prop| prop.key == "setting")
+                .map(|prop| prop.value.as_str());
+            let value = event
+                .string_props
+                .iter()
+                .find(|prop| prop.key == "value")
+                .map(|prop| prop.value.as_str());
+            match (setting, value) {
+                (Some(setting), Some(value)) if setting_value_allowed(setting, value) => Ok(()),
+                _ => Err(analytics_error(
+                    "analytics setting/value combination is not allowed",
+                )),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn setting_value_allowed(setting: &str, value: &str) -> bool {
+    match setting {
+        "theme" => matches!(value, "light" | "dark" | "system"),
+        "language" => matches!(
+            value,
+            "system" | "en" | "es" | "fr" | "de" | "it" | "pt" | "ru" | "tr"
+        ),
+        "notifications" | "analytics" => matches!(value, "enabled" | "disabled"),
+        _ => false,
+    }
 }
 
 fn event_allows_prop(event_name: ProductAnalyticsEventName, key: &str) -> bool {
@@ -514,6 +567,39 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_missing_schema_version() {
+        let event = ProductAnalyticsEvent {
+            name: ProductAnalyticsEventName::AppStarted,
+            string_props: vec![ProductAnalyticsStringProp {
+                key: "platform".to_string(),
+                value: "ios".to_string(),
+            }],
+            number_props: Vec::new(),
+        };
+
+        assert!(event.validate().is_err());
+        assert!(event.validated_props().is_err());
+    }
+
+    #[test]
+    fn validator_rejects_unsupported_schema_version() {
+        let event = ProductAnalyticsEvent {
+            name: ProductAnalyticsEventName::AppStarted,
+            string_props: vec![ProductAnalyticsStringProp {
+                key: "platform".to_string(),
+                value: "ios".to_string(),
+            }],
+            number_props: vec![ProductAnalyticsNumberProp {
+                key: "schema_version".to_string(),
+                value: f64::from(PRODUCT_ANALYTICS_SCHEMA_VERSION + 1),
+            }],
+        };
+
+        assert!(event.validate().is_err());
+        assert!(event.validated_props().is_err());
+    }
+
+    #[test]
     fn validator_rejects_props_for_analytics_enabled() {
         let event = ProductAnalyticsEvent::new(ProductAnalyticsEventName::AnalyticsEnabled)
             .with_string_prop("platform", "ios");
@@ -524,6 +610,26 @@ mod tests {
     #[test]
     fn global_prop_values_reject_unknown_keys() {
         assert!(!global_prop_value_allowed("future_key", "value"));
+    }
+
+    #[test]
+    fn setting_changed_rejects_invalid_setting_value_pair() {
+        let event = ProductAnalyticsEvent::new(ProductAnalyticsEventName::SettingChanged)
+            .with_string_prop("setting", "language")
+            .with_string_prop("value", "dark");
+
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn setting_changed_requires_setting_and_value_pair() {
+        let only_setting = ProductAnalyticsEvent::new(ProductAnalyticsEventName::SettingChanged)
+            .with_string_prop("setting", "analytics");
+        let only_value = ProductAnalyticsEvent::new(ProductAnalyticsEventName::SettingChanged)
+            .with_string_prop("value", "enabled");
+
+        assert!(only_setting.validate().is_err());
+        assert!(only_value.validate().is_err());
     }
 
     #[test]
