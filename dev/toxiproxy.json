@@ -1,0 +1,14 @@
+[
+  {
+    "name": "nostr-rs-slow",
+    "listen": "0.0.0.0:18080",
+    "upstream": "nostr-rs-relay:8080",
+    "enabled": true
+  },
+  {
+    "name": "strfry-slow",
+    "listen": "0.0.0.0:17777",
+    "upstream": "strfry-nostr-relay:7777",
+    "enabled": true
+  }
+]

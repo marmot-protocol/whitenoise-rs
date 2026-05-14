@@ -93,10 +93,24 @@ struct Args {
     #[clap(long, value_name = "PATH")]
     chrome_trace: Option<PathBuf>,
 
+    /// Relay URLs used both as discovery relays and as the seed value for new
+    /// accounts' NIP-65/Inbox/KeyPackage lists. Repeat for multiple relays.
+    /// Defaults to the local Docker relays on ports 8080 and 7777; override
+    /// with toxiproxy listen ports for WAN-latency benchmarks.
+    #[clap(long, value_name = "URL")]
+    relays: Vec<RelayUrl>,
+
     /// Optional scenario name to run a specific benchmark.
     /// If not provided, runs all benchmarks.
     #[clap(value_name = "SCENARIO")]
     scenario: Option<String>,
+}
+
+fn default_local_relays() -> Vec<RelayUrl> {
+    vec![
+        RelayUrl::parse("ws://localhost:8080").unwrap(),
+        RelayUrl::parse("ws://localhost:7777").unwrap(),
+    ]
 }
 
 fn git_sha() -> String {
@@ -290,10 +304,11 @@ async fn main() -> Result<(), WhitenoiseError> {
         restore_keyring_sidecar(&args.data_dir, nsec)?;
     }
 
-    let local_relays = vec![
-        RelayUrl::parse("ws://localhost:8080").unwrap(),
-        RelayUrl::parse("ws://localhost:7777").unwrap(),
-    ];
+    let local_relays = if args.relays.is_empty() {
+        default_local_relays()
+    } else {
+        args.relays.clone()
+    };
     let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir, KEYRING_SERVICE)
         .with_database_key_id(BENCHMARK_WHITENOISE_DB_KEY_ID)
         .with_discovery_relays(local_relays.clone())
