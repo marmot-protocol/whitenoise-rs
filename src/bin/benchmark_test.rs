@@ -290,12 +290,14 @@ async fn main() -> Result<(), WhitenoiseError> {
         restore_keyring_sidecar(&args.data_dir, nsec)?;
     }
 
+    let local_relays = vec![
+        RelayUrl::parse("ws://localhost:8080").unwrap(),
+        RelayUrl::parse("ws://localhost:7777").unwrap(),
+    ];
     let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir, KEYRING_SERVICE)
         .with_database_key_id(BENCHMARK_WHITENOISE_DB_KEY_ID)
-        .with_discovery_relays(vec![
-            RelayUrl::parse("ws://localhost:8080").unwrap(),
-            RelayUrl::parse("ws://localhost:7777").unwrap(),
-        ]);
+        .with_discovery_relays(local_relays.clone())
+        .with_default_account_relays(local_relays);
     let whitenoise = Whitenoise::new(config).await.inspect_err(|err| {
         tracing::error!(target: "whitenoise::benchmark", "Failed to initialize Whitenoise: {}", err);
     })?;

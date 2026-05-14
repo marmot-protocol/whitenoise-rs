@@ -43,16 +43,18 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     tracing::info!("=== Starting Whitenoise Integration Test Suite ===");
 
+    let local_relays = vec![
+        RelayUrl::parse("ws://localhost:8080").unwrap(),
+        RelayUrl::parse("ws://localhost:7777").unwrap(),
+    ];
     let config = WhitenoiseConfig::new(
         &args.data_dir,
         &args.logs_dir,
         "com.whitenoise.integration-test",
     )
     .with_database_key_id(INTEGRATION_WHITENOISE_DB_KEY_ID)
-    .with_discovery_relays(vec![
-        RelayUrl::parse("ws://localhost:8080").unwrap(),
-        RelayUrl::parse("ws://localhost:7777").unwrap(),
-    ]);
+    .with_discovery_relays(local_relays.clone())
+    .with_default_account_relays(local_relays);
     let whitenoise = Whitenoise::new(config).await.inspect_err(|err| {
         tracing::error!(target: "whitenoise::integration_test", "Failed to initialize Whitenoise: {}", err);
     })?;

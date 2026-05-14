@@ -151,6 +151,13 @@ pub struct WhitenoiseConfig {
 
     /// Configured discovery relays for the relay-control discovery plane.
     pub discovery_relays: Vec<RelayUrl>,
+
+    /// Relay URLs adopted as a freshly-created account's NIP-65, Inbox, and
+    /// KeyPackage lists when no existing relay-list events are found on the
+    /// network. Seeded from [`Relay::defaults`]; override with
+    /// [`Self::with_default_account_relays`] for benchmarks or private
+    /// (non-public-relay) deployments.
+    pub default_account_relays: Vec<RelayUrl>,
 }
 
 impl WhitenoiseConfig {
@@ -175,6 +182,7 @@ impl WhitenoiseConfig {
             #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
+            default_account_relays: Relay::urls(&Relay::defaults()),
         }
     }
 
@@ -201,11 +209,22 @@ impl WhitenoiseConfig {
             #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
+            default_account_relays: Relay::urls(&Relay::defaults()),
         }
     }
 
     pub fn with_discovery_relays(mut self, discovery_relays: Vec<RelayUrl>) -> Self {
         self.discovery_relays = discovery_relays;
+        self
+    }
+
+    /// Override the relay URLs adopted as a freshly-created account's NIP-65,
+    /// Inbox, and KeyPackage lists when the network has no existing relay-list
+    /// events for the account. Production callers should almost never set this
+    /// — it is intended for benchmarks and private (non-public-relay)
+    /// deployments where the public defaults are inappropriate.
+    pub fn with_default_account_relays(mut self, default_account_relays: Vec<RelayUrl>) -> Self {
+        self.default_account_relays = default_account_relays;
         self
     }
 
@@ -1459,18 +1478,24 @@ pub mod test_utils {
     ///   - `mpsc::Receiver<ProcessableEvent>`: The event receiver paired with the instance sender
     ///   - `TempDir`: The temporary directory for data storage
     ///   - `TempDir`: The temporary directory for log storage
-    async fn create_mock_whitenoise_internal() -> (
+    async fn create_mock_whitenoise_internal_with<F>(
+        customize: F,
+    ) -> (
         Arc<Whitenoise>,
         mpsc::Receiver<ProcessableEvent>,
         TempDir,
         TempDir,
-    ) {
+    )
+    where
+        F: FnOnce(WhitenoiseConfig) -> WhitenoiseConfig,
+    {
         Whitenoise::initialize_mock_keyring_store();
 
         // Wait for local relays to be ready in test environment
         wait_for_test_relays().await;
 
         let (config, data_temp, logs_temp) = create_test_config();
+        let config = customize(config);
 
         // Create directories manually to avoid issues
         std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -1514,8 +1539,20 @@ pub mod test_utils {
     }
 
     pub(crate) async fn create_mock_whitenoise() -> (Arc<Whitenoise>, TempDir, TempDir) {
+        create_mock_whitenoise_with(|config| config).await
+    }
+
+    /// Build a mock Whitenoise with a customised [`WhitenoiseConfig`]. Use when
+    /// a test needs to exercise a non-default config knob (e.g. an overridden
+    /// `default_account_relays`).
+    pub(crate) async fn create_mock_whitenoise_with<F>(
+        customize: F,
+    ) -> (Arc<Whitenoise>, TempDir, TempDir)
+    where
+        F: FnOnce(WhitenoiseConfig) -> WhitenoiseConfig,
+    {
         let (whitenoise, _event_receiver, data_temp, logs_temp) =
-            create_mock_whitenoise_internal().await;
+            create_mock_whitenoise_internal_with(customize).await;
         (whitenoise, data_temp, logs_temp)
     }
 
@@ -2166,6 +2203,33 @@ mod tests {
                 config.discovery_relays,
                 DiscoveryPlaneConfig::curated_default_relays()
             );
+        }
+
+        #[test]
+        fn test_whitenoise_config_default_account_relays_seed() {
+            let data_dir = std::path::Path::new("/test/data");
+            let logs_dir = std::path::Path::new("/test/logs");
+            let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.test.app");
+
+            assert_eq!(
+                config.default_account_relays,
+                Relay::urls(&Relay::defaults()),
+                "fresh config should seed default_account_relays from Relay::defaults()"
+            );
+        }
+
+        #[test]
+        fn test_whitenoise_config_with_default_account_relays_overrides_seed() {
+            let data_dir = std::path::Path::new("/test/data");
+            let logs_dir = std::path::Path::new("/test/logs");
+            let override_urls = vec![
+                RelayUrl::parse("ws://override-relay-a:9999").unwrap(),
+                RelayUrl::parse("ws://override-relay-b:9999").unwrap(),
+            ];
+            let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.test.app")
+                .with_default_account_relays(override_urls.clone());
+
+            assert_eq!(config.default_account_relays, override_urls);
         }
 
         #[test]
