@@ -1,214 +1,258 @@
-# Flutter Rust Bridge — Generation moved to whitenoise-rs
+# Flutter Rust Bridge — published as a hosted pub package
 
-## What changed
+## What this is
 
-Until recently, the Flutter app
-([marmot-protocol/whitenoise](https://github.com/marmot-protocol/whitenoise))
-owned both the FFI wrapper Rust crate and the `flutter_rust_bridge_codegen`
-runs that produced the Dart bindings. Every Rust API change forced the Flutter
-team to re-run codegen and bump the `whitenoise` git rev.
+`whitenoise-rs` owns the Flutter Rust Bridge wrapper at
+`crates/whitenoise-frb/` and publishes a Dart pub package
+(`whitenoise_frb`) to a static pub registry served from this repo's
+`gh-pages` branch. The Flutter app consumes it via a standard `hosted:`
+pubspec source. No codegen runs on the Flutter side, and no orphan
+branch participates in the flow.
 
-Now `whitenoise-rs` owns the wrapper and the codegen. Master is **Rust-only**;
-the Flutter package shape and generated bindings live exclusively on a
-dedicated `flutter-package` orphan branch (no shared history with master). CI
-regenerates and updates that branch on every codeowner push to `master`. The
-Flutter app consumes the orphan branch as a normal git dependency.
+## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph master["whitenoise-rs / master (Rust-only)"]
-        wrap["crates/whitenoise-frb/<br/>(wrapper crate)"]
-        cfg["flutter_rust_bridge.yaml"]
-        scripts["scripts/, workflow"]
+    subgraph master["whitenoise-rs / master"]
+        wrap["crates/whitenoise-frb/<br/>(wrapper Rust crate)"]
+        tmpl["crates/whitenoise-frb/template/<br/>(pubspec, cargokit, platform dirs)"]
+        scripts["scripts/, .github/workflows/"]
     end
 
     subgraph ci["frb-codegen.yml (CI)"]
-        s1["clone flutter-package<br/>orphan branch"]
-        s2["run codegen<br/>(dart bindings)"]
-        s3["vendor wrapper crate<br/>(rewrite path dep → git rev)"]
-        s4["force-push orphan branch<br/>(only if changed)"]
-        s1 --> s2 --> s3 --> s4
+        s1["frb-stage<br/>(template → .frb-staging/)"]
+        s2["frb-generate<br/>(Dart bindings + vendor wrapper)"]
+        s3["rewrite path-dep → git-rev"]
+        s4["frb-publish<br/>(tarball + version JSON)"]
+        s5["frb-update-index<br/>(mutate gh-pages worktree)"]
+        s6["git push gh-pages"]
+        s1 --> s2 --> s3 --> s4 --> s5 --> s6
     end
 
-    subgraph orphan["whitenoise-rs / flutter-package (orphan branch)"]
-        pkg["pubspec.yaml, cargokit/<br/>lib/src/rust/*.dart<br/>rust/ (vendored wrapper)"]
+    subgraph pages["whitenoise-rs / gh-pages"]
+        idx["/api/packages/whitenoise_frb<br/>(Pub Spec v2 JSON index)"]
+        tar["/packages/whitenoise_frb/<br/>&lt;version&gt;.tar.gz"]
     end
 
     subgraph app["marmot-protocol/whitenoise (Flutter app)"]
-        dep["pubspec.yaml<br/>rust_lib_whitenoise:<br/>git ref: flutter-package"]
+        dep["pubspec.yaml<br/>whitenoise_frb:<br/>  hosted: gh-pages URL<br/>  version: 0.0.0-dev+&lt;sha&gt;"]
     end
 
     master -- "codeowner push" --> ci
-    ci -- "force-push" --> orphan
-    orphan -- "flutter pub get<br/>(git dep)" --> app
+    ci -- "push" --> pages
+    pages -- "flutter pub get" --> app
 ```
 
 ## Where things live
 
-### On `master` (Rust-only)
+### On `master`
 
 | Concern | Path |
 |---|---|
 | FRB wrapper crate | `crates/whitenoise-frb/` |
+| Package template (pubspec, cargokit, platform glue) | `crates/whitenoise-frb/template/` |
 | FRB config | `flutter_rust_bridge.yaml` |
-| Codegen scripts | `scripts/frb-{stage,generate,check}.sh` |
+| Codegen + publish scripts | `scripts/frb-{stage,generate,check,publish,update-index,pages-bootstrap}.sh` |
 | CI workflow | `.github/workflows/frb-codegen.yml` |
-| Local staging worktree | `.frb-staging/` (gitignored) |
+| Local staging directory | `.frb-staging/` (gitignored) |
 
-### On `flutter-package` (orphan, no shared history)
+### On `gh-pages`
 
 | Concern | Path |
 |---|---|
-| Pubspec | `pubspec.yaml` |
-| Cargokit / platform glue | `cargokit/`, `android/`, `ios/`, `linux/`, `macos/`, `windows/` |
-| Generated Dart bindings | `lib/src/rust/` |
-| Vendored Rust wrapper | `rust/` (with `whitenoise` dep rewritten to a git rev) |
-| Provenance marker | `REGENERATED.txt` (writes source SHA, timestamp, FRB version) |
+| Pub Spec v2 index | `/api/packages/whitenoise_frb` |
+| Tarballs | `/packages/whitenoise_frb/<version>.tar.gz` |
+| Jekyll-disable marker | `/.nojekyll` |
+| Landing page (human-friendly) | `/index.html` |
+
+Public URL: `https://marmot-protocol.github.io/whitenoise-rs/`
+
+## Versioning
+
+Each codeowner push to `master` publishes a single version of the form:
+
+```
+0.0.0-dev+<short-sha>
+```
+
+(e.g. `0.0.0-dev+a1b2c3d`). Per semver, build metadata after `+` is not
+part of version precedence — every published version has the same
+`0.0.0-dev` precedence. **Consumers must pin a specific SHA**;
+`version: any` resolves arbitrarily across `0.0.0-dev+*` versions and is
+not supported.
+
+CI retains the most recent 20 dev versions on `gh-pages`; older tarballs
+are pruned on each publish.
 
 ## Local development
 
 ```sh
-# 1. Set up a worktree of the flutter-package branch as .frb-staging/
+# 1. Populate .frb-staging/ from the vendored template
 just frb-stage
 
-# 2. Run codegen (writes into .frb-staging/lib/src/rust/)
+# 2. Run codegen — writes Dart into .frb-staging/lib/src/rust/ and
+#    vendors crates/whitenoise-frb/ into .frb-staging/rust/
 just frb-generate
 
-# 3. Inspect changes
-git -C .frb-staging diff
+# 3. Lint the wrapper crate
+just frb-check
+
+# 4. (optional) Build a tarball + version JSON for inspection. Writes to
+#    /tmp/frb-publish-out/. Does NOT push anything.
+just frb-publish-local
 ```
 
-`just frb-stage` is safe to re-run; it refreshes `.frb-staging/` from origin
-if a worktree already exists. The codegen tool must match the
-`flutter_rust_bridge` crate version pinned in `crates/whitenoise-frb/Cargo.toml`
-(`2.11.1`):
+The codegen tool must match the `flutter_rust_bridge` crate version
+pinned in `crates/whitenoise-frb/Cargo.toml` (`2.11.1`):
 
 ```sh
 cargo install flutter_rust_bridge_codegen --version 2.11.1 --locked
-```
-
-To lint the wrapper crate (clippy under `-D warnings`):
-
-```sh
-just frb-check
 ```
 
 ## CI workflow
 
 `.github/workflows/frb-codegen.yml`:
 
-1. **Gate job** — parses the wildcard rule from `.github/CODEOWNERS` at
+1. **Gate** — parses the wildcard rule from `.github/CODEOWNERS` at
    runtime and verifies `github.actor` is one of those user logins.
-   Non-codeowner pushes skip cleanly. Team entries (`org/team`) cause the
-   gate to fail fast since user-login matching can't resolve them.
-2. **Codegen job**:
-   - Checks out master at the pushed SHA into `source/`.
-   - Checks out the `flutter-package` orphan branch into `source/.frb-staging/`.
-   - Installs Rust 1.90.0, `flutter_rust_bridge_codegen 2.11.1`, Flutter SDK.
-   - Runs `bash scripts/frb-generate.sh` (writes Dart into staging).
-   - Runs `bash scripts/frb-check.sh` (lints wrapper).
-   - Vendors `crates/whitenoise-frb/` into `staging/rust/` with the
-     `whitenoise` dep rewritten from `path = "../.."` to a git rev pinning
-     the source commit.
-   - Refreshes `REGENERATED.txt` with provenance.
-   - Commits + pushes the orphan branch only if there are real changes.
+   Non-codeowner pushes skip cleanly. Team entries (`org/team`) cause
+   the gate to fail fast (user-login matching can't resolve them).
+2. **Publish**:
+   - Checkout source at the pushed SHA
+   - Checkout `gh-pages` into a sibling worktree
+   - Install Rust 1.90.0, `flutter_rust_bridge_codegen` 2.11.1, Flutter SDK
+   - Stage from template (`scripts/frb-stage.sh`)
+   - Run codegen (`scripts/frb-generate.sh`)
+   - Lint wrapper (`scripts/frb-check.sh`)
+   - Rewrite `whitenoise = { path = "../.." }` in the vendored
+     `rust/Cargo.toml` to a git rev pinning the source SHA
+   - Write `REGENERATED.txt` provenance marker
+   - Build tarball + version JSON (`scripts/frb-publish.sh`)
+   - Mutate gh-pages worktree (`scripts/frb-update-index.sh`)
+   - Commit + push gh-pages
 
-Cross-repo authentication uses `secrets.FRB_PR_TOKEN` if set, else
-`secrets.GITHUB_TOKEN`. Same-repo orphan-branch pushes work with the default
-token.
+Concurrency: `group: frb-publish, cancel-in-progress: false` — queues
+rather than cancels, since dropping a publish would leave gh-pages
+out-of-sync with master.
+
+Auth: same extraheader pattern used elsewhere — never embeds the token
+in the remote URL.
 
 ## One-time bootstrap
 
-The `flutter-package` orphan branch must exist on `origin` before the
-workflow can update it. Bootstrap once:
+The `gh-pages` branch must exist and GitHub Pages must be serving from
+it before the workflow can publish.
 
 ```sh
-# 1. Create the orphan branch directly at the staging worktree path that
-#    flutter_rust_bridge.yaml's dart_output already targets. A branch can
-#    only be checked out in one worktree at a time, so reuse this one.
-git worktree add --orphan -b flutter-package .frb-staging
+# 1. Create the gh-pages orphan branch with .nojekyll + landing page
+PUB_BASE_URL="https://marmot-protocol.github.io/whitenoise-rs" \
+    bash scripts/frb-pages-bootstrap.sh
 
-# 2. Seed it with the package shape (pubspec, cargokit, platform dirs,
-#    LICENSE, README, .gitignore, analysis_options) — see the layout under
-#    "On flutter-package" above. The simplest source is to copy the files
-#    that whitenoise (Flutter app) currently has under rust_builder/.
+# 2. Push the bootstrap commit
+git -C .gh-pages-bootstrap push origin gh-pages
 
-# 3. Vendor the wrapper crate
-cp -r crates/whitenoise-frb .frb-staging/rust
-SHA=$(git rev-parse HEAD)
-sed -i "s#whitenoise = { path = \"../..\" }#whitenoise = { git = \"https://github.com/marmot-protocol/whitenoise-rs\", rev = \"${SHA}\" }#" \
-    .frb-staging/rust/Cargo.toml
+# 3. Enable GitHub Pages serving:
+#    Settings → Pages → Source = gh-pages branch / (root)
 
-# 4. Run codegen into .frb-staging/lib/src/rust/
-just frb-generate
+# 4. Verify the landing page is live (takes ~1 min after enabling Pages)
+curl https://marmot-protocol.github.io/whitenoise-rs/
 
-# 5. Commit and push
-git -C .frb-staging add -A
-git -C .frb-staging \
-    -c user.email=frb-codegen-bot@marmot-protocol.org \
-    -c user.name="frb-codegen-bot" \
-    commit -m "frb: bootstrap flutter-package from ${SHA}"
-git -C .frb-staging push origin flutter-package
+# 5. Clean up the local worktree
+git worktree remove .gh-pages-bootstrap
 ```
 
-After step 5, the workflow can take over.
+The bootstrap script is idempotent: if `origin/gh-pages` already exists,
+it no-ops with a pointer to the Pages settings URL.
 
-## Rolling out the Flutter side
+## Migration sequence
 
-Once the orphan branch exists, the Flutter team needs a separate PR on
-`marmot-protocol/whitenoise` that:
+Strict ordering — each step depends on the previous one being live.
 
-1. **Removes** the in-repo wrapper and its build glue:
-   - `rust/` (entire wrapper crate)
+1. **Bootstrap `gh-pages`** (one-time, see above).
+2. **Land this PR** on `marmot-protocol/whitenoise-rs`. The new workflow
+   replaces the old orphan-branch flow.
+3. **Verify the first publish lands** on `gh-pages`:
+   - Check the workflow run succeeds
+   - Confirm the index: `curl https://marmot-protocol.github.io/whitenoise-rs/api/packages/whitenoise_frb`
+   - Confirm at least one tarball under `/packages/whitenoise_frb/`
+4. **Land the Flutter cutover PR** on `marmot-protocol/whitenoise`
+   (see checklist below).
+5. **Verify the Flutter app builds** against the hosted package source.
+6. **Delete the `flutter-package` orphan branch**:
+   ```sh
+   git push origin --delete flutter-package
+   ```
+
+Deleting the orphan branch before step 5 will break `flutter pub get`
+on the Flutter app's main branch. The deletion is the terminal step.
+
+## Flutter app cutover checklist
+
+For the PR on `marmot-protocol/whitenoise`:
+
+1. **Remove the in-repo wrapper and build glue:**
+   - `rust/` (wrapper crate)
    - `rust_builder/` (cargokit + plugin shape)
    - `flutter_rust_bridge.yaml`
-   - `lib/src/rust/` (all auto-generated Dart bindings)
+   - `lib/src/rust/` (auto-generated Dart — will come from the hosted
+     package)
 
-2. **Updates `pubspec.yaml`** to consume the orphan branch:
+2. **Update `pubspec.yaml`** — switch from `git:` to `hosted:`:
 
    ```yaml
    dependencies:
-     rust_lib_whitenoise:
-       git:
-         url: https://github.com/marmot-protocol/whitenoise-rs
-         ref: flutter-package
-   # flutter_rust_bridge no longer needed at top level — comes transitively
+     whitenoise_frb:
+       hosted: https://marmot-protocol.github.io/whitenoise-rs
+       version: "0.0.0-dev+<short-sha>"   # pin a specific master SHA
+   # flutter_rust_bridge is pulled in transitively from whitenoise_frb;
+   # remove the top-level entry if it was pinned.
    ```
 
-3. **Updates Dart imports** across the app. Two equivalent approaches:
+   Get the latest SHA from
+   `https://marmot-protocol.github.io/whitenoise-rs/api/packages/whitenoise_frb`
+   (the `latest.version` field).
 
-   - **Mass rewrite (recommended for clean end state):**
-     ```sh
-     find lib test -name "*.dart" -exec \
-       sed -i 's#package:whitenoise/src/rust#package:rust_lib_whitenoise/src/rust#g' {} +
-     ```
-   - **Forwarding shims (smaller diff, leaves indirection):** keep
-     `lib/src/rust/*.dart` files but replace each body with
-     `export 'package:rust_lib_whitenoise/src/rust/<same-relative-path>';`.
+3. **Rewrite Dart imports** across the app:
 
-4. **Removes generation recipes from `justfile`**: `generate`, `regenerate`,
-   `clean-bridge`, and any `lint-rust` / `test-rust` recipes that operated on
-   the deleted `rust/`.
+   ```sh
+   find lib test -name "*.dart" -exec \
+     sed -i 's#package:whitenoise/src/rust#package:whitenoise_frb/src/rust#g' {} +
+   ```
 
-5. **Updates `analysis_options.yaml`** — drop the `rust_builder/**` exclude.
+4. **Remove generation recipes** from `justfile`: `generate`,
+   `regenerate`, `clean-bridge`, and any `lint-rust` / `test-rust`
+   recipes that operated on the deleted `rust/`.
 
-6. **Updates docs** (`AGENTS.md`, `CONTRIBUTING.md`) — remove instructions for
-   running `just generate` locally.
+5. **Update `analysis_options.yaml`** — drop the `rust_builder/**`
+   exclude.
 
-## Rollout order (important)
+6. **Update docs** (`AGENTS.md`, `CONTRIBUTING.md`) — remove the
+   "run `just generate` locally" instructions.
 
-1. Land the whitenoise-rs PR introducing the wrapper + workflow.
-2. Bootstrap the orphan branch (one-time, see above).
-3. Run the workflow once via `workflow_dispatch` to verify CI updates the
-   orphan branch correctly.
-4. *Then* land the Flutter cleanup PR. If the Flutter PR lands first,
-   `flutter pub get` will fail because the git ref does not resolve.
+7. **Test**: `flutter pub get && flutter build` (per relevant platforms).
+
+After this PR lands and the app builds successfully, return to the
+whitenoise-rs migration sequence and run the orphan-branch deletion
+(step 6 above).
 
 ## Codeowner gating
 
-The CI workflow derives the allowlist from `.github/CODEOWNERS` at runtime
-(parsing the wildcard rule). `github.actor` is matched against the parsed
-user logins, so the gate stays in sync with the file automatically. Team
-entries (`org/team`) cause the gate to fail fast — extend the workflow to
-query the GitHub Teams API if you need that. Non-codeowner pushes to master
-skip the codegen job silently; no orphan-branch update.
+The CI workflow derives the allowlist from `.github/CODEOWNERS` at
+runtime (parsing the wildcard rule). `github.actor` is matched against
+the parsed user logins, so the gate stays in sync with the file
+automatically. Team entries (`org/team`) cause the gate to fail fast —
+extend the workflow to query the GitHub Teams API if you need that.
+Non-codeowner pushes to master skip the publish job silently.
+
+## Known risk: extensionless JSON MIME type
+
+GitHub Pages serves `/api/packages/whitenoise_frb` (no file extension)
+as `application/octet-stream`, not the spec-mandated
+`application/vnd.pub.v2+json`. Most pub clients parse the JSON
+regardless of the declared content-type, so this is expected to work,
+but spec-strict clients may reject. Verify on first publish.
+
+If clients reject the MIME type, options:
+- Place a small Cloudflare Worker in front of Pages to set the header
+- Switch the index to a different static host that supports
+  `_headers` / route overrides

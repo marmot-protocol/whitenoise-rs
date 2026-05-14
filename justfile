@@ -448,9 +448,8 @@ install-tools:
 # Flutter Rust Bridge
 ######################
 
-# Set up .frb-staging/ as a worktree of the flutter-package orphan branch.
-# Run this once before `just frb-generate`. Safe to re-run (refreshes from
-# origin if a worktree already exists).
+# Populate .frb-staging/ from crates/whitenoise-frb/template/ (vendored on
+# master). Run this once before `just frb-generate`. Safe to re-run.
 frb-stage:
     @bash scripts/frb-stage.sh
 
@@ -462,6 +461,17 @@ frb-generate:
 # Verify the wrapper compiles after a regen (CI guard against API drift).
 frb-check:
     @bash scripts/frb-check.sh
+
+# Build a tarball + version JSON from .frb-staging/ into /tmp/frb-publish-out/.
+# Does NOT push to gh-pages — useful for inspecting what CI would publish.
+# Requires `just frb-stage` and `just frb-generate` to have run first.
+frb-publish-local:
+    @STAGING_DIR=".frb-staging" \
+     VERSION="0.0.0-dev+$(git rev-parse --short HEAD)" \
+     PUB_BASE_URL="https://marmot-protocol.github.io/whitenoise-rs" \
+     OUTPUT_DIR="/tmp/frb-publish-out" \
+     PACKAGE_NAME="whitenoise_frb" \
+     bash scripts/frb-publish.sh
 
 ######################
 # Build

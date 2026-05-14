@@ -4268,23 +4268,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_lib_whitenoise"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "chrono",
- "flutter_rust_bridge",
- "hex",
- "nostr-sdk",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
- "whitenoise",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5920,6 +5903,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "whitenoise_frb"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "flutter_rust_bridge",
+ "hex",
+ "nostr-sdk",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "whitenoise",
 ]
 
 [[package]]

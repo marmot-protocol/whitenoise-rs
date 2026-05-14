@@ -1,4 +1,4 @@
-name: FRB codegen
+name: FRB codegen + publish
 
 on:
   push:
@@ -6,15 +6,18 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch or SHA to regenerate from"
+        description: "Branch or SHA to publish from"
         required: false
         default: "master"
 
 permissions:
   contents: write
 
+# Cross-trigger serialization: gh-pages is mutable shared state, so two
+# publishes mid-flight would race the push. Queue rather than cancel — a
+# dropped publish would leave the index out-of-sync with master.
 concurrency:
-  group: frb-codegen-${{ github.ref }}
+  group: frb-publish
   cancel-in-progress: false
 
 jobs:
@@ -65,17 +68,20 @@ jobs:
               exit 0
             fi
           done
-          echo "$ACTOR is not in the codeowner allowlist — skipping codegen."
+          echo "$ACTOR is not in the codeowner allowlist — skipping publish."
           echo "authorized=false" >> "$GITHUB_OUTPUT"
 
-  codegen:
-    name: Regenerate bindings and update flutter-package branch
+  publish:
+    name: Regenerate bindings and publish to gh-pages
     needs: gate
     if: needs.gate.outputs.authorized == 'true'
     runs-on: ubuntu-latest
     env:
       FRB_VERSION: "2.11.1"
       STAGING: ".frb-staging"
+      PACKAGE_NAME: "whitenoise_frb"
+      PAGES_BRANCH: "gh-pages"
+      PUB_BASE_URL: "https://marmot-protocol.github.io/whitenoise-rs"
     steps:
       - name: Checkout source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -84,17 +90,22 @@ jobs:
           fetch-depth: 1
           path: source
 
-      - name: Capture real source SHA
+      - name: Capture source SHA
         id: src
         working-directory: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "version=0.0.0-dev+${SHORT}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout flutter-package orphan branch
+      - name: Checkout gh-pages worktree
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: flutter-package
+          ref: ${{ env.PAGES_BRANCH }}
           fetch-depth: 1
-          path: source/.frb-staging
+          path: pages
           # Don't persist the default token: we set our own auth header in
           # the push step (avoids token-in-URL leakage via `git remote -v`).
           persist-credentials: false
@@ -121,38 +132,37 @@ jobs:
         with:
           channel: stable
 
-      - name: Run codegen into staging worktree
+      - name: Stage from template and run codegen
         working-directory: source
-        run: bash scripts/frb-generate.sh
+        run: |
+          bash scripts/frb-stage.sh
+          bash scripts/frb-generate.sh
 
       - name: Lint wrapper crate
         working-directory: source
         run: bash scripts/frb-check.sh
 
-      - name: Vendor wrapper crate into staging
+      - name: Rewrite wrapper path-dep to git-rev
         working-directory: source
         env:
           SOURCE_SHA: ${{ steps.src.outputs.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          rm -rf "${STAGING}/rust"
-          mkdir -p "${STAGING}/rust"
-          cp -r crates/whitenoise-frb/. "${STAGING}/rust/"
-
           sed -i \
             "s#^whitenoise = { path = \"../..\" }\$#whitenoise = { git = \"https://github.com/${REPO}\", rev = \"${SOURCE_SHA}\" }#" \
             "${STAGING}/rust/Cargo.toml"
 
-          # Tighter validation: any remaining `whitenoise = { path = ` line
-          # means the rewrite failed. Print the file so CI logs are useful.
+          # Defensive: any remaining `path = ` line means the rewrite
+          # missed. Without this the published tarball would have a broken
+          # dep that consumers can't resolve.
           if grep -q '^whitenoise = { path = ' "${STAGING}/rust/Cargo.toml"; then
-            echo "Dep rewrite failed. ${STAGING}/rust/Cargo.toml content:" >&2
+            echo "✗ Dep rewrite failed. ${STAGING}/rust/Cargo.toml content:" >&2
             cat "${STAGING}/rust/Cargo.toml" >&2
             exit 1
           fi
 
-      - name: Refresh provenance marker
+      - name: Write provenance marker
         working-directory: source
         env:
           SOURCE_SHA: ${{ steps.src.outputs.sha }}
@@ -166,11 +176,35 @@ jobs:
             echo "flutter_rust_bridge: ${FRB_VERSION}"
           } > "${STAGING}/REGENERATED.txt"
 
-      - name: Commit and push if changed
-        working-directory: source/.frb-staging
+      - name: Build tarball + version JSON
+        working-directory: source
+        env:
+          VERSION_STR: ${{ steps.src.outputs.version }}
+        run: |
+          mkdir -p ../publish-out
+          STAGING_DIR="${STAGING}" \
+          VERSION="${VERSION_STR}" \
+          PUB_BASE_URL="${PUB_BASE_URL}" \
+          OUTPUT_DIR=../publish-out \
+          PACKAGE_NAME="${PACKAGE_NAME}" \
+            bash scripts/frb-publish.sh
+
+      - name: Apply version to gh-pages worktree
+        env:
+          VERSION_STR: ${{ steps.src.outputs.version }}
+        run: |
+          PUBLISH_DIR=publish-out \
+          PACKAGE_NAME="${PACKAGE_NAME}" \
+          VERSION="${VERSION_STR}" \
+          PAGES_WORKTREE=pages \
+            bash source/scripts/frb-update-index.sh
+
+      - name: Commit and push gh-pages
+        working-directory: pages
         env:
           GH_TOKEN: ${{ secrets.FRB_PR_TOKEN || secrets.GITHUB_TOKEN }}
           SOURCE_SHA: ${{ steps.src.outputs.sha }}
+          VERSION_STR: ${{ steps.src.outputs.version }}
         run: |
           set -euo pipefail
           git config user.email "frb-codegen-bot@marmot-protocol.org"
@@ -178,27 +212,38 @@ jobs:
           git add -A
 
           if git diff --cached --quiet; then
-            echo "No changes to publish — bindings already current."
+            echo "No changes to publish — index already current."
             exit 0
           fi
 
-          git commit -q -m "frb: regenerate from ${SOURCE_SHA}"
+          git commit -q -m "publish: ${PACKAGE_NAME} ${VERSION_STR} from ${SOURCE_SHA}"
 
           # Auth via extraheader instead of embedding the token in the
           # remote URL. The header lives only in this worktree's local git
           # config and never appears in `git remote -v` output.
           git config --local "http.https://github.com/.extraheader" \
             "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
-          git push origin flutter-package
+          git push origin "${PAGES_BRANCH}"
 
       - name: Summary
         env:
           SOURCE_SHA: ${{ steps.src.outputs.sha }}
+          VERSION_STR: ${{ steps.src.outputs.version }}
         run: |
           {
-            echo "### FRB regen complete"
+            echo "### Published \`${PACKAGE_NAME}\`"
             echo
-            echo "- Source commit: \`${SOURCE_SHA}\`"
-            echo "- Updated branch: \`flutter-package\`"
-            echo "- Consumers: bump their git ref or run \`flutter pub upgrade\`."
+            echo "- Version: \`${VERSION_STR}\`"
+            echo "- Source: \`${SOURCE_SHA}\`"
+            echo "- Registry: ${PUB_BASE_URL}"
+            echo "- Index: ${PUB_BASE_URL}/api/packages/${PACKAGE_NAME}"
+            echo
+            echo "Consume from a Flutter app:"
+            echo
+            echo '```yaml'
+            echo "dependencies:"
+            echo "  ${PACKAGE_NAME}:"
+            echo "    hosted: ${PUB_BASE_URL}"
+            echo "    version: \"${VERSION_STR}\""
+            echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"

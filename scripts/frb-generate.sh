@@ -21,14 +21,14 @@ fi
 
 if [[ ! -d "${STAGING}" ]]; then
     echo "✗ ${STAGING}/ missing — set it up with 'just frb-stage' first." >&2
-    echo "  This directory is a worktree of the 'flutter-package' orphan branch and" >&2
-    echo "  receives the codegen output (no Dart files are committed to master)." >&2
+    echo "  frb-stage populates ${STAGING}/ from crates/whitenoise-frb/template/" >&2
+    echo "  and is where codegen output lands (gitignored on master)." >&2
     exit 1
 fi
 
 if [[ ! -f "${STAGING}/pubspec.yaml" ]]; then
-    echo "✗ ${STAGING}/pubspec.yaml missing — staging worktree is incomplete." >&2
-    echo "  Re-run 'just frb-stage' to refresh the worktree from origin." >&2
+    echo "✗ ${STAGING}/pubspec.yaml missing — staging directory is incomplete." >&2
+    echo "  Re-run 'just frb-stage' to refresh from the vendored template." >&2
     exit 1
 fi
 
@@ -47,7 +47,7 @@ fi
 
 if command -v cargo >/dev/null 2>&1; then
     echo "Formatting generated Rust file..."
-    cargo fmt --package rust_lib_whitenoise
+    cargo fmt --package whitenoise_frb
 fi
 
 # Vendor the wrapper crate so cargokit (driven by ${STAGING}/{linux,android,...}
@@ -57,12 +57,18 @@ fi
 # "Content hash on Dart side ... is different from Rust side" mismatch.
 #
 # Locally we keep `whitenoise = { path = "../.." }` — from ${STAGING}/rust/
-# that resolves to the master worktree root where the `whitenoise` crate
-# lives. CI rewrites this dep to a git rev because the orphan branch it
-# pushes has no shared history with master.
+# that resolves to the master worktree root. CI rewrites this dep to a git
+# rev before publishing the tarball, since the published package has no
+# shared history with master.
+#
+# Exclude template/ (the vendored Flutter package shell) and target/ (Rust
+# build artifacts) — neither belong inside the vendored wrapper.
 echo "Vendoring wrapper crate into ${STAGING}/rust/..."
 rm -rf "${STAGING}/rust"
 mkdir -p "${STAGING}/rust"
-cp -r crates/whitenoise-frb/. "${STAGING}/rust/"
+(cd crates/whitenoise-frb && tar \
+    --exclude='./template' \
+    --exclude='./target' \
+    -cf - .) | tar -xf - -C "${STAGING}/rust/"
 
 echo "Done. Inspect changes with: git -C ${STAGING} diff"

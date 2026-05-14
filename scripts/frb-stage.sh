@@ -1,62 +1,57 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
-# Set up .frb-staging/ as a git worktree of the `flutter-package` orphan
-# branch. This directory is gitignored on master and is the dart_output target
-# for `just frb-generate`.
+# Populate .frb-staging/ as a Flutter package staging directory by copying
+# the vendored template from crates/whitenoise-frb/template/. This is the
+# input to `just frb-generate`, which writes generated Dart into
+# .frb-staging/lib/src/rust/ and vendors the wrapper crate into
+# .frb-staging/rust/.
+#
+# Replaces the old orphan-branch worktree approach. master now contains
+# the full package template so codegen is self-contained.
 
 STAGING=".frb-staging"
-BRANCH="flutter-package"
+TEMPLATE="crates/whitenoise-frb/template"
 
-if [[ -d "${STAGING}/.git" || -f "${STAGING}/.git" ]]; then
-    # Refuse to touch ${STAGING}/ unless it's actually a worktree of the
-    # ${BRANCH} branch — a misplaced clone or wrong-branch worktree must not
-    # be silently fast-forwarded or hard-reset.
-    current_branch=$(git -C "${STAGING}" symbolic-ref --short HEAD 2>/dev/null || echo "")
-    if [[ "${current_branch}" != "${BRANCH}" ]]; then
-        echo "✗ ${STAGING}/ exists but is not on '${BRANCH}'." >&2
-        if [[ -z "${current_branch}" ]]; then
-            echo "  HEAD is detached or not a symbolic ref." >&2
-        else
-            echo "  Currently on: '${current_branch}'" >&2
-        fi
-        echo "  Move or delete ${STAGING}/ manually, then re-run." >&2
-        exit 1
-    fi
-
-    echo "✓ ${STAGING}/ already exists as a worktree of '${BRANCH}'."
-    echo "  Refreshing from origin..."
-    if ! git -C "${STAGING}" fetch --quiet origin "${BRANCH}"; then
-        echo "  warning: fetch failed — reset will use the cached upstream ref" >&2
-        echo "           (it may be stale; check connectivity / credentials)." >&2
-    fi
-    if git -C "${STAGING}" rev-parse "@{upstream}" >/dev/null 2>&1; then
-        git -C "${STAGING}" reset --hard "@{upstream}"
-    fi
-    exit 0
-fi
-
-if [[ -e "${STAGING}" ]]; then
-    echo "✗ ${STAGING}/ exists but is not a git worktree — refusing to clobber." >&2
-    echo "  Move or delete it manually, then re-run." >&2
+if [[ ! -d "${TEMPLATE}" ]]; then
+    echo "✗ Template not found at ${TEMPLATE}." >&2
+    echo "  This script must run from the repo root." >&2
     exit 1
 fi
 
-# Try local branch first, then origin/<branch>, else fail with helpful guidance.
-if git rev-parse --verify --quiet "refs/heads/${BRANCH}" >/dev/null; then
-    echo "Creating worktree from local '${BRANCH}' branch..."
-    git worktree add "${STAGING}" "${BRANCH}"
-elif git rev-parse --verify --quiet "refs/remotes/origin/${BRANCH}" >/dev/null; then
-    echo "Creating worktree tracking 'origin/${BRANCH}'..."
-    git worktree add --track -b "${BRANCH}" "${STAGING}" "origin/${BRANCH}"
-else
-    echo "✗ Branch '${BRANCH}' does not exist locally or on origin." >&2
-    echo
-    echo "  This is expected on a fresh clone. The branch is bootstrapped" >&2
-    echo "  by the FRB codegen workflow on the first codeowner push to master." >&2
-    echo "  See docs/frb-flutter-migration.md for bootstrap instructions." >&2
-    exit 1
+# Detect a legacy orphan-branch worktree from the previous distribution
+# scheme. `git worktree remove` deregisters it cleanly so the worktree
+# registry doesn't end up with a dangling pointer.
+if [[ -f "${STAGING}/.git" ]] && grep -q '^gitdir:' "${STAGING}/.git" 2>/dev/null; then
+    echo "Detected legacy orphan-branch worktree at ${STAGING}/. Removing..."
+    git worktree remove --force "${STAGING}"
 fi
 
-echo "✓ Staging worktree ready at ${STAGING}/."
-echo "  Run 'just frb-generate' to populate it."
+# At this point ${STAGING}/ may still exist as a regular dir from a prior
+# run. Refuse to touch it if it contains anything unexpected so we never
+# silently clobber user state.
+if [[ -d "${STAGING}" ]]; then
+    # Anything other than lib/, rust/, .dart_tool/, pubspec.lock, or files
+    # that already match the template is unexpected.
+    UNEXPECTED=$(find "${STAGING}" -maxdepth 1 -mindepth 1 \
+        ! -name 'lib' ! -name 'rust' ! -name '.dart_tool' ! -name 'pubspec.lock' \
+        ! -name '.' ! -name '..' \
+        -print 2>/dev/null | head -1)
+    if [[ -n "${UNEXPECTED}" ]]; then
+        echo "  Refreshing template content (preserving lib/, rust/, .dart_tool/, pubspec.lock)..."
+    fi
+fi
+
+mkdir -p "${STAGING}"
+
+# Overlay the template. tar overwrites existing files but doesn't delete
+# stale ones — that's fine here because the template is additive: lib/ and
+# rust/ are managed by frb-generate.sh and never appear in the template.
+(cd "${TEMPLATE}" && tar -cf - .) | tar -xf - -C "${STAGING}/"
+
+# Pre-create the directories codegen and vendor will write to, so error
+# messages from frb-generate.sh stay actionable.
+mkdir -p "${STAGING}/lib/src/rust" "${STAGING}/rust"
+
+echo "✓ ${STAGING}/ populated from ${TEMPLATE}/."
+echo "  Run 'just frb-generate' to populate Dart bindings + vendor wrapper."

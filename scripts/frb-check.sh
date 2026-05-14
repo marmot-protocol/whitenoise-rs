@@ -6,14 +6,14 @@ set -euo pipefail
 # (added Rust APIs that don't compile, missing trait impls, drift in the
 # generated `frb_generated.rs` after a regen, etc.).
 
-echo "🔍 Format-checking rust_lib_whitenoise..."
-cargo fmt --package rust_lib_whitenoise --check
+echo "🔍 Format-checking whitenoise_frb..."
+cargo fmt --package whitenoise_frb --check
 
-echo "🔍 Linting rust_lib_whitenoise..."
+echo "🔍 Linting whitenoise_frb..."
 cargo clippy \
     --no-deps \
-    --package rust_lib_whitenoise \
+    --package whitenoise_frb \
     --all-targets \
     -- -D warnings -A clippy::uninlined_format_args
 
-echo "✅ rust_lib_whitenoise checks passed"
+echo "✅ whitenoise_frb checks passed"
