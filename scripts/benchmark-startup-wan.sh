@@ -36,6 +36,15 @@ CONTACT_LIST_RELAY="ws://localhost:8080"
 RUST_LOG_TIMING="warn,whitenoise::init_timing=info"
 RUST_LOG_LOGIN="warn,whitenoise=info"
 
+if ! [[ "$LATENCY_MS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: latency_ms must be a non-negative integer (got: '$LATENCY_MS')" >&2
+    exit 1
+fi
+if ! [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: iterations must be a positive integer (got: '$ITERATIONS')" >&2
+    exit 1
+fi
+
 CARGO_BIN=(cargo run --bin benchmark_test --features benchmark-tests --release --)
 
 trap toxiproxy_down EXIT

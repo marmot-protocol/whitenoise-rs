@@ -26,6 +26,11 @@ LATENCY_MS="${2:-0}"
 DATA_DIR="./dev/data/benchmark_test"
 RESULTS_DIR="./benchmark_results"
 
+if ! [[ "$LATENCY_MS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: latency_ms must be a non-negative integer (got: '$LATENCY_MS')" >&2
+    exit 1
+fi
+
 mkdir -p "$RESULTS_DIR"
 rm -rf "$DATA_DIR" && mkdir -p "$DATA_DIR"
 

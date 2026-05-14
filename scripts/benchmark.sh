@@ -23,8 +23,14 @@ SCENARIO="${1:-}"
 LATENCY_MS="${2:-0}"
 DATA_DIR="./dev/data/benchmark_test"
 
+if ! [[ "$LATENCY_MS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: latency_ms must be a non-negative integer (got: '$LATENCY_MS')" >&2
+    exit 1
+fi
+
 CARGO_BIN=(cargo run --bin benchmark_test --features benchmark-tests --release --)
 RELAY_ARGS=()
+LATENCY_LABEL=""
 
 if [ "$LATENCY_MS" -gt 0 ]; then
     trap toxiproxy_down EXIT
@@ -32,6 +38,7 @@ if [ "$LATENCY_MS" -gt 0 ]; then
     toxiproxy_up
     toxiproxy_apply_latency "$LATENCY_MS"
     RELAY_ARGS=(--relays "${TOXIPROXY_RELAYS[0]}" --relays "${TOXIPROXY_RELAYS[1]}")
+    LATENCY_LABEL=" at ${LATENCY_MS}ms latency"
 fi
 
 rm -rf "$DATA_DIR"
@@ -41,9 +48,9 @@ ARGS=(--data-dir "$DATA_DIR" --logs-dir "$DATA_DIR")
 [ -n "$SCENARIO" ] && ARGS+=("$SCENARIO")
 
 if [ -z "$SCENARIO" ]; then
-    echo "Running all benchmarks..."
+    echo "Running all benchmarks${LATENCY_LABEL}..."
 else
-    echo "Running benchmark: $SCENARIO${LATENCY_MS:+ at ${LATENCY_MS}ms latency}"
+    echo "Running benchmark: ${SCENARIO}${LATENCY_LABEL}"
 fi
 
 RUST_LOG=warn,benchmark_test=info,whitenoise=info \

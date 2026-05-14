@@ -720,22 +720,30 @@ impl Whitenoise {
     /// relays and settings, spawns the event-processing loop, scheduled
     /// tasks, and the discovery sync worker.
     ///
-    /// **Subscription setup is initiated asynchronously and continues after
-    /// this function returns.** A background task brings up per-account inbox
-    /// and group-plane subscriptions and signals the discovery sync worker;
-    /// the `subscription_health_check` scheduled task is the recovery safety
-    /// net. Callers that need synchronously-live subscriptions (for example,
-    /// the iOS background-push path) must call
-    /// [`Self::ensure_all_subscriptions`] before depending on inbound event
-    /// delivery — the existing FFI entry point in
+    /// **Relay-bound init is performed asynchronously and continues after
+    /// this function returns.** Two background tasks are spawned: one brings
+    /// the discovery plane online (connecting to the configured discovery
+    /// relays and warming the ephemeral pool against the same URLs); the
+    /// other ensures per-account inbox / group-plane subscriptions are
+    /// operational and signals the discovery sync worker. Callers that need
+    /// synchronously-live subscriptions (for example, the iOS background-push
+    /// path) must call [`Self::ensure_all_subscriptions`] before depending on
+    /// inbound event delivery — the existing FFI entry point in
     /// [`crate::whitenoise::background_notifications`] already does this.
+    ///
+    /// Operations that read or publish through the discovery plane
+    /// (`fetch_user_relays`, the discovery sync worker's own rebuild, etc.)
+    /// will lazy-connect on first use if the background task has not yet
+    /// completed, so no caller has to wait explicitly. The
+    /// `subscription_health_check` scheduled task is the recovery safety net
+    /// for any transient relay failure within either deferred task.
     ///
     /// Callers own the returned `Arc` for the lifetime of the process (or the
     /// test) and drop it to tear the instance down. Sessions and event
     /// handlers receive their own `Arc<Whitenoise>` clones internally via the
-    /// weak self-reference stamped at construction. The deferred subscription
-    /// task is registered with the background-task pool, so [`Self::shutdown`]
-    /// waits for it to complete before returning.
+    /// weak self-reference stamped at construction. Both deferred tasks are
+    /// registered with the background-task pool, so [`Self::shutdown`] waits
+    /// for them to complete before returning.
     #[perf_instrument("whitenoise")]
     pub async fn new(mut config: WhitenoiseConfig) -> Result<Arc<Self>> {
         init_timing::start();
@@ -872,13 +880,31 @@ impl Whitenoise {
 
         init_timing::record("database_seeding");
 
-        whitenoise
-            .shared
-            .relay_control
-            .start_discovery_plane()
-            .await?;
+        // Two invariants make deferring the discovery-plane start safe:
+        //   1. No init step below (`restore_sessions`,
+        //      `sync_message_cache_on_startup`, `backfill_dm_peer_pubkeys`,
+        //      the worker spawns) touches the discovery plane. Preserve this
+        //      when adding steps here.
+        //   2. The deferred subscription setup signals the discovery worker,
+        //      whose `sync_discovery_subscriptions` itself calls
+        //      `discovery.start()`. Both paths converge on
+        //      `ensure_relays_connected`, which is idempotent at the
+        //      relay-client layer.
+        {
+            let wn = Arc::clone(&whitenoise);
+            whitenoise
+                .spawn_background(async move {
+                    if let Err(error) = wn.shared.relay_control.start_discovery_plane().await {
+                        tracing::warn!(
+                            target: "whitenoise::new",
+                            "Background discovery-plane start failed: {error}"
+                        );
+                    }
+                })
+                .await;
+        }
 
-        init_timing::record("discovery_plane");
+        init_timing::record("discovery_plane_spawned");
 
         // Restore account sessions before any startup step that resolves a
         // session by pubkey. `sync_message_cache_on_startup` reads per-account
@@ -965,11 +991,10 @@ impl Whitenoise {
 
         init_timing::record("background_tasks");
 
-        // Bring up subscriptions in the background. `ensure_all_subscriptions`
-        // is the right primitive here (not `setup_all_subscriptions`): it
-        // checks the operational state per account and skips accounts whose
-        // subscriptions were already set up by a concurrent `login` /
-        // `create_identity` call, so the deferred task composes safely with
+        // `ensure_all_subscriptions` is the right primitive here (not
+        // `setup_all_subscriptions`): it checks per-account operational state
+        // and skips accounts whose subscriptions were already set up by a
+        // concurrent `login` / `create_identity`, so this composes safely with
         // any account-creation work that runs after `Whitenoise::new` returns.
         {
             let wn = Arc::clone(&whitenoise);
