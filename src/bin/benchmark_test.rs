@@ -258,6 +258,15 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
     Ok(())
 }
 
+/// Drains tracing-appender workers when `main` returns by any path.
+struct FlushTracingOnDrop;
+
+impl Drop for FlushTracingOnDrop {
+    fn drop(&mut self) {
+        ::whitenoise::shutdown_tracing();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
@@ -266,6 +275,7 @@ async fn main() -> Result<(), WhitenoiseError> {
     // the layer is part of the subscriber stack from the very first span.
     let perf_layer = init_perf_layer();
     init_tracing_with_perf_layer(&args.logs_dir, perf_layer);
+    let _flush_tracing = FlushTracingOnDrop;
 
     if args.detailed {
         DETAILED_MODE.store(true, Ordering::Relaxed);
@@ -286,13 +296,9 @@ async fn main() -> Result<(), WhitenoiseError> {
             RelayUrl::parse("ws://localhost:8080").unwrap(),
             RelayUrl::parse("ws://localhost:7777").unwrap(),
         ]);
-    let whitenoise = match Whitenoise::new(config).await {
-        Ok(wn) => wn,
-        Err(err) => {
-            tracing::error!("Failed to initialize Whitenoise: {}", err);
-            std::process::exit(1);
-        }
-    };
+    let whitenoise = Whitenoise::new(config).await.inspect_err(|err| {
+        tracing::error!(target: "whitenoise::benchmark", "Failed to initialize Whitenoise: {}", err);
+    })?;
 
     if let Some(ref nsec) = args.login {
         let account = whitenoise.login(nsec.clone()).await?;
