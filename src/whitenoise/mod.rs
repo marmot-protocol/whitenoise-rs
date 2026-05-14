@@ -215,6 +215,7 @@ impl WhitenoiseConfig {
         self
     }
 
+    /// Configure opt-in product analytics; validated when `Whitenoise` is initialized.
     pub fn with_product_analytics_config(
         mut self,
         config: product_analytics::ProductAnalyticsConfig,

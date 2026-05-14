@@ -6,7 +6,7 @@ use serde_json::{Map, Number, Value};
 use crate::whitenoise::Result;
 use crate::whitenoise::error::WhitenoiseError;
 
-pub const PRODUCT_ANALYTICS_SCHEMA_VERSION: f64 = 1.0;
+pub const PRODUCT_ANALYTICS_SCHEMA_VERSION: u32 = 1;
 const MAX_PROP_KEY_LEN: usize = 48;
 const MAX_PROP_VALUE_LEN: usize = 64;
 
@@ -24,7 +24,7 @@ impl ProductAnalyticsEvent {
             string_props: Vec::new(),
             number_props: vec![ProductAnalyticsNumberProp {
                 key: "schema_version".to_string(),
-                value: PRODUCT_ANALYTICS_SCHEMA_VERSION,
+                value: f64::from(PRODUCT_ANALYTICS_SCHEMA_VERSION),
             }],
         }
     }
@@ -294,6 +294,8 @@ fn contains_sensitive_pattern(value: &str) -> bool {
         || lower.starts_with("nsec")
         || lower.starts_with("nevent")
         || lower.starts_with("nprofile")
+        || lower.starts_with("naddr")
+        || lower.starts_with("nrelay")
         || lower.starts_with("wss://")
         || lower.starts_with("ws://")
         || lower.starts_with("https://")
@@ -318,27 +320,179 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_name_serializes_to_expected_snake_case() {
+    fn event_names_serialize_to_stable_snake_case() {
+        let cases = [
+            (
+                ProductAnalyticsEventName::AnalyticsEnabled,
+                "analytics_enabled",
+            ),
+            (ProductAnalyticsEventName::AppStarted, "app_started"),
+            (
+                ProductAnalyticsEventName::AppForegrounded,
+                "app_foregrounded",
+            ),
+            (
+                ProductAnalyticsEventName::AppBackgrounded,
+                "app_backgrounded",
+            ),
+            (
+                ProductAnalyticsEventName::OnboardingStarted,
+                "onboarding_started",
+            ),
+            (
+                ProductAnalyticsEventName::OnboardingCompleted,
+                "onboarding_completed",
+            ),
+            (
+                ProductAnalyticsEventName::IdentityCreated,
+                "identity_created",
+            ),
+            (ProductAnalyticsEventName::LoginStarted, "login_started"),
+            (ProductAnalyticsEventName::LoginCompleted, "login_completed"),
+            (ProductAnalyticsEventName::LoginFailed, "login_failed"),
+            (
+                ProductAnalyticsEventName::MessageSendStarted,
+                "message_send_started",
+            ),
+            (
+                ProductAnalyticsEventName::MessageSendCompleted,
+                "message_send_completed",
+            ),
+            (
+                ProductAnalyticsEventName::MessageSendFailed,
+                "message_send_failed",
+            ),
+            (
+                ProductAnalyticsEventName::GroupCreateStarted,
+                "group_create_started",
+            ),
+            (
+                ProductAnalyticsEventName::GroupCreateCompleted,
+                "group_create_completed",
+            ),
+            (
+                ProductAnalyticsEventName::GroupCreateFailed,
+                "group_create_failed",
+            ),
+            (ProductAnalyticsEventName::MembersAdded, "members_added"),
+            (ProductAnalyticsEventName::MembersRemoved, "members_removed"),
+            (
+                ProductAnalyticsEventName::GroupDataUpdated,
+                "group_data_updated",
+            ),
+            (
+                ProductAnalyticsEventName::MediaUploadStarted,
+                "media_upload_started",
+            ),
+            (
+                ProductAnalyticsEventName::MediaUploadCompleted,
+                "media_upload_completed",
+            ),
+            (
+                ProductAnalyticsEventName::MediaUploadFailed,
+                "media_upload_failed",
+            ),
+            (
+                ProductAnalyticsEventName::PushRegistrationCompleted,
+                "push_registration_completed",
+            ),
+            (
+                ProductAnalyticsEventName::PushRegistrationFailed,
+                "push_registration_failed",
+            ),
+            (ProductAnalyticsEventName::SettingChanged, "setting_changed"),
+        ];
+
+        for (event_name, expected) in cases {
+            assert_eq!(event_name.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn validator_accepts_first_pass_event_prop_matrix() {
+        let cases = [
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AnalyticsEnabled),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop("platform", "ios"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppForegrounded)
+                .with_string_prop("platform", "android"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppBackgrounded)
+                .with_string_prop("platform", "macos"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::OnboardingStarted),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::OnboardingCompleted),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::IdentityCreated)
+                .with_string_prop("account_type", "local_key"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::LoginStarted)
+                .with_string_prop("account_type", "external_signer"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::LoginCompleted)
+                .with_string_prop("account_type", "unknown")
+                .with_string_prop("duration_bucket", "lt_250ms"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::LoginFailed)
+                .with_string_prop("account_type", "local_key")
+                .with_string_prop("error_kind", "timeout")
+                .with_string_prop("duration_bucket", "250ms_1s"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MessageSendStarted)
+                .with_string_prop("chat_type", "dm"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MessageSendCompleted)
+                .with_string_prop("chat_type", "group")
+                .with_string_prop("duration_bucket", "1_5s"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MessageSendFailed)
+                .with_string_prop("chat_type", "unknown")
+                .with_string_prop("error_kind", "crypto")
+                .with_string_prop("duration_bucket", "5_30s"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::GroupCreateStarted),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::GroupCreateCompleted)
+                .with_string_prop("duration_bucket", "30s_plus"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::GroupCreateFailed)
+                .with_string_prop("error_kind", "validation")
+                .with_string_prop("duration_bucket", "250ms_1s"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MembersAdded)
+                .with_string_prop("member_count_bucket", "3_5"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MembersRemoved)
+                .with_string_prop("member_count_bucket", "26_plus"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::GroupDataUpdated),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MediaUploadStarted)
+                .with_string_prop("media_kind", "image")
+                .with_string_prop("media_size_bucket", "lt_1mb"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MediaUploadCompleted)
+                .with_string_prop("media_kind", "video")
+                .with_string_prop("media_size_bucket", "1_5mb")
+                .with_string_prop("duration_bucket", "1_5s"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::MediaUploadFailed)
+                .with_string_prop("media_kind", "pdf")
+                .with_string_prop("media_size_bucket", "25mb_plus")
+                .with_string_prop("error_kind", "storage")
+                .with_string_prop("duration_bucket", "30s_plus"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::PushRegistrationCompleted)
+                .with_string_prop("platform", "ios"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::PushRegistrationFailed)
+                .with_string_prop("platform", "android")
+                .with_string_prop("error_kind", "permission"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::SettingChanged)
+                .with_string_prop("setting", "analytics")
+                .with_string_prop("value", "enabled"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::SettingChanged)
+                .with_string_prop("setting", "notifications")
+                .with_string_prop("value", "disabled"),
+        ];
+
+        for event in cases {
+            event.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn validated_props_includes_schema_version_and_string_props() {
+        let props = ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+            .with_string_prop("platform", "ios")
+            .validated_props()
+            .unwrap();
+
         assert_eq!(
-            ProductAnalyticsEventName::GroupCreateStarted.as_str(),
-            "group_create_started"
+            props.get("platform"),
+            Some(&Value::String("ios".to_string()))
         );
-        assert_eq!(
-            ProductAnalyticsEventName::GroupCreateCompleted.as_str(),
-            "group_create_completed"
-        );
-        assert_eq!(
-            ProductAnalyticsEventName::GroupCreateFailed.as_str(),
-            "group_create_failed"
-        );
-        assert_eq!(
-            ProductAnalyticsEventName::MembersAdded.as_str(),
-            "members_added"
-        );
-        assert_eq!(
-            ProductAnalyticsEventName::GroupDataUpdated.as_str(),
-            "group_data_updated"
-        );
+        assert_eq!(props.get("schema_version"), Some(&Value::from(1.0)));
     }
 
     #[test]
@@ -360,10 +514,57 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_props_for_analytics_enabled() {
+        let event = ProductAnalyticsEvent::new(ProductAnalyticsEventName::AnalyticsEnabled)
+            .with_string_prop("platform", "ios");
+
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn global_prop_values_reject_unknown_keys() {
+        assert!(!global_prop_value_allowed("future_key", "value"));
+    }
+
+    #[test]
+    fn validator_rejects_invalid_prop_keys_and_values() {
+        let long_key = "x".repeat(MAX_PROP_KEY_LEN + 1);
+        let long_value = "x".repeat(MAX_PROP_VALUE_LEN + 1);
+        let cases = [
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop("", "ios"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop(&long_key, "ios"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop("platform", "ios-\u{1f600}"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop("platform", ""),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop("platform", &long_value),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop("platform", "beos"),
+            ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                .with_string_prop("platform", "nrelay1qqt8wumn8ghj7"),
+        ];
+
+        for event in cases {
+            assert!(event.validate().is_err());
+        }
+    }
+
+    #[test]
     fn validator_rejects_duplicate_prop_keys() {
         let event = ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
             .with_string_prop("platform", "ios")
             .with_string_prop("platform", "android");
+
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn validator_rejects_duplicate_number_prop_keys() {
+        let event = ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+            .with_number_prop("schema_version", 1.0);
 
         assert!(event.validate().is_err());
     }
@@ -377,6 +578,14 @@ mod tests {
             );
 
         assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn validator_rejects_extended_nip19_patterns() {
+        assert!(contains_sensitive_pattern("naddr1qqxnzdesxqcrqvpsxq"));
+        assert!(contains_sensitive_pattern(
+            "nrelay1qqt8wumn8ghj7un9d3shjtnyv9kh2uewd9hs"
+        ));
     }
 
     #[test]

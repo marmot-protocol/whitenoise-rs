@@ -10,15 +10,14 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use super::aptabase::AptabaseProductAnalyticsClient;
 use super::client::ProductAnalyticsClient;
 use super::{
-    ProductAnalyticsBackend, ProductAnalyticsConfig, ProductAnalyticsEvent,
-    ProductAnalyticsEventName, ProductAnalyticsFlushStatus, ProductAnalyticsSettings,
-    ProductAnalyticsTrackStatus,
+    PRODUCT_ANALYTICS_MAX_BATCH_SIZE, ProductAnalyticsBackend, ProductAnalyticsConfig,
+    ProductAnalyticsEvent, ProductAnalyticsEventName, ProductAnalyticsFlushStatus,
+    ProductAnalyticsSettings, ProductAnalyticsTrackStatus, utc_now_millis,
 };
 use crate::whitenoise::Result;
 use crate::whitenoise::database::Database;
 use crate::whitenoise::error::WhitenoiseError;
 
-const MAX_BATCH_SIZE: usize = 25;
 const WORKER_QUEUE_SIZE: usize = 100;
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -77,15 +76,19 @@ impl ProductAnalytics {
             ));
         }
 
+        let current_settings = ProductAnalyticsSettings::find_or_create_default(database).await?;
         let settings = ProductAnalyticsSettings {
             enabled,
-            updated_at: Utc::now(),
+            created_at: current_settings.created_at,
+            updated_at: utc_now_millis(),
             consent_version,
         };
         settings.save(database).await?;
 
         if enabled {
             self.rotate_session().await;
+            // `track` reads the session id after this await, so the opt-in marker
+            // is the first event in the newly rotated analytics session.
             if let Err(e) = self
                 .track(
                     database,
@@ -131,12 +134,20 @@ impl ProductAnalytics {
             props: event.validated_props()?,
         };
 
-        command_sender
-            .send(WorkerCommand::Track(Box::new(prepared)))
-            .await
-            .map_err(|_| {
-                WhitenoiseError::ProductAnalytics("analytics worker is unavailable".to_string())
-            })?;
+        match command_sender.try_send(WorkerCommand::Track(Box::new(prepared))) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!(
+                    target: "whitenoise::product_analytics",
+                    "Dropping product analytics event because the in-memory queue is full"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(WhitenoiseError::ProductAnalytics(
+                    "analytics worker is unavailable".to_string(),
+                ));
+            }
+        }
 
         Ok(ProductAnalyticsTrackStatus::Queued)
     }
@@ -152,12 +163,17 @@ impl ProductAnalytics {
         };
 
         let (reply_sender, reply_receiver) = oneshot::channel();
-        command_sender
-            .send(WorkerCommand::Flush(reply_sender))
-            .await
-            .map_err(|_| {
-                WhitenoiseError::ProductAnalytics("analytics worker is unavailable".to_string())
-            })?;
+        match command_sender.try_send(WorkerCommand::Flush(reply_sender)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Ok(ProductAnalyticsFlushStatus::TimedOut);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(WhitenoiseError::ProductAnalytics(
+                    "analytics worker is unavailable".to_string(),
+                ));
+            }
+        }
 
         match tokio::time::timeout(FLUSH_TIMEOUT, reply_receiver).await {
             Ok(Ok(status)) => Ok(status),
@@ -170,7 +186,7 @@ impl ProductAnalytics {
 
     async fn purge_pending_events(&self) {
         if let Some(command_sender) = &self.command_sender
-            && command_sender.send(WorkerCommand::Purge).await.is_err()
+            && command_sender.try_send(WorkerCommand::Purge).is_err()
         {
             tracing::debug!(
                 target: "whitenoise::product_analytics",
@@ -268,8 +284,8 @@ async fn send_queued_batches(
     }
 
     while !queue.is_empty() {
-        let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
-        while batch.len() < MAX_BATCH_SIZE {
+        let mut batch = Vec::with_capacity(PRODUCT_ANALYTICS_MAX_BATCH_SIZE);
+        while batch.len() < PRODUCT_ANALYTICS_MAX_BATCH_SIZE {
             let Some(event) = queue.pop_front() else {
                 break;
             };
@@ -298,10 +314,12 @@ fn generate_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use tokio::sync::Mutex as TokioMutex;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::whitenoise::database::Database;
@@ -316,6 +334,10 @@ mod tests {
         failures_remaining: AtomicUsize,
     }
 
+    struct BlockingClient {
+        started: Notify,
+    }
+
     #[async_trait]
     impl ProductAnalyticsClient for RecordingClient {
         async fn send_events(&self, events: &[PreparedProductAnalyticsEvent]) -> Result<()> {
@@ -325,6 +347,14 @@ mod tests {
             }
             self.batches.lock().await.push(events.to_vec());
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProductAnalyticsClient for BlockingClient {
+        async fn send_events(&self, _events: &[PreparedProductAnalyticsEvent]) -> Result<()> {
+            self.started.notify_one();
+            future::pending::<Result<()>>().await
         }
     }
 
@@ -343,12 +373,47 @@ mod tests {
         }
     }
 
+    fn prepared_event(event_name: &str) -> PreparedProductAnalyticsEvent {
+        let mut props = Map::new();
+        props.insert("schema_version".to_string(), Value::from(1));
+        PreparedProductAnalyticsEvent {
+            timestamp: Utc::now(),
+            session_id: "171351624706652714".to_string(),
+            event_name: event_name.to_string(),
+            system_props: test_config().system_props(),
+            props,
+        }
+    }
+
+    fn analytics_with_sender(command_sender: mpsc::Sender<WorkerCommand>) -> ProductAnalytics {
+        ProductAnalytics {
+            config: Some(test_config()),
+            command_sender: Some(command_sender),
+            session_id: Arc::new(Mutex::new("171351624706652714".to_string())),
+        }
+    }
+
     async fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(dir.path().join("analytics.sqlite"))
             .await
             .unwrap();
         (db, dir)
+    }
+
+    async fn enable_settings(database: &Database) {
+        let mut settings = ProductAnalyticsSettings::find_or_create_default(database)
+            .await
+            .unwrap();
+        settings.enabled = true;
+        settings.save(database).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_with_aptabase_backend_starts_worker() {
+        let analytics = ProductAnalytics::new(Some(test_config()));
+
+        assert!(analytics.command_sender.is_some());
     }
 
     #[tokio::test]
@@ -431,6 +496,349 @@ mod tests {
         let _ = analytics.flush(&db).await.unwrap();
 
         let batches = client.batches.lock().await;
-        assert!(batches.iter().all(|batch| batch.len() <= MAX_BATCH_SIZE));
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.len() <= PRODUCT_ANALYTICS_MAX_BATCH_SIZE)
+        );
+    }
+
+    #[tokio::test]
+    async fn tracking_drops_instead_of_blocking_when_queue_is_full() {
+        let (db, _dir) = test_db().await;
+        let client = Arc::new(BlockingClient {
+            started: Notify::new(),
+        });
+        let analytics = ProductAnalytics::with_client(test_config(), client.clone());
+        analytics
+            .set_enabled(&db, true, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+            .await
+            .unwrap();
+        client.started.notified().await;
+
+        for _ in 0..WORKER_QUEUE_SIZE {
+            analytics
+                .track(
+                    &db,
+                    ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                        .with_string_prop("platform", "ios"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            analytics.track(
+                &db,
+                ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                    .with_string_prop("platform", "ios"),
+            ),
+        )
+        .await
+        .expect("track should not wait for queue capacity")
+        .unwrap();
+
+        assert_eq!(status, ProductAnalyticsTrackStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn tracking_reports_unconfigured_when_backend_disabled() {
+        let (db, _dir) = test_db().await;
+        let mut config = test_config();
+        config.backend = ProductAnalyticsBackend::Disabled;
+        let analytics = ProductAnalytics::new(Some(config));
+        enable_settings(&db).await;
+
+        let status = analytics
+            .track(
+                &db,
+                ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status, ProductAnalyticsTrackStatus::IgnoredUnconfigured);
+    }
+
+    #[tokio::test]
+    async fn tracking_drops_event_when_custom_queue_is_full() {
+        let (db, _dir) = test_db().await;
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .try_send(WorkerCommand::Track(Box::new(prepared_event("queued"))))
+            .unwrap();
+        let analytics = analytics_with_sender(sender);
+        enable_settings(&db).await;
+
+        let status = analytics
+            .track(
+                &db,
+                ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status, ProductAnalyticsTrackStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn tracking_reports_error_when_worker_channel_is_closed() {
+        let (db, _dir) = test_db().await;
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let analytics = analytics_with_sender(sender);
+        enable_settings(&db).await;
+
+        let err = analytics
+            .track(
+                &db,
+                ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WhitenoiseError::ProductAnalytics(_)));
+    }
+
+    #[tokio::test]
+    async fn set_enabled_succeeds_when_marker_event_cannot_be_queued() {
+        let (db, _dir) = test_db().await;
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let analytics = analytics_with_sender(sender);
+
+        let settings = analytics
+            .set_enabled(&db, true, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+            .await
+            .unwrap();
+
+        assert!(settings.enabled);
+    }
+
+    #[tokio::test]
+    async fn disabling_consent_persists_setting_and_purges_worker() {
+        let (db, _dir) = test_db().await;
+        let client = Arc::new(RecordingClient::default());
+        let analytics = ProductAnalytics::with_client(test_config(), client);
+        enable_settings(&db).await;
+
+        let settings = analytics
+            .set_enabled(&db, false, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+            .await
+            .unwrap();
+
+        assert!(!settings.enabled);
+        assert_eq!(settings.consent_version, PRODUCT_ANALYTICS_CONSENT_VERSION);
+    }
+
+    #[tokio::test]
+    async fn disabling_consent_drops_purge_when_queue_is_full() {
+        let (db, _dir) = test_db().await;
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .try_send(WorkerCommand::Track(Box::new(prepared_event("queued"))))
+            .unwrap();
+        let analytics = analytics_with_sender(sender);
+        enable_settings(&db).await;
+
+        let settings = analytics
+            .set_enabled(&db, false, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+            .await
+            .unwrap();
+
+        assert!(!settings.enabled);
+    }
+
+    #[tokio::test]
+    async fn flush_reports_unconfigured_when_enabled_without_worker() {
+        let (db, _dir) = test_db().await;
+        let mut config = test_config();
+        config.backend = ProductAnalyticsBackend::Disabled;
+        let analytics = ProductAnalytics::new(Some(config));
+        enable_settings(&db).await;
+
+        let status = analytics.flush(&db).await.unwrap();
+
+        assert_eq!(status, ProductAnalyticsFlushStatus::Unconfigured);
+    }
+
+    #[tokio::test]
+    async fn flush_reports_nothing_to_flush_for_empty_worker_queue() {
+        let (db, _dir) = test_db().await;
+        let client = Arc::new(RecordingClient::default());
+        let analytics = ProductAnalytics::with_client(test_config(), client.clone());
+        enable_settings(&db).await;
+
+        let status = analytics.flush(&db).await.unwrap();
+
+        assert_eq!(status, ProductAnalyticsFlushStatus::NothingToFlush);
+        assert!(client.batches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_reports_timed_out_when_command_queue_is_full() {
+        let (db, _dir) = test_db().await;
+        let client = Arc::new(BlockingClient {
+            started: Notify::new(),
+        });
+        let analytics = ProductAnalytics::with_client(test_config(), client.clone());
+        analytics
+            .set_enabled(&db, true, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+            .await
+            .unwrap();
+        client.started.notified().await;
+
+        for _ in 0..WORKER_QUEUE_SIZE {
+            analytics
+                .track(
+                    &db,
+                    ProductAnalyticsEvent::new(ProductAnalyticsEventName::AppStarted)
+                        .with_string_prop("platform", "ios"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let status = analytics.flush(&db).await.unwrap();
+
+        assert_eq!(status, ProductAnalyticsFlushStatus::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn flush_reports_error_when_worker_channel_is_closed() {
+        let (db, _dir) = test_db().await;
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let analytics = analytics_with_sender(sender);
+        enable_settings(&db).await;
+
+        let err = analytics.flush(&db).await.unwrap_err();
+
+        assert!(matches!(err, WhitenoiseError::ProductAnalytics(_)));
+    }
+
+    #[tokio::test]
+    async fn flush_reports_error_when_worker_drops_reply() {
+        let (db, _dir) = test_db().await;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let analytics = analytics_with_sender(sender);
+        enable_settings(&db).await;
+        let handle = tokio::spawn(async move {
+            if let Some(WorkerCommand::Flush(reply_sender)) = receiver.recv().await {
+                drop(reply_sender);
+            }
+        });
+
+        let err = analytics.flush(&db).await.unwrap_err();
+        handle.await.unwrap();
+
+        assert!(matches!(err, WhitenoiseError::ProductAnalytics(_)));
+    }
+
+    #[tokio::test]
+    async fn run_worker_accepts_purge_as_primary_command() {
+        let (sender, receiver) = mpsc::channel(1);
+        let client = Arc::new(RecordingClient::default());
+        let handle = tokio::spawn(run_worker(receiver, client));
+
+        sender.send(WorkerCommand::Purge).await.unwrap();
+        drop(sender);
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn drain_ready_commands_handles_disconnected_receiver() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        drop(sender);
+        let mut queue = VecDeque::new();
+
+        let pending_flushes = drain_ready_commands(&mut receiver, &mut queue);
+
+        assert!(pending_flushes.is_empty());
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_enabled_rejects_invalid_consent_version() {
+        let (db, _dir) = test_db().await;
+        let client = Arc::new(RecordingClient::default());
+        let analytics = ProductAnalytics::with_client(test_config(), client);
+
+        assert!(
+            analytics
+                .set_enabled(&db, true, " ".to_string())
+                .await
+                .is_err()
+        );
+        assert!(
+            analytics
+                .set_enabled(&db, true, "x".repeat(65))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_queued_batches_drops_failed_batches() {
+        let recording_client = Arc::new(RecordingClient::default());
+        recording_client
+            .failures_remaining
+            .store(1, Ordering::SeqCst);
+        let client: Arc<dyn ProductAnalyticsClient> = recording_client.clone();
+        let mut queue = VecDeque::from([prepared_event("app_started")]);
+
+        let status = send_queued_batches(&mut queue, &client).await;
+
+        assert_eq!(status, ProductAnalyticsFlushStatus::Flushed);
+        assert!(queue.is_empty());
+        assert!(recording_client.batches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_ready_commands_collects_flushes_and_honors_purge() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        sender
+            .try_send(WorkerCommand::Track(Box::new(prepared_event(
+                "app_started",
+            ))))
+            .unwrap();
+        sender.try_send(WorkerCommand::Flush(reply_sender)).unwrap();
+        sender.try_send(WorkerCommand::Purge).unwrap();
+        drop(sender);
+        let mut queue = VecDeque::from([prepared_event("login_started")]);
+
+        let pending_flushes = drain_ready_commands(&mut receiver, &mut queue);
+
+        assert_eq!(pending_flushes.len(), 1);
+        assert!(queue.is_empty());
+        drop(pending_flushes);
+        assert!(reply_receiver.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_worker_replies_to_flush_drained_after_track() {
+        let (sender, receiver) = mpsc::channel(4);
+        let recording_client = Arc::new(RecordingClient::default());
+        let client: Arc<dyn ProductAnalyticsClient> = recording_client.clone();
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        sender
+            .try_send(WorkerCommand::Track(Box::new(prepared_event(
+                "app_started",
+            ))))
+            .unwrap();
+        sender.try_send(WorkerCommand::Flush(reply_sender)).unwrap();
+        drop(sender);
+
+        run_worker(receiver, client).await;
+
+        assert_eq!(
+            reply_receiver.await.unwrap(),
+            ProductAnalyticsFlushStatus::Flushed
+        );
+        let batches = recording_client.batches.lock().await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0].event_name, "app_started");
     }
 }

@@ -1,5 +1,3 @@
-use chrono::Utc;
-
 use super::Database;
 use super::utils::parse_timestamp;
 use crate::perf_span;
@@ -16,10 +14,12 @@ where
     fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
         let enabled_int: i64 = row.try_get("enabled")?;
         let consent_version: String = row.try_get("consent_version")?;
+        let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
         Ok(Self {
             enabled: enabled_int == 1,
+            created_at,
             updated_at,
             consent_version,
         })
@@ -31,7 +31,8 @@ pub(crate) async fn find_or_create_settings(
 ) -> Result<ProductAnalyticsSettings, WhitenoiseError> {
     let _span = perf_span!("db::product_analytics_find_or_create");
     match sqlx::query_as::<_, ProductAnalyticsSettings>(
-        "SELECT enabled, consent_version, updated_at FROM product_analytics_settings WHERE id = 1",
+        "SELECT enabled, consent_version, created_at, updated_at \
+         FROM product_analytics_settings WHERE id = 1",
     )
     .fetch_one(&database.pool)
     .await
@@ -53,7 +54,6 @@ pub(crate) async fn save_settings(
     database: &Database,
 ) -> Result<(), WhitenoiseError> {
     let _span = perf_span!("db::product_analytics_save");
-    let now = Utc::now().timestamp_millis();
     sqlx::query(
         "INSERT INTO product_analytics_settings \
          (id, enabled, consent_version, created_at, updated_at) VALUES (1, ?, ?, ?, ?) \
@@ -64,7 +64,7 @@ pub(crate) async fn save_settings(
     )
     .bind(i64::from(settings.enabled))
     .bind(&settings.consent_version)
-    .bind(now)
+    .bind(settings.created_at.timestamp_millis())
     .bind(settings.updated_at.timestamp_millis())
     .execute(&database.pool)
     .await

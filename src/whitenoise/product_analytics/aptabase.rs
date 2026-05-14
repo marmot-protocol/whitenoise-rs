@@ -4,12 +4,11 @@ use async_trait::async_trait;
 use reqwest::Url;
 
 use super::AptabaseAnalyticsConfig;
+use super::PRODUCT_ANALYTICS_MAX_BATCH_SIZE;
 use super::client::ProductAnalyticsClient;
 use super::worker::PreparedProductAnalyticsEvent;
 use crate::whitenoise::Result;
 use crate::whitenoise::error::WhitenoiseError;
-
-const MAX_APTABASE_BATCH_SIZE: usize = 25;
 
 static ANALYTICS_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -46,26 +45,30 @@ impl AptabaseProductAnalyticsClient {
 #[async_trait]
 impl ProductAnalyticsClient for AptabaseProductAnalyticsClient {
     async fn send_events(&self, events: &[PreparedProductAnalyticsEvent]) -> Result<()> {
-        for batch in events.chunks(MAX_APTABASE_BATCH_SIZE) {
-            if batch.is_empty() {
-                continue;
-            }
-            let response = ANALYTICS_HTTP_CLIENT
-                .post(self.endpoint.clone())
-                .header("App-Key", &self.app_key)
-                .json(batch)
-                .send()
-                .await
-                .map_err(|e| {
-                    WhitenoiseError::ProductAnalytics(format!("Aptabase request failed: {e}"))
-                })?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.len() > PRODUCT_ANALYTICS_MAX_BATCH_SIZE {
+            return Err(WhitenoiseError::ProductAnalytics(format!(
+                "Aptabase batch exceeds max size of {PRODUCT_ANALYTICS_MAX_BATCH_SIZE}"
+            )));
+        }
 
-            if !response.status().is_success() {
-                return Err(WhitenoiseError::ProductAnalytics(format!(
-                    "Aptabase request failed with status {}",
-                    response.status()
-                )));
-            }
+        let response = ANALYTICS_HTTP_CLIENT
+            .post(self.endpoint.clone())
+            .header("App-Key", &self.app_key)
+            .json(events)
+            .send()
+            .await
+            .map_err(|e| {
+                WhitenoiseError::ProductAnalytics(format!("Aptabase request failed: {e}"))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(WhitenoiseError::ProductAnalytics(format!(
+                "Aptabase request failed with status {}",
+                response.status()
+            )));
         }
 
         Ok(())
@@ -171,11 +174,83 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn send_events_accepts_empty_batch_without_network_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v0/events")
+            .with_status(500)
+            .create_async()
+            .await;
+        let client = AptabaseProductAnalyticsClient::new(&AptabaseAnalyticsConfig {
+            app_key: "A-TEST".to_string(),
+            host: server.url(),
+        });
+
+        client.send_events(&[]).await.unwrap();
+
+        mock.expect(0).assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_events_rejects_oversized_batch_before_network_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v0/events")
+            .with_status(202)
+            .create_async()
+            .await;
+        let client = AptabaseProductAnalyticsClient::new(&AptabaseAnalyticsConfig {
+            app_key: "A-TEST".to_string(),
+            host: server.url(),
+        });
+        let events = vec![event(); PRODUCT_ANALYTICS_MAX_BATCH_SIZE + 1];
+
+        assert!(client.send_events(&events).await.is_err());
+
+        mock.expect(0).assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_events_reports_non_success_status() {
+        let mut server = mockito::Server::new_async().await;
+        let event = event();
+        let mock = server
+            .mock("POST", "/api/v0/events")
+            .with_status(503)
+            .create_async()
+            .await;
+        let client = AptabaseProductAnalyticsClient::new(&AptabaseAnalyticsConfig {
+            app_key: "A-TEST".to_string(),
+            host: server.url(),
+        });
+
+        assert!(client.send_events(&[event]).await.is_err());
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_events_reports_transport_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = AptabaseProductAnalyticsClient::new(&AptabaseAnalyticsConfig {
+            app_key: "A-TEST".to_string(),
+            host,
+        });
+
+        assert!(client.send_events(&[event()]).await.is_err());
+    }
+
     #[test]
     fn validates_host_shape() {
         assert!(validate_host("https://analytics.example.com").is_ok());
         assert!(validate_host("http://127.0.0.1:1234").is_ok());
         assert!(validate_host("https://analytics.example.com/api").is_err());
         assert!(validate_host("https://user:pass@analytics.example.com").is_err());
+        assert!(validate_host("https://analytics.example.com?debug=true").is_err());
+        assert!(validate_host("https://analytics.example.com/#events").is_err());
+        assert!(validate_host("http://analytics.example.com").is_err());
     }
 }
