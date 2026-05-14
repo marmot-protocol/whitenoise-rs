@@ -38,6 +38,13 @@ mkdir -p "${OUTPUT_DIR}"
 TARBALL="${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}.tar.gz"
 VERSION_JSON="${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}.version.json"
 
+# Stamp the published version into pubspec.yaml. Pub clients validate that
+# the registry's `version` field matches the tarball's pubspec.version;
+# the template ships `version: 0.0.1` so without this rewrite every
+# publish lists as 0.0.0-dev+<sha> on the index but is internally 0.0.1,
+# and the resolver rejects "0.0.0-dev+<sha> doesn't match any versions".
+sed -i "s/^version: .*\$/version: ${VERSION}/" "${STAGING_DIR}/pubspec.yaml"
+
 # Tar from inside STAGING_DIR so pubspec.yaml lives at the archive root.
 # Exclude transient/local artifacts that must never ship.
 tar -czf "${TARBALL}" \
