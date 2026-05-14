@@ -412,8 +412,12 @@ test-nextest:
     cargo nextest run --all-features --all-targets
     cargo test --all-features --doc
 
-# Filename regex for excluding test infrastructure from coverage metrics
-coverage_ignore := '(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs)'
+# Filename regex for excluding test infrastructure from coverage metrics.
+# Also excludes the per-account Rust migration framework (mostly mechanical
+# `CREATE TABLE`/`ALTER TABLE` SQL with no branch logic) and the
+# whitenoise-cli crate (thin pass-through dispatch — its e2e tests live
+# under `tests/cli_*` and don't contribute to the lib coverage measurement).
+coverage_ignore := '(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs|rust_migrations/|crates/whitenoise-cli/)'
 
 # Generate code coverage report (lcov format, matches CI flags)
 coverage:
