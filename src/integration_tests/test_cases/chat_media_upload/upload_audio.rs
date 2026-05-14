@@ -1,7 +1,11 @@
+use std::io::Write;
+
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::whitenoise::media_files::AudioMetadata;
 use async_trait::async_trait;
 use nostr_sdk::Url;
+use sha2::{Digest, Sha256};
 
 /// Test case for uploading audio files (MP3)
 pub struct UploadAudioTestCase {
@@ -19,8 +23,6 @@ impl UploadAudioTestCase {
 
     /// Create a temporary MP3 audio file with valid magic bytes
     fn create_test_audio(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
-        use std::io::Write;
-
         let mut temp_file = tempfile::NamedTempFile::new()
             .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
 
@@ -64,10 +66,10 @@ impl TestCase for UploadAudioTestCase {
 
         // Read the file data and compute expected hash
         let test_audio_data = tokio::fs::read(temp_path).await?;
-        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(&test_audio_data);
         let expected_original_hash: [u8; 32] = hasher.finalize().into();
+        let audio_metadata = AudioMetadata::new(Some(12_345), Some(vec![0, 8, 42, 100]))?;
 
         let blossom_url = if cfg!(debug_assertions) {
             Some(Url::parse("http://localhost:3000").unwrap())
@@ -81,7 +83,13 @@ impl TestCase for UploadAudioTestCase {
             .unwrap()
             .groups()
             .media()
-            .upload_chat_media(&group.mls_group_id, temp_path, blossom_url, None)
+            .upload_chat_media_with_audio_metadata(
+                &group.mls_group_id,
+                temp_path,
+                blossom_url,
+                None,
+                Some(audio_metadata.clone()),
+            )
             .await?;
 
         drop(temp_file);
@@ -114,8 +122,15 @@ impl TestCase for UploadAudioTestCase {
         assert_eq!(media_file.mime_type, "audio/mpeg");
         assert_eq!(media_file.media_type, "chat_media");
         assert!(media_file.file_path.exists());
+        let metadata = media_file
+            .file_metadata
+            .as_ref()
+            .expect("Audio upload should persist file metadata");
+        assert_eq!(metadata.duration_ms, audio_metadata.duration_ms);
+        assert_eq!(metadata.waveform, audio_metadata.waveform);
 
         tracing::info!("✓ Audio upload validations passed");
+        context.add_media_file("uploaded_audio_media", media_file);
 
         Ok(())
     }

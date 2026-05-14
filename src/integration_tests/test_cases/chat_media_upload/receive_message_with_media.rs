@@ -1,7 +1,7 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::whitenoise::media_files::{AudioMetadata, build_chat_media_imeta_tag};
 use async_trait::async_trait;
-use nostr_sdk::prelude::*;
 
 /// Test case for receiving messages with media attachments and verifying MediaFile records are created
 ///
@@ -16,6 +16,8 @@ pub struct ReceiveMessageWithMediaTestCase {
     receiver_account_name: String,
     group_name: String,
     message_content: String,
+    media_file_name: String,
+    audio_metadata: Option<AudioMetadata>,
 }
 
 impl ReceiveMessageWithMediaTestCase {
@@ -25,32 +27,24 @@ impl ReceiveMessageWithMediaTestCase {
             receiver_account_name: receiver_account_name.to_string(),
             group_name: group_name.to_string(),
             message_content: "Check out this cool image! 🖼️".to_string(),
+            media_file_name: "uploaded_chat_media".to_string(),
+            audio_metadata: None,
         }
     }
 
-    /// Build imeta tag per MIP-04 spec
-    /// Format: `["imeta", "url <blossom_url>", "m <mime_type>", "filename <name>", "x <hash>", "n <nonce>", "v <version>"]`
-    /// Note: MIP-04 requires url, m, filename, x, n, and v fields
-    fn build_imeta_tag(
-        &self,
-        original_hash_hex: &str,
-        blossom_url: &str,
-        mime_type: &str,
-        filename: Option<&str>,
-        nonce_hex: &str,
-    ) -> Result<Tag, WhitenoiseError> {
-        let parts = vec![
-            "imeta".to_string(),
-            format!("url {}", blossom_url),
-            format!("m {}", mime_type),
-            format!("filename {}", filename.unwrap_or("image.jpg")),
-            format!("x {}", original_hash_hex),
-            format!("n {}", nonce_hex),
-            format!("v mip04-v2"),
-        ];
+    pub fn with_media_file(mut self, media_file_name: &str) -> Self {
+        self.media_file_name = media_file_name.to_string();
+        self
+    }
 
-        Tag::parse(parts)
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create imeta tag: {}", e)))
+    pub fn with_message_content(mut self, message_content: &str) -> Self {
+        self.message_content = message_content.to_string();
+        self
+    }
+
+    pub fn with_audio_metadata(mut self, audio_metadata: AudioMetadata) -> Self {
+        self.audio_metadata = Some(audio_metadata);
+        self
     }
 }
 
@@ -69,7 +63,7 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
         let group = context.get_group(&self.group_name)?;
 
         // Get the uploaded media file from context (uploaded earlier in scenario)
-        let media_file = context.get_media_file("uploaded_chat_media")?;
+        let media_file = context.get_media_file(&self.media_file_name)?;
 
         // MIP-04: imeta 'x' field must contain original_file_hash
         let original_hash = media_file.original_file_hash.as_ref().ok_or_else(|| {
@@ -83,23 +77,7 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
             WhitenoiseError::Configuration("Uploaded media has no blossom URL".to_string())
         })?;
 
-        let filename = media_file
-            .file_metadata
-            .as_ref()
-            .and_then(|meta| meta.original_filename.as_deref());
-
-        // Get nonce from media_file (required for MIP-04 v2)
-        let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
-            WhitenoiseError::Configuration("Chat media must have nonce for MIP-04 v2".to_string())
-        })?;
-
-        let imeta_tag = self.build_imeta_tag(
-            &original_hash_hex,
-            blossom_url,
-            &media_file.mime_type,
-            filename,
-            nonce_hex,
-        )?;
+        let imeta_tag = build_chat_media_imeta_tag(media_file, self.audio_metadata.as_ref())?;
 
         tracing::info!("✓ Built imeta tag with original_hash={}", original_hash_hex);
 
@@ -247,9 +225,25 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
         // Verify nonce was preserved from imeta 'n' field (MIP-04 v2 contract)
         assert_eq!(
             receiver_media.nonce.as_deref(),
-            Some(nonce_hex.as_str()),
+            media_file.nonce.as_deref(),
             "Receiver should preserve the nonce from imeta 'n' field"
         );
+
+        if let Some(expected_audio_metadata) = self.audio_metadata.as_ref() {
+            let metadata = receiver_media.file_metadata.as_ref().ok_or_else(|| {
+                WhitenoiseError::Internal(
+                    "Receiver's MediaFile should have file_metadata".to_string(),
+                )
+            })?;
+            assert_eq!(
+                metadata.duration_ms, expected_audio_metadata.duration_ms,
+                "Receiver should preserve audio duration metadata"
+            );
+            assert_eq!(
+                metadata.waveform, expected_audio_metadata.waveform,
+                "Receiver should preserve audio waveform metadata"
+            );
+        }
 
         tracing::info!(
             "✓ Media reference successfully created on receiver's database with both hashes"
