@@ -718,12 +718,24 @@ impl Whitenoise {
     /// This is the authoritative constructor: it sets up data and log
     /// directories, initializes logging and the database, seeds default
     /// relays and settings, spawns the event-processing loop, scheduled
-    /// tasks, discovery sync worker, and session subscriptions.
+    /// tasks, and the discovery sync worker.
+    ///
+    /// **Subscription setup is initiated asynchronously and continues after
+    /// this function returns.** A background task brings up per-account inbox
+    /// and group-plane subscriptions and signals the discovery sync worker;
+    /// the `subscription_health_check` scheduled task is the recovery safety
+    /// net. Callers that need synchronously-live subscriptions (for example,
+    /// the iOS background-push path) must call
+    /// [`Self::ensure_all_subscriptions`] before depending on inbound event
+    /// delivery — the existing FFI entry point in
+    /// [`crate::whitenoise::background_notifications`] already does this.
     ///
     /// Callers own the returned `Arc` for the lifetime of the process (or the
     /// test) and drop it to tear the instance down. Sessions and event
     /// handlers receive their own `Arc<Whitenoise>` clones internally via the
-    /// weak self-reference stamped at construction.
+    /// weak self-reference stamped at construction. The deferred subscription
+    /// task is registered with the background-task pool, so [`Self::shutdown`]
+    /// waits for it to complete before returning.
     #[perf_instrument("whitenoise")]
     pub async fn new(mut config: WhitenoiseConfig) -> Result<Arc<Self>> {
         init_timing::start();
@@ -953,10 +965,27 @@ impl Whitenoise {
 
         init_timing::record("background_tasks");
 
-        // Fetch events and setup subscriptions after event processing has started
-        whitenoise.setup_all_subscriptions().await?;
+        // Bring up subscriptions in the background. `ensure_all_subscriptions`
+        // is the right primitive here (not `setup_all_subscriptions`): it
+        // checks the operational state per account and skips accounts whose
+        // subscriptions were already set up by a concurrent `login` /
+        // `create_identity` call, so the deferred task composes safely with
+        // any account-creation work that runs after `Whitenoise::new` returns.
+        {
+            let wn = Arc::clone(&whitenoise);
+            whitenoise
+                .spawn_background(async move {
+                    if let Err(error) = wn.ensure_all_subscriptions().await {
+                        tracing::warn!(
+                            target: "whitenoise::new",
+                            "Background subscription setup failed: {error}"
+                        );
+                    }
+                })
+                .await;
+        }
 
-        init_timing::record("subscription_setup");
+        init_timing::record("subscription_setup_spawned");
 
         tracing::debug!(
             target: "whitenoise::new",
