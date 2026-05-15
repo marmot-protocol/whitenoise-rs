@@ -453,22 +453,17 @@ impl Whitenoise {
         // "Callers SHOULD store and reuse this value when rotating the
         // KeyPackage." Without reuse, every publish lands as a distinct event
         // and relays accumulate stale key packages indefinitely.
-        let stored_d_tag = match session
+        //
+        // Fail fast if the lookup errors. Silently falling back to MDK's
+        // fresh d-tag would publish into a brand-new NIP-33 slot and orphan
+        // the existing canonical event on relays — defeating this fix. DB
+        // read failures on the per-account SQLite file are rare; the
+        // scheduler retries publishing on its next tick.
+        let stored_d_tag = session
             .repos
             .published_key_packages
             .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
-            .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::key_packages",
-                    "Failed to load latest d_tag for kind:30443, falling back to fresh d_tag: {}",
-                    e
-                );
-                None
-            }
-        };
+            .await?;
 
         let (canonical_tags, canonical_d_tag) =
             apply_d_tag_override(stored_d_tag.as_deref(), key_package_data);
