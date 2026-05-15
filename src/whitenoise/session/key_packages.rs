@@ -143,13 +143,17 @@ impl<'a> KeyPackageOps<'a> {
                 Some(canonical_created_at),
             )
             .await?;
-        self.track_published(
+        // Propagate canonical tracking failures: the d-tag reuse and
+        // monotonic-timestamp invariants both depend on this row being
+        // persisted. If the publish landed but tracking silently fails, the
+        // next publish would think no slot exists and start a fresh one —
+        // the very bug this PR is fixing.
+        self.track_published_canonical(
             &key_package_data.hash_ref,
             &canonical_event_id,
-            MLS_KEY_PACKAGE_KIND,
-            Some(&canonical_d_tag),
+            &canonical_d_tag,
         )
-        .await;
+        .await?;
 
         match self
             .publish_to_relays(
@@ -162,13 +166,12 @@ impl<'a> KeyPackageOps<'a> {
             .await
         {
             Ok(legacy_event_id) => {
-                self.track_published(
-                    &key_package_data.hash_ref,
-                    &legacy_event_id,
-                    MLS_KEY_PACKAGE_KIND_LEGACY,
-                    None,
-                )
-                .await;
+                // Legacy tracking is best-effort: kind:443 is regular per
+                // NIP-01 (not addressable), so a missed row only affects
+                // audit-trail completeness, not future canonical
+                // replacement.
+                self.track_published_legacy(&key_package_data.hash_ref, &legacy_event_id)
+                    .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -455,24 +458,51 @@ impl<'a> KeyPackageOps<'a> {
         Ok(*result.id())
     }
 
+    /// Tracks a canonical (kind:30443) publish in the per-account DB.
+    ///
+    /// Errors propagate to the caller because the d-tag reuse and
+    /// monotonic-timestamp logic both read from this row on the next
+    /// publish; silent loss would re-introduce slot drift.
     #[perf_instrument("key_packages")]
-    async fn track_published(
+    async fn track_published_canonical(
         &self,
         hash_ref: &[u8],
         event_id: &EventId,
-        kind: Kind,
-        d_tag: Option<&str>,
-    ) {
+        d_tag: &str,
+    ) -> Result<()> {
+        self.session
+            .repos
+            .published_key_packages
+            .create(
+                hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(d_tag),
+            )
+            .await
+    }
+
+    /// Tracks a legacy (kind:443) publish — best-effort.
+    ///
+    /// kind:443 is regular per NIP-01 (not addressable), so missing rows
+    /// only affect the audit trail. We log and continue.
+    #[perf_instrument("key_packages")]
+    async fn track_published_legacy(&self, hash_ref: &[u8], event_id: &EventId) {
         if let Err(e) = self
             .session
             .repos
             .published_key_packages
-            .create(hash_ref, &event_id.to_hex(), kind, d_tag)
+            .create(
+                hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
             .await
         {
             tracing::warn!(
                 target: "whitenoise::key_packages",
-                "Published key package but failed to track it: {}",
+                "Published legacy key package but failed to track it: {}",
                 e
             );
         }

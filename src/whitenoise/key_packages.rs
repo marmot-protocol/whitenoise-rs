@@ -516,14 +516,16 @@ impl Whitenoise {
             )
             .await?;
 
-        Self::track_published_key_package(
+        // Propagate canonical tracking failures: the d-tag reuse and
+        // monotonic-timestamp invariants both read this row on the next
+        // publish; silent loss would re-introduce slot drift.
+        Self::track_published_key_package_canonical(
             &session,
             &key_package_data.hash_ref,
             &canonical_event_id,
-            MLS_KEY_PACKAGE_KIND,
-            Some(&canonical_d_tag),
+            &canonical_d_tag,
         )
-        .await;
+        .await?;
 
         match self
             .publish_key_package_to_relays(
@@ -537,12 +539,13 @@ impl Whitenoise {
             .await
         {
             Ok(legacy_event_id) => {
-                Self::track_published_key_package(
+                // Legacy tracking is best-effort: kind:443 is regular
+                // (not addressable) per NIP-01, so a missed row only
+                // affects audit-trail completeness.
+                Self::track_published_key_package_legacy(
                     &session,
                     &key_package_data.hash_ref,
                     &legacy_event_id,
-                    MLS_KEY_PACKAGE_KIND_LEGACY,
-                    None,
                 )
                 .await;
             }
@@ -604,27 +607,56 @@ impl Whitenoise {
         Ok(*result.id())
     }
 
-    /// Records a successfully published key package in the lifecycle tracking table.
+    /// Records a successful canonical (kind:30443) publish.
     ///
-    /// Caller resolves the session beforehand so this can't lose a tracking
-    /// record because the session went away between publish and track.
+    /// Errors propagate to the caller because the d-tag reuse and
+    /// monotonic-timestamp logic both read from this row on the next
+    /// publish; silent loss would re-introduce slot drift. Caller resolves
+    /// the session beforehand so this can't lose a tracking record because
+    /// the session went away between publish and track.
     #[perf_instrument("key_packages")]
-    async fn track_published_key_package(
+    async fn track_published_key_package_canonical(
         session: &std::sync::Arc<crate::whitenoise::session::AccountSession>,
         hash_ref: &[u8],
         event_id: &EventId,
-        kind: Kind,
-        d_tag: Option<&str>,
+        d_tag: &str,
+    ) -> Result<()> {
+        session
+            .repos
+            .published_key_packages
+            .create(
+                hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(d_tag),
+            )
+            .await
+    }
+
+    /// Records a successful legacy (kind:443) publish — best-effort.
+    ///
+    /// kind:443 is regular per NIP-01 (not addressable), so a missed row
+    /// only affects audit-trail completeness.
+    #[perf_instrument("key_packages")]
+    async fn track_published_key_package_legacy(
+        session: &std::sync::Arc<crate::whitenoise::session::AccountSession>,
+        hash_ref: &[u8],
+        event_id: &EventId,
     ) {
         if let Err(e) = session
             .repos
             .published_key_packages
-            .create(hash_ref, &event_id.to_hex(), kind, d_tag)
+            .create(
+                hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
             .await
         {
             tracing::warn!(
                 target: "whitenoise::key_packages",
-                "Published key package but failed to track it: {}",
+                "Published legacy key package but failed to track it: {}",
                 e
             );
         }
