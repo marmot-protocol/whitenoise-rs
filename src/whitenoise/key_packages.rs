@@ -256,6 +256,39 @@ pub(crate) fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey)
     Ok(())
 }
 
+/// Returns the canonical kind:30443 tags and `d` tag to publish.
+///
+/// If `stored_d_tag` is `Some`, swaps the freshly-generated `Tag::identifier`
+/// in `key_package_data.tags_30443` for the stored value so the publish lands
+/// in the same NIP-33 addressable slot and replaces the prior event on relays.
+/// If `None`, returns the MDK-generated tags and `d` tag unchanged — this is
+/// the first publish for the account.
+fn apply_d_tag_override(
+    stored_d_tag: Option<&str>,
+    key_package_data: &KeyPackageEventData,
+) -> (Vec<Tag>, String) {
+    match stored_d_tag {
+        Some(d) => {
+            let tags = key_package_data
+                .tags_30443
+                .iter()
+                .map(|tag| {
+                    if tag.kind() == TagKind::d() {
+                        Tag::identifier(d)
+                    } else {
+                        tag.clone()
+                    }
+                })
+                .collect();
+            (tags, d.to_string())
+        }
+        None => (
+            key_package_data.tags_30443.clone(),
+            key_package_data.d_tag.clone(),
+        ),
+    }
+}
+
 /// Filters relay responses to key package events that match the expected kind and author.
 ///
 /// Returns `(valid_events, dropped_wrong_kind, dropped_wrong_author)`.
@@ -413,12 +446,39 @@ impl Whitenoise {
         // a local audit trail.
         let session = self.require_session(&account.pubkey)?;
 
+        // Reuse the previously-published kind:30443 `d` tag slot so this
+        // publish replaces the prior addressable event on relays per NIP-33.
+        // MDK generates a fresh random `d` tag inside
+        // `create_key_package_for_event`, and the MDK docs explicitly say
+        // "Callers SHOULD store and reuse this value when rotating the
+        // KeyPackage." Without reuse, every publish lands as a distinct event
+        // and relays accumulate stale key packages indefinitely.
+        let stored_d_tag = match session
+            .repos
+            .published_key_packages
+            .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Failed to load latest d_tag for kind:30443, falling back to fresh d_tag: {}",
+                    e
+                );
+                None
+            }
+        };
+
+        let (canonical_tags, canonical_d_tag) =
+            apply_d_tag_override(stored_d_tag.as_deref(), key_package_data);
+
         let canonical_event_id = self
             .publish_key_package_to_relays(
                 MLS_KEY_PACKAGE_KIND,
                 &key_package_data.content,
                 relay_urls,
-                &key_package_data.tags_30443,
+                &canonical_tags,
                 signer.clone(),
             )
             .await?;
@@ -428,7 +488,7 @@ impl Whitenoise {
             &key_package_data.hash_ref,
             &canonical_event_id,
             MLS_KEY_PACKAGE_KIND,
-            Some(&key_package_data.d_tag),
+            Some(&canonical_d_tag),
         )
         .await;
 
@@ -1975,6 +2035,125 @@ mod tests {
             .await;
         tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
+    }
+
+    fn sample_key_package_event_data(d_tag: &str) -> KeyPackageEventData {
+        KeyPackageEventData {
+            content: "sample".to_string(),
+            tags_30443: vec![
+                Tag::identifier(d_tag),
+                Tag::custom(TagKind::MlsCiphersuite, [REQUIRED_MLS_CIPHERSUITE_TAG]),
+                Tag::custom(TagKind::MlsExtensions, vec!["0x000a", "0xf2ee"]),
+                Tag::custom(TagKind::Custom("encoding".into()), ["base64"]),
+            ],
+            tags_443: vec![Tag::custom(
+                TagKind::MlsCiphersuite,
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            )],
+            hash_ref: vec![1, 2, 3],
+            d_tag: d_tag.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_apply_d_tag_override_uses_stored_d_tag_when_present() {
+        let data = sample_key_package_event_data("fresh-from-mdk");
+
+        let (tags, d_tag) = apply_d_tag_override(Some("persisted-slot"), &data);
+
+        assert_eq!(d_tag, "persisted-slot");
+        let identifier = tags
+            .iter()
+            .find(|t| t.kind() == TagKind::d())
+            .expect("d tag must be present");
+        assert_eq!(identifier.content(), Some("persisted-slot"));
+
+        // Non-d tags are preserved unchanged so MLS metadata still validates.
+        assert!(tags.iter().any(|t| t.kind() == TagKind::MlsCiphersuite));
+        assert!(
+            tags.iter()
+                .any(|t| t.kind() == TagKind::Custom("encoding".into()))
+        );
+    }
+
+    #[test]
+    fn test_apply_d_tag_override_keeps_fresh_d_tag_when_none_stored() {
+        let data = sample_key_package_event_data("fresh-from-mdk");
+
+        let (tags, d_tag) = apply_d_tag_override(None, &data);
+
+        assert_eq!(d_tag, "fresh-from-mdk");
+        let identifier = tags
+            .iter()
+            .find(|t| t.kind() == TagKind::d())
+            .expect("d tag must be present");
+        assert_eq!(identifier.content(), Some("fresh-from-mdk"));
+    }
+
+    #[test]
+    fn test_apply_d_tag_override_replaces_only_d_tag() {
+        let data = sample_key_package_event_data("fresh");
+        let original_count = data.tags_30443.len();
+
+        let (tags, _) = apply_d_tag_override(Some("slot"), &data);
+
+        assert_eq!(tags.len(), original_count);
+        // Exactly one `d` tag, and it is the overridden one.
+        let d_tags: Vec<_> = tags.iter().filter(|t| t.kind() == TagKind::d()).collect();
+        assert_eq!(d_tags.len(), 1);
+        assert_eq!(d_tags[0].content(), Some("slot"));
+    }
+
+    #[tokio::test]
+    async fn test_publish_key_package_pair_reuses_d_tag_across_publishes() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // First publish lands during account creation.
+        let account = whitenoise.create_identity().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let initial_d_tag = session
+            .repos
+            .published_key_packages
+            .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap()
+            .expect("initial publish must record a d_tag for kind:30443");
+
+        // Trigger a second publish through the same code path.
+        let keys = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+        whitenoise
+            .publish_key_package_for_account_with_signer(&account, keys)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let canonical_rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT d_tag FROM published_key_packages
+             WHERE kind = ? AND d_tag IS NOT NULL",
+        )
+        .bind(i64::from(MLS_KEY_PACKAGE_KIND.as_u16()))
+        .fetch_all(&session.account_db.inner.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            canonical_rows.len() >= 2,
+            "expected at least two kind:30443 publish rows, got {}",
+            canonical_rows.len()
+        );
+        for (d_tag,) in &canonical_rows {
+            assert_eq!(
+                d_tag, &initial_d_tag,
+                "every kind:30443 publish must reuse the original d_tag slot \
+                 so relays NIP-33-replace the previous event instead of accumulating"
+            );
+        }
     }
 
     #[tokio::test]

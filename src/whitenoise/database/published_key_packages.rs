@@ -107,6 +107,32 @@ impl PublishedKeyPackage {
         Ok(row)
     }
 
+    /// Returns the most recently recorded `d` tag for a given event kind, if any.
+    ///
+    /// Used by the kind:30443 publish path to reuse a single addressable-event
+    /// slot per NIP-33. MDK generates a fresh random `d` tag inside
+    /// `create_key_package_for_event` every time it's called, and the MDK
+    /// docs explicitly say "Callers SHOULD store and reuse this value when
+    /// rotating the KeyPackage." Without reuse, every publish lands as a
+    /// distinct event on relays instead of replacing the previous one.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn find_latest_d_tag(
+        db: &AccountDatabase,
+        kind: Kind,
+    ) -> Result<Option<String>, DatabaseError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT d_tag FROM published_key_packages
+             WHERE kind = ? AND d_tag IS NOT NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(i64::from(kind.as_u16()))
+        .fetch_optional(&db.inner.pool)
+        .await?;
+
+        Ok(row.map(|(d,)| d))
+    }
+
     /// Looks up all published key packages sharing the same hash reference.
     #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn find_by_hash_ref(
@@ -462,6 +488,66 @@ mod tests {
             .unwrap();
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].event_id, "old");
+    }
+
+    #[tokio::test]
+    async fn test_find_latest_d_tag_returns_none_when_empty() {
+        let (db, _dir) = setup().await;
+
+        let result = PublishedKeyPackage::find_latest_d_tag(&db, MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_latest_d_tag_returns_most_recent_for_kind() {
+        let (db, _dir) = setup().await;
+
+        // Track an older canonical row.
+        PublishedKeyPackage::create(
+            &db,
+            &[1, 1, 1],
+            "older-canonical",
+            MLS_KEY_PACKAGE_KIND,
+            Some("old-d-tag"),
+        )
+        .await
+        .unwrap();
+        // Bump the older row's created_at into the past so ORDER BY is unambiguous.
+        sqlx::query(
+            "UPDATE published_key_packages SET created_at = unixepoch() - 60 WHERE event_id = ?",
+        )
+        .bind("older-canonical")
+        .execute(&db.inner.pool)
+        .await
+        .unwrap();
+
+        PublishedKeyPackage::create(
+            &db,
+            &[2, 2, 2],
+            "newer-canonical",
+            MLS_KEY_PACKAGE_KIND,
+            Some("new-d-tag"),
+        )
+        .await
+        .unwrap();
+        // Legacy rows without d_tag must not be considered.
+        PublishedKeyPackage::create(&db, &[2, 2, 2], "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+            .await
+            .unwrap();
+
+        let result = PublishedKeyPackage::find_latest_d_tag(&db, MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap();
+        assert_eq!(result.as_deref(), Some("new-d-tag"));
+
+        // Legacy kind has no d_tag rows.
+        let legacy_result =
+            PublishedKeyPackage::find_latest_d_tag(&db, MLS_KEY_PACKAGE_KIND_LEGACY)
+                .await
+                .unwrap();
+        assert!(legacy_result.is_none());
     }
 
     #[tokio::test]

@@ -38,6 +38,11 @@ impl PublishedKeyPackagesRepo {
         Ok(PublishedKeyPackage::find_by_hash_ref(&self.db, hash_ref).await?)
     }
 
+    /// Return the most recently recorded `d` tag for a given event kind, if any.
+    pub async fn find_latest_d_tag(&self, kind: nostr_sdk::Kind) -> Result<Option<String>> {
+        Ok(PublishedKeyPackage::find_latest_d_tag(&self.db, kind).await?)
+    }
+
     /// Mark a published key package as consumed (used by a Welcome).
     pub async fn mark_consumed(&self, event_id: &str) -> Result<bool> {
         Ok(PublishedKeyPackage::mark_consumed(&self.db, event_id).await?)
