@@ -362,6 +362,12 @@ impl Whitenoise {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
+        // Serialize concurrent rotations for this account so the
+        // prepare/publish/track sequence stays atomic. See
+        // `AccountSession::key_package_publish_lock`.
+        let session = self.require_session(&account.pubkey)?;
+        let _publish_guard = session.key_package_publish_lock.lock().await;
+
         let (key_package_data, canonical_created_at) = self
             .prepare_canonical_publish_inputs(account, &relays)
             .await?;

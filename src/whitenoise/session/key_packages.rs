@@ -56,6 +56,11 @@ impl<'a> KeyPackageOps<'a> {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
+        // Serialize concurrent rotations for this account so the
+        // prepare/publish/track sequence stays atomic — see the lock's
+        // docs on [`AccountSession`]. Held until the function returns.
+        let _publish_guard = self.session.key_package_publish_lock.lock().await;
+
         let (key_package_data, canonical_created_at) =
             self.prepare_canonical_publish_inputs(&relays).await?;
         let relay_urls = Relay::urls(&relays);
@@ -103,6 +108,18 @@ impl<'a> KeyPackageOps<'a> {
     /// warnings, leaving the scheduler to retry.
     #[perf_instrument("key_packages")]
     pub(crate) async fn create_and_publish(&self, relays: &[Relay]) -> Result<()> {
+        // Mirror `publish()`: empty relays means we have nowhere to publish
+        // to, so don't waste MLS key material generating a package we can't
+        // send. Fail with the same error variant so callers handle both
+        // paths uniformly.
+        if relays.is_empty() {
+            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
+        }
+
+        // Serialize concurrent rotations for this account so the
+        // prepare/publish/track sequence stays atomic.
+        let _publish_guard = self.session.key_package_publish_lock.lock().await;
+
         let (key_package_data, canonical_created_at) =
             self.prepare_canonical_publish_inputs(relays).await?;
         let relay_urls = Relay::urls(relays);
