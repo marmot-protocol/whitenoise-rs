@@ -3304,7 +3304,7 @@ mod tests {
     async fn test_archive_sets_archived_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[120; 32]);
+        let group_id = GroupId::from_slice(&[1; 32]);
 
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         session
@@ -3329,7 +3329,7 @@ mod tests {
     async fn test_archive_is_idempotent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[121; 32]);
+        let group_id = GroupId::from_slice(&[1; 32]);
 
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         session
@@ -3362,7 +3362,7 @@ mod tests {
     async fn test_unarchive_clears_archived_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[122; 32]);
+        let group_id = GroupId::from_slice(&[1; 32]);
 
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         session
@@ -3394,7 +3394,7 @@ mod tests {
     async fn test_unarchive_on_unarchived_chat_is_no_op() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[123; 32]);
+        let group_id = GroupId::from_slice(&[1; 32]);
 
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         session
@@ -3427,7 +3427,7 @@ mod tests {
     async fn test_clear_chat_deletes_draft_for_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[145; 32]);
+        let group_id = GroupId::from_slice(&[1; 32]);
 
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         session

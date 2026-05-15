@@ -74,7 +74,9 @@ mod tests {
         // Matches the project-wide account-DB test pattern: stamp the schema
         // directly because `AccountDatabase::new` uses `open_without_migrations`
         // and running the full migration timeline here would require wiring
-        // a shared pool.
+        // a shared pool. NOTE: the CREATE TABLE below must stay in sync with
+        // `fresh_account_schema.sql`; until a `setup_account_db_with_migrations`
+        // helper exists, divergence here will silently mask production drift.
         sqlx::query("DROP TABLE IF EXISTS push_registrations")
             .execute(&db.inner.pool)
             .await
