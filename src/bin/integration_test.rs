@@ -8,6 +8,15 @@ use ::whitenoise::*;
 
 const INTEGRATION_WHITENOISE_DB_KEY_ID: &str = "integration.whitenoise.db.key.v1";
 
+/// Drains tracing-appender workers when `main` returns by any path.
+struct FlushTracingOnDrop;
+
+impl Drop for FlushTracingOnDrop {
+    fn drop(&mut self) {
+        ::whitenoise::shutdown_tracing();
+    }
+}
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
@@ -26,6 +35,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
+    let _flush_tracing = FlushTracingOnDrop;
 
     // Initialize mock keyring store for integration tests
     // This is required for MDK database encryption in test environments
@@ -33,23 +43,21 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     tracing::info!("=== Starting Whitenoise Integration Test Suite ===");
 
+    let local_relays = vec![
+        RelayUrl::parse("ws://localhost:8080").unwrap(),
+        RelayUrl::parse("ws://localhost:7777").unwrap(),
+    ];
     let config = WhitenoiseConfig::new(
         &args.data_dir,
         &args.logs_dir,
         "com.whitenoise.integration-test",
     )
     .with_database_key_id(INTEGRATION_WHITENOISE_DB_KEY_ID)
-    .with_discovery_relays(vec![
-        RelayUrl::parse("ws://localhost:8080").unwrap(),
-        RelayUrl::parse("ws://localhost:7777").unwrap(),
-    ]);
-    let whitenoise = match Whitenoise::new(config).await {
-        Ok(wn) => wn,
-        Err(err) => {
-            tracing::error!("Failed to initialize Whitenoise: {}", err);
-            std::process::exit(1);
-        }
-    };
+    .with_discovery_relays(local_relays.clone())
+    .with_default_account_relays(local_relays);
+    let whitenoise = Whitenoise::new(config).await.inspect_err(|err| {
+        tracing::error!(target: "whitenoise::integration_test", "Failed to initialize Whitenoise: {}", err);
+    })?;
 
     match args.scenario {
         Some(scenario_name) => {

@@ -124,6 +124,28 @@ pub use whitenoise::zapstore::fetch_latest_zapstore_version;
 static TRACING_GUARDS: OnceLock<Mutex<Option<(WorkerGuard, WorkerGuard)>>> = OnceLock::new();
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 
+/// Flush the non-blocking tracing-appender workers and tear them down.
+///
+/// Dropping each `WorkerGuard` signals its writer thread to drain queued
+/// records before exiting. Statics are not dropped at process exit, so the
+/// guards held by the static `TRACING_GUARDS` cell would otherwise leak and
+/// the workers would be killed mid-flush — losing whatever log records were
+/// still in flight, including the error logged just before `main` returns
+/// `Err`.
+///
+/// Binaries should call this once before returning from `main`. The call is
+/// safe before initialisation (no-op) and safe to invoke more than once
+/// (subsequent calls are no-ops).
+pub fn shutdown_tracing() {
+    if let Some(mutex) = TRACING_GUARDS.get()
+        && let Ok(mut guard) = mutex.lock()
+    {
+        // Dropping the inner tuple joins the appender worker threads after
+        // they finish draining their channels.
+        let _ = guard.take();
+    }
+}
+
 /// Create non-blocking file and stdout writers, stash their guards in [`TRACING_GUARDS`],
 /// and return the two writers so callers can attach them to `fmt::Layer`s.
 ///
