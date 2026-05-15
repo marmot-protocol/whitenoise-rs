@@ -1,0 +1,481 @@
+{
+  "blocks": [
+    {
+      "Heading": {
+        "level": 1,
+        "inlines": [
+          {
+            "Text": "Kitchen Sink"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "A paragraph with "
+          },
+          {
+            "Emph": [
+              {
+                "Text": "em"
+              }
+            ]
+          },
+          {
+            "Text": ", "
+          },
+          {
+            "Strong": [
+              {
+                "Text": "strong"
+              }
+            ]
+          },
+          {
+            "Text": ", "
+          },
+          {
+            "Emph": [
+              {
+                "Strong": [
+                  {
+                    "Text": "both"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "Text": ", "
+          },
+          {
+            "Strikethrough": [
+              {
+                "Text": "strike"
+              }
+            ]
+          },
+          {
+            "Text": ", "
+          },
+          {
+            "Code": "code"
+          },
+          {
+            "Text": ", and a"
+          },
+          "SoftBreak",
+          {
+            "Link": {
+              "dest": "https://example.com",
+              "title": "title",
+              "children": [
+                {
+                  "Text": "link"
+                }
+              ]
+            }
+          },
+          {
+            "Text": ". Hard break here:"
+          },
+          "HardBreak",
+          {
+            "Text": "second line."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "A "
+          },
+          {
+            "Link": {
+              "dest": "/reference",
+              "title": "ref title",
+              "children": [
+                {
+                  "Text": "reference link"
+                }
+              ]
+            }
+          },
+          {
+            "Text": " and a "
+          },
+          {
+            "Image": {
+              "dest": "/img.png",
+              "title": "img title",
+              "alt": [
+                {
+                  "Text": "alt text"
+                }
+              ]
+            }
+          },
+          {
+            "Text": " and an"
+          },
+          "SoftBreak",
+          {
+            "Text": "autolink "
+          },
+          {
+            "Autolink": {
+              "url": "https://nostr.com",
+              "kind": "Uri"
+            }
+          },
+          {
+            "Text": " plus an email autolink "
+          },
+          {
+            "Autolink": {
+              "url": "a@b.co",
+              "kind": "Email"
+            }
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    },
+    "ThematicBreak",
+    {
+      "BlockQuote": {
+        "blocks": [
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "A blockquote with "
+                },
+                {
+                  "Strong": [
+                    {
+                      "Text": "bold"
+                    }
+                  ]
+                },
+                {
+                  "Text": " inside."
+                },
+                "SoftBreak",
+                {
+                  "Text": "Continues on the next line."
+                }
+              ]
+            }
+          },
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "Even has a second paragraph."
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "Heading": {
+        "level": 2,
+        "inlines": [
+          {
+            "Text": "Lists"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "bullet one"
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "bullet two"
+                    }
+                  ]
+                }
+              },
+              {
+                "List": {
+                  "kind": {
+                    "Bullet": {
+                      "marker": 45
+                    }
+                  },
+                  "tight": true,
+                  "items": [
+                    {
+                      "blocks": [
+                        {
+                          "Paragraph": {
+                            "inlines": [
+                              {
+                                "Text": "nested bullet"
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "checked": null
+                    },
+                    {
+                      "blocks": [
+                        {
+                          "Paragraph": {
+                            "inlines": [
+                              {
+                                "Text": "open task"
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "checked": false
+                    },
+                    {
+                      "blocks": [
+                        {
+                          "Paragraph": {
+                            "inlines": [
+                              {
+                                "Text": "done task"
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "checked": true
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Loose list:"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Ordered": {
+            "start": 1,
+            "delimiter": 46
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "ordered first"
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "ordered second"
+                    }
+                  ]
+                }
+              },
+              {
+                "List": {
+                  "kind": {
+                    "Ordered": {
+                      "start": 1,
+                      "delimiter": 46
+                    }
+                  },
+                  "tight": true,
+                  "items": [
+                    {
+                      "blocks": [
+                        {
+                          "Paragraph": {
+                            "inlines": [
+                              {
+                                "Text": "nested ordered"
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "checked": null
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Heading": {
+        "level": 2,
+        "inlines": [
+          {
+            "Text": "Code"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Indented:"
+          }
+        ]
+      }
+    },
+    {
+      "CodeBlock": {
+        "kind": "Indented",
+        "info": "",
+        "content": "let x = 1;\nlet y = 2;\n"
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Fenced with info:"
+          }
+        ]
+      }
+    },
+    {
+      "CodeBlock": {
+        "kind": "Fenced",
+        "info": "rust",
+        "content": "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n"
+      }
+    },
+    {
+      "Heading": {
+        "level": 2,
+        "inlines": [
+          {
+            "Text": "Escapes"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "*not emphasis* and \\backslash."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "End."
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "one"
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "two"
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    }
+  ]
+}

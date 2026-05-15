@@ -76,8 +76,14 @@ pub use whitenoise::message_aggregator::{
     ChatMessage, DeliveryStatus, EmojiReaction, ReactionSummary, UserReaction,
 };
 
-// Nostr integration
-pub use nostr_manager::parser::SerializableToken;
+// Markdown AST (CommonMark + GFM + nostr extensions) — produced during message
+// aggregation and exposed on `ChatMessage::content_tokens`.
+pub mod markdown {
+    pub use whitenoise_markdown::{
+        Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, ListItem, ListKind,
+        NostrEntity, NostrHrp, TableCell, parse,
+    };
+}
 
 // Group message streaming
 pub use whitenoise::message_streaming::{GroupMessageSubscription, MessageUpdate, UpdateTrigger};

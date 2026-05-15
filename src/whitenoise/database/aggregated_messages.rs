@@ -6,7 +6,6 @@ use nostr_sdk::prelude::*;
 use sqlx::Row;
 
 use super::{Database, DatabaseError, retry_on_lock, utils::parse_timestamp};
-use crate::nostr_manager::parser::SerializableToken;
 use crate::perf_instrument;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
@@ -54,7 +53,6 @@ struct AggregatedMessageRow {
     pub tags: Tags,
     pub reply_to_id: Option<EventId>,
     pub deletion_event_id: Option<EventId>,
-    pub content_tokens: Vec<SerializableToken>,
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
     pub delivery_status: Option<DeliveryStatus>,
@@ -131,14 +129,9 @@ where
             None => None,
         };
 
-        // Deserialize JSONB fields from JSON strings
-        let content_tokens_str: String = row.try_get("content_tokens")?;
-        let content_tokens =
-            serde_json::from_str(&content_tokens_str).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "content_tokens".to_string(),
-                source: Box::new(e),
-            })?;
-
+        // The `content_tokens` column is intentionally not deserialized here.
+        // The markdown AST exposed on `ChatMessage` is re-derived from `content`
+        // in `row_to_chat_message`, so the legacy column is now dead storage.
         let reactions_str: String = row.try_get("reactions")?;
         let reactions =
             serde_json::from_str(&reactions_str).map_err(|e| sqlx::Error::ColumnDecode {
@@ -189,7 +182,6 @@ where
             tags,
             reply_to_id,
             deletion_event_id,
-            content_tokens,
             reactions,
             media_attachments,
             delivery_status,
@@ -797,7 +789,7 @@ impl AggregatedMessage {
             .collect();
 
         // Empty defaults for kind 7/5 events
-        let empty_tokens = Vec::<SerializableToken>::new();
+        let empty_tokens = whitenoise_markdown::Document::default();
         let empty_reactions = ReactionSummary::default();
         let empty_media = Vec::<MediaFile>::new();
 
@@ -946,7 +938,7 @@ impl AggregatedMessage {
             }
         })?;
 
-        let empty_tokens = Vec::<SerializableToken>::new();
+        let empty_tokens = whitenoise_markdown::Document::default();
         let empty_reactions = ReactionSummary::default();
         let empty_media = Vec::<MediaFile>::new();
 
@@ -985,7 +977,7 @@ impl AggregatedMessage {
             }
         })?;
 
-        let empty_tokens = Vec::<SerializableToken>::new();
+        let empty_tokens = whitenoise_markdown::Document::default();
         let empty_reactions = ReactionSummary::default();
         let empty_media = Vec::<MediaFile>::new();
 
@@ -1718,6 +1710,10 @@ impl AggregatedMessage {
         // Convert DateTime<Utc> to Timestamp (seconds)
         let created_at = Timestamp::from(row.created_at.timestamp() as u64);
 
+        // Markdown AST is derived on read rather than persisted: re-parsing
+        // from `content` is cheap and avoids a stale-AST class of bugs.
+        let content_tokens = whitenoise_markdown::parse(&row.content);
+
         Ok(ChatMessage {
             id: row.message_id.to_string(),
             author: row.author,
@@ -1727,7 +1723,7 @@ impl AggregatedMessage {
             is_reply: row.reply_to_id.is_some(),
             reply_to_id: row.reply_to_id.map(|id| id.to_string()),
             is_deleted: row.deletion_event_id.is_some(),
-            content_tokens: row.content_tokens,
+            content_tokens,
             reactions: row.reactions,
             kind: row.kind.as_u16(),
             media_attachments: row.media_attachments,
@@ -1745,7 +1741,7 @@ impl AggregatedMessage {
         created_at: DateTime<Utc>,
         database: &Database,
     ) -> Result<()> {
-        let empty_tokens = Vec::<SerializableToken>::new();
+        let empty_tokens = whitenoise_markdown::Document::default();
         let empty_reactions = ReactionSummary::default();
         let empty_media = Vec::<MediaFile>::new();
 
@@ -1789,7 +1785,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
-            content_tokens: vec![],
+            content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
@@ -3095,7 +3091,8 @@ mod tests {
         let authorized_deletion_id = format!("{:0>64x}", 0xde187u64);
         let unauthorized_deletion_id = format!("{:0>64x}", 0xde188u64);
         let tags_json = serde_json::to_string(&vec![vec!["e", &parent_id]]).unwrap();
-        let empty_tokens = serde_json::to_string(&Vec::<SerializableToken>::new()).unwrap();
+        let empty_tokens =
+            serde_json::to_string(&whitenoise_markdown::Document::default()).unwrap();
         let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
         let empty_media = serde_json::to_string(&Vec::<MediaFile>::new()).unwrap();
 
@@ -3167,7 +3164,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
-            content_tokens: vec![],
+            content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
@@ -4166,7 +4163,8 @@ mod tests {
         // Insert a kind-7 reaction row directly with raw SQL (insert_message always writes kind=9)
         let reaction_id = format!("{:0>64}", format!("{:x}", 200u8));
         let tags_json = serde_json::to_string(&Vec::<Vec<String>>::new()).unwrap();
-        let empty_tokens = serde_json::to_string(&Vec::<SerializableToken>::new()).unwrap();
+        let empty_tokens =
+            serde_json::to_string(&whitenoise_markdown::Document::default()).unwrap();
         let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
         let empty_media = serde_json::to_string(&Vec::<MediaFile>::new()).unwrap();
         sqlx::query(
@@ -4515,7 +4513,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
-            content_tokens: vec![],
+            content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
@@ -4563,7 +4561,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
-            content_tokens: vec![],
+            content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
@@ -4777,7 +4775,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -5104,7 +5102,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
