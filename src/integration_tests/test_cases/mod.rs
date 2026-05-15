@@ -12,6 +12,7 @@ pub mod group_state_streaming;
 pub mod login_flow;
 pub mod message_streaming;
 pub mod metadata_management;
+pub mod mute_list;
 pub mod notification_streaming;
 pub mod scheduler;
 pub mod shared;

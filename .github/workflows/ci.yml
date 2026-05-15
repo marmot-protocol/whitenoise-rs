@@ -294,8 +294,10 @@ jobs:
       - name: Test with Coverage
         run: |
           # Exclude test infrastructure, integration tests, and benchmarks from coverage.
+          # Also exclude rust_migrations/ (mechanical schema DDL) and the
+          # whitenoise-cli crate (thin dispatch covered by its own e2e tests).
           # These inflate the line count without measuring library code quality.
-          IGNORE_REGEX='(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs)'
+          IGNORE_REGEX='(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs|rust_migrations/|crates/whitenoise-cli/)'
 
           # Clean and run tests with coverage (library only, no integration-tests feature).
           # Exclude CLI e2e test binaries for the same reason as the test-linux job.

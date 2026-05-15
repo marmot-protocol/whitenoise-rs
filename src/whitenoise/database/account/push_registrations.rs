@@ -55,3 +55,94 @@ impl PushRegistrationsRepo {
         Ok(PushRegistration::delete(&self.db.inner.pool).await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::Keys;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    async fn setup() -> (PushRegistrationsRepo, PublicKey, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let pubkey = Keys::generate().public_key();
+        let db = Arc::new(
+            AccountDatabase::new(pubkey, dir.path().join("acct.db"))
+                .await
+                .unwrap(),
+        );
+        // Matches the project-wide account-DB test pattern: stamp the schema
+        // directly because `AccountDatabase::new` uses `open_without_migrations`
+        // and running the full migration timeline here would require wiring
+        // a shared pool. NOTE: the CREATE TABLE below must stay in sync with
+        // `fresh_account_schema.sql`; until a `setup_account_db_with_migrations`
+        // helper exists, divergence here will silently mask production drift.
+        sqlx::query("DROP TABLE IF EXISTS push_registrations")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE push_registrations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform        TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
+                raw_token       TEXT NOT NULL CHECK (
+                    length(trim(raw_token, ' ' || char(9) || char(10) || char(13))) > 0
+                ),
+                server_pubkey   TEXT NOT NULL,
+                relay_hint      TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                last_shared_at  INTEGER
+            )",
+        )
+        .execute(&db.inner.pool)
+        .await
+        .unwrap();
+        (PushRegistrationsRepo::new(pubkey, db), pubkey, dir)
+    }
+
+    /// The wrapper's only added behavior is binding `account_pubkey` to the
+    /// returned record. Inner [`PushRegistration`] tests cover the SQL semantics.
+    #[tokio::test]
+    async fn upsert_binds_repo_account_pubkey_to_returned_registration() {
+        let (repo, expected_pubkey, _dir) = setup().await;
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        let inserted = repo
+            .upsert(
+                PushPlatform::Apns,
+                "token-aaaa",
+                &server_pubkey,
+                Some(&relay_hint),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inserted.account_pubkey, expected_pubkey,
+            "upsert must bind the repo's account_pubkey to the returned registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_accounts_have_independent_per_account_dbs() {
+        // The per-account DB IS the scoping mechanism. Two repos over two
+        // distinct account DBs must not see each other's registrations.
+        let (repo_a, pubkey_a, _dir_a) = setup().await;
+        let (repo_b, pubkey_b, _dir_b) = setup().await;
+        assert_ne!(pubkey_a, pubkey_b);
+
+        let server = Keys::generate().public_key();
+        repo_a
+            .upsert(PushPlatform::Apns, "token-a", &server, None)
+            .await
+            .unwrap();
+
+        let in_a = repo_a.find().await.unwrap().expect("A must see its row");
+        assert_eq!(in_a.account_pubkey, pubkey_a);
+        assert_eq!(in_a.raw_token, "token-a");
+
+        let in_b = repo_b.find().await.unwrap();
+        assert!(in_b.is_none(), "B must not see A's registration");
+    }
+}
