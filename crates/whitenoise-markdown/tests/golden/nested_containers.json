@@ -11,15 +11,6 @@
       }
     },
     {
-      "Paragraph": {
-        "inlines": [
-          {
-            "Text": "Trailing paragraph in inner quote."
-          }
-        ]
-      }
-    },
-    {
       "BlockQuote": {
         "blocks": [
           {
@@ -118,6 +109,15 @@
                       }
                     ]
                   }
+                },
+                {
+                  "Paragraph": {
+                    "inlines": [
+                      {
+                        "Text": "Trailing paragraph in inner quote."
+                      }
+                    ]
+                  }
                 }
               ]
             }
@@ -135,13 +135,6 @@
       }
     },
     {
-      "CodeBlock": {
-        "kind": "Fenced",
-        "info": "",
-        "content": "code block inside list item\n"
-      }
-    },
-    {
       "List": {
         "kind": {
           "Ordered": {
@@ -149,7 +142,7 @@
             "delimiter": 46
           }
         },
-        "tight": false,
+        "tight": true,
         "items": [
           {
             "blocks": [
@@ -229,6 +222,13 @@
                       "checked": null
                     }
                   ]
+                }
+              },
+              {
+                "CodeBlock": {
+                  "kind": "Fenced",
+                  "info": "",
+                  "content": "code block inside list item\n"
                 }
               }
             ],

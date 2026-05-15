@@ -544,16 +544,21 @@ impl BlockParser {
 
     fn push_block(&mut self, block: Block) {
         self.consume_list_blank();
+        // A `List` on top of the stack with no active `ListItem` happens
+        // when a sibling-failing line closes the last item but the new
+        // content is NOT a list-item (e.g. a paragraph at a shallower
+        // indent inside an enclosing blockquote). Close the dangling list
+        // so the block lands in the list's parent — the alternative would
+        // misroute it to root.
+        while let Some(Container::List { .. }) = self.containers.last() {
+            let list = self.containers.pop().unwrap();
+            self.close_container(list);
+        }
         match self.containers.last_mut() {
             None => self.root.push(block),
             Some(Container::BlockQuote { children }) => children.push(block),
             Some(Container::ListItem { children, .. }) => children.push(block),
-            Some(Container::List { .. }) => {
-                // Block-level content directly inside a List with no open
-                // item is impossible: opening a list always pushes an item.
-                // Defensive: append to root.
-                self.root.push(block);
-            }
+            Some(Container::List { .. }) => unreachable!("dangling List was just closed"),
         }
     }
 

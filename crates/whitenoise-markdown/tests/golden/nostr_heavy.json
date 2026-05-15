@@ -134,69 +134,6 @@
       }
     },
     {
-      "Paragraph": {
-        "inlines": [
-          {
-            "Text": "Rejected HRP stays literal: nostr:nsec1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9."
-          }
-        ]
-      }
-    },
-    {
-      "Paragraph": {
-        "inlines": [
-          {
-            "Text": "Left-boundary rule rejects "
-          },
-          {
-            "Code": "foo@npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
-          },
-          {
-            "Text": " (letter precedes)."
-          }
-        ]
-      }
-    },
-    {
-      "Paragraph": {
-        "inlines": [
-          {
-            "Text": "In a list:"
-          }
-        ]
-      }
-    },
-    {
-      "Paragraph": {
-        "inlines": [
-          {
-            "Text": "In a blockquote:"
-          }
-        ]
-      }
-    },
-    {
-      "BlockQuote": {
-        "blocks": [
-          {
-            "Paragraph": {
-              "inlines": [
-                {
-                  "Text": "ping "
-                },
-                {
-                  "NostrMention": {
-                    "hrp": "Npub",
-                    "bech32": "npub1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
       "List": {
         "kind": {
           "Bullet": {
@@ -324,7 +261,52 @@
               }
             ],
             "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Rejected HRP stays literal: nostr:nsec1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Left-boundary rule rejects "
           },
+          {
+            "Code": "foo@npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+          },
+          {
+            "Text": " (letter precedes)."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "In a list:"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
           {
             "blocks": [
               {
@@ -364,6 +346,36 @@
               }
             ],
             "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "In a blockquote:"
+          }
+        ]
+      }
+    },
+    {
+      "BlockQuote": {
+        "blocks": [
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "ping "
+                },
+                {
+                  "NostrMention": {
+                    "hrp": "Npub",
+                    "bech32": "npub1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz"
+                  }
+                }
+              ]
+            }
           }
         ]
       }

@@ -291,15 +291,6 @@
       }
     },
     {
-      "Paragraph": {
-        "inlines": [
-          {
-            "Text": "Loose list:"
-          }
-        ]
-      }
-    },
-    {
       "List": {
         "kind": {
           "Ordered": {
@@ -357,6 +348,55 @@
                         }
                       ],
                       "checked": null
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Loose list:"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "one"
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "two"
                     }
                   ]
                 }
@@ -433,46 +473,6 @@
         "inlines": [
           {
             "Text": "End."
-          }
-        ]
-      }
-    },
-    {
-      "List": {
-        "kind": {
-          "Bullet": {
-            "marker": 45
-          }
-        },
-        "tight": false,
-        "items": [
-          {
-            "blocks": [
-              {
-                "Paragraph": {
-                  "inlines": [
-                    {
-                      "Text": "one"
-                    }
-                  ]
-                }
-              }
-            ],
-            "checked": null
-          },
-          {
-            "blocks": [
-              {
-                "Paragraph": {
-                  "inlines": [
-                    {
-                      "Text": "two"
-                    }
-                  ]
-                }
-              }
-            ],
-            "checked": null
           }
         ]
       }

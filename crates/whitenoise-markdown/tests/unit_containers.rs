@@ -88,6 +88,86 @@ fn blockquote_nested() {
 }
 
 #[test]
+fn nested_blockquote_list_then_trailing_paragraph() {
+    // Regression: a list inside a nested blockquote followed by another
+    // paragraph in the same nested quote — the trailing paragraph used to
+    // misroute to root because the now-itemless list was left on the
+    // container stack.
+    let input = "> Outer quote\n\
+                 >\n\
+                 > > Inner quote with **bold**.\n\
+                 > >\n\
+                 > > - inner list item one\n\
+                 > > - inner list item two\n\
+                 > >   - deeply nested\n\
+                 > >\n\
+                 > > Trailing paragraph in inner quote.\n\
+                 >\n\
+                 > Back to outer.\n";
+
+    let parsed = parse_blocks(input);
+    assert_eq!(parsed.len(), 1, "exactly one outer block expected");
+    let outer = match &parsed[0] {
+        Block::BlockQuote { blocks } => blocks,
+        other => panic!("expected outer BlockQuote, got {other:?}"),
+    };
+    assert_eq!(outer.len(), 3, "outer should contain 3 children");
+
+    // Outer[0]: paragraph "Outer quote"
+    assert!(matches!(&outer[0], Block::Paragraph { .. }));
+
+    // Outer[1]: inner BlockQuote with 3 children (intro paragraph, list,
+    // trailing paragraph).
+    let inner = match &outer[1] {
+        Block::BlockQuote { blocks } => blocks,
+        other => panic!("expected inner BlockQuote, got {other:?}"),
+    };
+    assert_eq!(inner.len(), 3, "inner should contain 3 children");
+    assert!(matches!(&inner[0], Block::Paragraph { .. }));
+    let list_items = match &inner[1] {
+        Block::List { items, .. } => items,
+        other => panic!("expected list as inner[1], got {other:?}"),
+    };
+    assert_eq!(list_items.len(), 2);
+    // Item 2 carries a nested list.
+    assert!(
+        list_items[1]
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::List { .. })),
+        "item 2 should embed a nested list"
+    );
+    match &inner[2] {
+        Block::Paragraph { inlines } => {
+            let text: String = inlines
+                .iter()
+                .map(|i| match i {
+                    Inline::Text(s) => s.as_str(),
+                    _ => "",
+                })
+                .collect();
+            assert_eq!(text, "Trailing paragraph in inner quote.");
+        }
+        other => panic!("expected trailing Paragraph as inner[2], got {other:?}"),
+    }
+
+    // Outer[2]: paragraph "Back to outer."
+    match &outer[2] {
+        Block::Paragraph { inlines } => {
+            let text: String = inlines
+                .iter()
+                .map(|i| match i {
+                    Inline::Text(s) => s.as_str(),
+                    _ => "",
+                })
+                .collect();
+            assert_eq!(text, "Back to outer.");
+        }
+        other => panic!("expected 'Back to outer.' Paragraph, got {other:?}"),
+    }
+}
+
+#[test]
 fn blockquote_with_atx_inside() {
     let input = "> # foo";
     assert_eq!(
