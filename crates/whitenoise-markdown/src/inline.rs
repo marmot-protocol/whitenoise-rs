@@ -276,7 +276,20 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 }
             }
             b'@' => try_or_literal!('@', try_nostr_mention(bytes, i), Inline::NostrMention),
-            b'n' => try_or_literal!('n', try_nostr_uri(bytes, i), Inline::NostrUri),
+            b'n' => {
+                if let Some((entity, end)) = try_nostr_uri(bytes, i) {
+                    flush_text(&mut out, &mut buf, &delims);
+                    out.push(Inline::NostrUri(entity));
+                    i = end;
+                } else if let Some((entity, end)) = try_nostr_bare_mention(bytes, i) {
+                    flush_text(&mut out, &mut buf, &delims);
+                    out.push(Inline::NostrMention(entity));
+                    i = end;
+                } else {
+                    buf.push('n');
+                    i += 1;
+                }
+            }
             b'\n' => {
                 let trailing = trailing_space_count(&buf);
                 let hard = trailing >= 2;
@@ -316,12 +329,16 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                         }
                         if INLINE_SPECIAL[cc as usize] {
                             // `n` is in INLINE_SPECIAL only as a tripwire for
-                            // the `nostr:` URI scheme; the vast majority of
-                            // `n` bytes in prose aren't followed by `ostr:`.
-                            // Replicate the cheap discriminator here so those
-                            // bytes stay in the bulk run instead of bouncing
-                            // out to dispatch + `try_nostr_uri` and back.
-                            if cc == b'n' && bytes.get(i + 1..i + 6) != Some(b"ostr:") {
+                            // the `nostr:` URI scheme and bare `npub1…`
+                            // mentions; the vast majority of `n` bytes in
+                            // prose aren't either. Replicate the cheap
+                            // discriminator here so those bytes stay in the
+                            // bulk run instead of bouncing out to dispatch
+                            // and back.
+                            if cc == b'n'
+                                && bytes.get(i + 1..i + 6) != Some(b"ostr:")
+                                && bytes.get(i + 1..i + 5) != Some(b"pub1")
+                            {
                                 i += 1;
                                 continue;
                             }
@@ -832,6 +849,32 @@ fn try_nostr_mention(bytes: &[u8], i: usize) -> Option<(NostrEntity, usize)> {
         return None;
     }
     let bech32 = std::str::from_utf8(&bytes[i + 1..end]).ok()?.to_string();
+    Some((NostrEntity { hrp, bech32 }, end))
+}
+
+/// Try to consume a bare `npub1…` mention starting at byte `i` (which must
+/// point at `n`). Same shape rules as `try_nostr_mention` but without the
+/// `@` prefix. Restricted to the `npub` HRP — other HRPs require the
+/// explicit `@` or `nostr:` prefix to avoid false-positive matches on
+/// running text that happens to start with `note1…` / `nevent1…`.
+fn try_nostr_bare_mention(bytes: &[u8], i: usize) -> Option<(NostrEntity, usize)> {
+    debug_assert_eq!(bytes[i], b'n');
+    let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
+    if !nostr::left_boundary_ok(prev) {
+        return None;
+    }
+    // Don't let the bare form rescue a prefix that already declined: if the
+    // previous byte is `@` or `:` then `@npub1…` or `nostr:npub1…` was tried
+    // and rejected (left boundary on the prefix), so the trailing bech32
+    // must stay literal too.
+    if matches!(prev, Some(b'@') | Some(b':')) {
+        return None;
+    }
+    let (hrp, end) = nostr::classify_bech32(bytes, i)?;
+    if hrp != NostrHrp::Npub {
+        return None;
+    }
+    let bech32 = std::str::from_utf8(&bytes[i..end]).ok()?.to_string();
     Some((NostrEntity { hrp, bech32 }, end))
 }
 

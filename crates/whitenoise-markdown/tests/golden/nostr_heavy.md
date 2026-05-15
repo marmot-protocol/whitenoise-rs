@@ -6,6 +6,12 @@ Mid-sentence: hello @npub1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz, how are you?
 
 In parens: (@npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9).
 
+Bare (no `@`) at start: npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9 — followed by text.
+
+Bare mid-sentence: hello npub1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz, how are you?
+
+Bare in parens: (npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9).
+
 URI forms — all six accepted HRPs:
 
 - npub: nostr:npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9

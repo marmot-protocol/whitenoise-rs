@@ -23,8 +23,6 @@
 //! diff, commit if intentional. Re-run without the env var to confirm the
 //! goldens lock in.
 
-#![cfg(feature = "serde")]
-
 use std::fs;
 use std::path::PathBuf;
 

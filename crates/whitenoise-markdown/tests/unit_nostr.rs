@@ -176,6 +176,66 @@ fn nostr_terminator_punctuation() {
 
 #[test]
 fn nostr_n_alone_is_text() {
-    // `n` not followed by `ostr:` is just literal text.
+    // `n` not followed by `ostr:` or `pub1` is just literal text.
     assert_eq!(parse_inlines("nope"), vec![t("nope")]);
+}
+
+// ----- Bare npub mentions (no `@` prefix) ----------------------------
+
+#[test]
+fn bare_npub_at_start_of_paragraph() {
+    assert_eq!(parse_inlines(&npub_str()), vec![npub(&npub_str())]);
+}
+
+#[test]
+fn bare_npub_after_whitespace() {
+    let s = format!("hello {}", npub_str());
+    assert_eq!(parse_inlines(&s), vec![t("hello "), npub(&npub_str())]);
+}
+
+#[test]
+fn bare_npub_after_punctuation() {
+    let s = format!("({})", npub_str());
+    assert_eq!(parse_inlines(&s), vec![t("("), npub(&npub_str()), t(")")]);
+}
+
+#[test]
+fn bare_npub_terminator_punctuation() {
+    let s = format!("see {}.", npub_str());
+    assert_eq!(
+        parse_inlines(&s),
+        vec![t("see "), npub(&npub_str()), t(".")]
+    );
+}
+
+#[test]
+fn bare_npub_after_letter_rejected() {
+    // `foonpub1...` must NOT match — left boundary fails.
+    let s = format!("foo{}", npub_str());
+    assert_eq!(parse_inlines(&s), vec![t(&s)]);
+}
+
+#[test]
+fn bare_npub_after_digit_rejected() {
+    let s = format!("1{}", npub_str());
+    assert_eq!(parse_inlines(&s), vec![t(&s)]);
+}
+
+#[test]
+fn bare_nsec_rejected() {
+    // `nsec1…` must never match in bare form either.
+    let s = format!("nsec1{NPUB_BODY}");
+    assert_eq!(parse_inlines(&s), vec![t(&s)]);
+}
+
+#[test]
+fn bare_nevent_not_recognized() {
+    // Only `npub` is allowed in bare form; `nevent1…` requires `nostr:`.
+    assert_eq!(parse_inlines(&nevent_str()), vec![t(&nevent_str())]);
+}
+
+#[test]
+fn bare_npub_uppercase_rejected() {
+    let s = format!("NPUB1{NPUB_BODY}");
+    assert_eq!(parse_inlines(&s), vec![t(&s)]);
 }
