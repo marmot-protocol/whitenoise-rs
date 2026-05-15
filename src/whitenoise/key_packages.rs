@@ -280,39 +280,6 @@ pub(crate) fn monotonic_canonical_created_at(prev_max: Option<i64>) -> Timestamp
     }
 }
 
-/// Returns the canonical kind:30443 tags and `d` tag to publish.
-///
-/// If `stored_d_tag` is `Some`, swaps the freshly-generated `Tag::identifier`
-/// in `key_package_data.tags_30443` for the stored value so the publish lands
-/// in the same NIP-33 addressable slot and replaces the prior event on relays.
-/// If `None`, returns the MDK-generated tags and `d` tag unchanged — this is
-/// the first publish for the account.
-pub(crate) fn apply_d_tag_override(
-    stored_d_tag: Option<&str>,
-    key_package_data: &KeyPackageEventData,
-) -> (Vec<Tag>, String) {
-    match stored_d_tag {
-        Some(d) => {
-            let tags = key_package_data
-                .tags_30443
-                .iter()
-                .map(|tag| {
-                    if tag.kind() == TagKind::d() {
-                        Tag::identifier(d)
-                    } else {
-                        tag.clone()
-                    }
-                })
-                .collect();
-            (tags, d.to_string())
-        }
-        None => (
-            key_package_data.tags_30443.clone(),
-            key_package_data.d_tag.clone(),
-        ),
-    }
-}
-
 /// Filters relay responses to key package events that match the expected kind and author.
 ///
 /// Returns `(valid_events, dropped_wrong_kind, dropped_wrong_author)`.
@@ -344,6 +311,13 @@ pub(crate) fn filter_key_package_events_for_account(
 impl Whitenoise {
     /// Helper method to create and encode a key package for the given account.
     ///
+    /// When `existing_d_tag` is `Some(d)`, MDK reuses that NIP-33
+    /// addressable-slot identifier instead of generating a fresh random
+    /// one — this is how consecutive publishes for the same account replace
+    /// the previous canonical event on relays per NIP-33 instead of
+    /// accumulating new distinct events. `None` lets MDK generate a fresh
+    /// slot (first publish for the account).
+    ///
     /// Returns a [`KeyPackageEventData`] containing the encoded content, tags
     /// for both event kinds, and the hash_ref for lifecycle tracking.
     #[perf_instrument("key_packages")]
@@ -351,12 +325,21 @@ impl Whitenoise {
         &self,
         account: &Account,
         key_package_relays: &[Relay],
+        existing_d_tag: Option<&str>,
     ) -> Result<KeyPackageEventData> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
+        let options = mdk_core::key_packages::KeyPackageOptions {
+            protected: false,
+            existing_d_tag: existing_d_tag.map(str::to_owned),
+        };
         let data = mdk
-            .create_key_package_for_event(&account.pubkey, key_package_relay_urls)
+            .create_key_package_for_event_with_options(
+                &account.pubkey,
+                key_package_relay_urls,
+                options,
+            )
             .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))?;
 
         Ok(data)
@@ -379,11 +362,14 @@ impl Whitenoise {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
-        let key_package_data = self.encoded_key_package(account, &relays).await?;
+        let (key_package_data, canonical_created_at) = self
+            .prepare_canonical_publish_inputs(account, &relays)
+            .await?;
         let relay_urls = Relay::urls(&relays);
         self.publish_key_package_pair_to_relays(
             account,
             &key_package_data,
+            canonical_created_at,
             &relay_urls,
             std::sync::Arc::new(signer),
         )
@@ -406,7 +392,9 @@ impl Whitenoise {
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
-        let key_package_data = self.encoded_key_package(account, relays).await?;
+        let (key_package_data, canonical_created_at) = self
+            .prepare_canonical_publish_inputs(account, relays)
+            .await?;
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
 
@@ -422,6 +410,7 @@ impl Whitenoise {
                     .publish_key_package_pair_to_relays(
                         &account,
                         &key_package_data,
+                        canonical_created_at,
                         &relay_urls,
                         signer,
                     )
@@ -438,7 +427,13 @@ impl Whitenoise {
         }
 
         match self
-            .publish_key_package_pair_to_relays(account, &key_package_data, &relay_urls, signer)
+            .publish_key_package_pair_to_relays(
+                account,
+                &key_package_data,
+                canonical_created_at,
+                &relay_urls,
+                signer,
+            )
             .await
         {
             Ok(()) => {}
@@ -454,11 +449,61 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Resolves persisted canonical-slot state and generates the key package
+    /// in one step.
+    ///
+    /// Looks up the previously-recorded NIP-33 `d` tag and the maximum
+    /// `created_at` for kind:30443 publishes, then calls MDK with the stored
+    /// d-tag so the new event lands in the same addressable slot. Returns a
+    /// strictly-monotonic canonical `created_at` so a same-second publish
+    /// can't lose the NIP-01 lowest-event-id tiebreaker.
+    ///
+    /// Fail-fast on DB read errors: a soft-fail `None` fallback would publish
+    /// into a fresh NIP-33 slot (slot drift) and risk losing the timestamp
+    /// tiebreaker — defeating the whole reuse path. The scheduler retries
+    /// publishing on its next tick, so transient SQLite errors aren't fatal
+    /// for the system.
+    async fn prepare_canonical_publish_inputs(
+        &self,
+        account: &Account,
+        relays: &[Relay],
+    ) -> Result<(KeyPackageEventData, Timestamp)> {
+        let session = self.require_session(&account.pubkey)?;
+
+        let stored_d_tag = session
+            .repos
+            .published_key_packages
+            .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
+            .await?;
+        let prev_canonical_max = session
+            .repos
+            .published_key_packages
+            .find_max_created_at(MLS_KEY_PACKAGE_KIND)
+            .await?;
+
+        let key_package_data = self
+            .encoded_key_package(account, relays, stored_d_tag.as_deref())
+            .await?;
+        let canonical_created_at = monotonic_canonical_created_at(prev_canonical_max);
+
+        Ok((key_package_data, canonical_created_at))
+    }
+
+    /// Publishes the canonical (kind:30443) and legacy (kind:443) key package
+    /// pair for an already-encoded `KeyPackageEventData`.
+    ///
+    /// Caller is responsible for resolving NIP-33 slot state via
+    /// [`Self::prepare_canonical_publish_inputs`] so the d-tag baked into
+    /// `key_package_data.tags_30443` by MDK is the persisted slot identifier
+    /// (not a fresh random one), and `canonical_created_at` is strictly
+    /// monotonic past the prior canonical insert. This function trusts those
+    /// inputs and just publishes + tracks.
     #[perf_instrument("key_packages")]
     async fn publish_key_package_pair_to_relays(
         &self,
         account: &Account,
         key_package_data: &KeyPackageEventData,
+        canonical_created_at: Timestamp,
         relay_urls: &[RelayUrl],
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<()> {
@@ -470,47 +515,12 @@ impl Whitenoise {
         // a local audit trail.
         let session = self.require_session(&account.pubkey)?;
 
-        // Reuse the previously-published kind:30443 `d` tag slot so this
-        // publish replaces the prior addressable event on relays per NIP-33.
-        // MDK generates a fresh random `d` tag inside
-        // `create_key_package_for_event`, and the MDK docs explicitly say
-        // "Callers SHOULD store and reuse this value when rotating the
-        // KeyPackage." Without reuse, every publish lands as a distinct event
-        // and relays accumulate stale key packages indefinitely.
-        //
-        // Fail fast if the lookup errors. Silently falling back to MDK's
-        // fresh d-tag would publish into a brand-new NIP-33 slot and orphan
-        // the existing canonical event on relays — defeating this fix. DB
-        // read failures on the per-account SQLite file are rare; the
-        // scheduler retries publishing on its next tick.
-        let stored_d_tag = session
-            .repos
-            .published_key_packages
-            .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
-            .await?;
-
-        // Also look up the highest `created_at` recorded for the canonical
-        // slot. NIP-01 says if two replaceable events share a `created_at`,
-        // relays keep the one with the lowest event id — so reusing the
-        // d-tag alone is not enough to guarantee replacement when two
-        // publishes land in the same second. Force a strictly-monotonic
-        // canonical `created_at` so the new event always wins.
-        let prev_canonical_max = session
-            .repos
-            .published_key_packages
-            .find_max_created_at(MLS_KEY_PACKAGE_KIND)
-            .await?;
-
-        let (canonical_tags, canonical_d_tag) =
-            apply_d_tag_override(stored_d_tag.as_deref(), key_package_data);
-        let canonical_created_at = monotonic_canonical_created_at(prev_canonical_max);
-
         let canonical_event_id = self
             .publish_key_package_to_relays(
                 MLS_KEY_PACKAGE_KIND,
                 &key_package_data.content,
                 relay_urls,
-                &canonical_tags,
+                &key_package_data.tags_30443,
                 Some(canonical_created_at),
                 signer.clone(),
             )
@@ -523,7 +533,7 @@ impl Whitenoise {
             &session,
             &key_package_data.hash_ref,
             &canonical_event_id,
-            &canonical_d_tag,
+            &key_package_data.d_tag,
         )
         .await?;
 
@@ -2111,24 +2121,6 @@ mod tests {
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
-    fn sample_key_package_event_data(d_tag: &str) -> KeyPackageEventData {
-        KeyPackageEventData {
-            content: "sample".to_string(),
-            tags_30443: vec![
-                Tag::identifier(d_tag),
-                Tag::custom(TagKind::MlsCiphersuite, [REQUIRED_MLS_CIPHERSUITE_TAG]),
-                Tag::custom(TagKind::MlsExtensions, vec!["0x000a", "0xf2ee"]),
-                Tag::custom(TagKind::Custom("encoding".into()), ["base64"]),
-            ],
-            tags_443: vec![Tag::custom(
-                TagKind::MlsCiphersuite,
-                [REQUIRED_MLS_CIPHERSUITE_TAG],
-            )],
-            hash_ref: vec![1, 2, 3],
-            d_tag: d_tag.to_string(),
-        }
-    }
-
     #[test]
     fn test_monotonic_canonical_created_at_uses_now_when_no_prior() {
         let now_secs = Timestamp::now().as_secs();
@@ -2169,55 +2161,6 @@ mod tests {
         let now_secs = Timestamp::now().as_secs();
         let ts = monotonic_canonical_created_at(Some(-5));
         assert!(ts.as_secs() >= now_secs);
-    }
-
-    #[test]
-    fn test_apply_d_tag_override_uses_stored_d_tag_when_present() {
-        let data = sample_key_package_event_data("fresh-from-mdk");
-
-        let (tags, d_tag) = apply_d_tag_override(Some("persisted-slot"), &data);
-
-        assert_eq!(d_tag, "persisted-slot");
-        let identifier = tags
-            .iter()
-            .find(|t| t.kind() == TagKind::d())
-            .expect("d tag must be present");
-        assert_eq!(identifier.content(), Some("persisted-slot"));
-
-        // Non-d tags are preserved unchanged so MLS metadata still validates.
-        assert!(tags.iter().any(|t| t.kind() == TagKind::MlsCiphersuite));
-        assert!(
-            tags.iter()
-                .any(|t| t.kind() == TagKind::Custom("encoding".into()))
-        );
-    }
-
-    #[test]
-    fn test_apply_d_tag_override_keeps_fresh_d_tag_when_none_stored() {
-        let data = sample_key_package_event_data("fresh-from-mdk");
-
-        let (tags, d_tag) = apply_d_tag_override(None, &data);
-
-        assert_eq!(d_tag, "fresh-from-mdk");
-        let identifier = tags
-            .iter()
-            .find(|t| t.kind() == TagKind::d())
-            .expect("d tag must be present");
-        assert_eq!(identifier.content(), Some("fresh-from-mdk"));
-    }
-
-    #[test]
-    fn test_apply_d_tag_override_replaces_only_d_tag() {
-        let data = sample_key_package_event_data("fresh");
-        let original_count = data.tags_30443.len();
-
-        let (tags, _) = apply_d_tag_override(Some("slot"), &data);
-
-        assert_eq!(tags.len(), original_count);
-        // Exactly one `d` tag, and it is the overridden one.
-        let d_tags: Vec<_> = tags.iter().filter(|t| t.kind() == TagKind::d()).collect();
-        assert_eq!(d_tags.len(), 1);
-        assert_eq!(d_tags[0].content(), Some("slot"));
     }
 
     #[tokio::test]
@@ -2409,7 +2352,7 @@ mod tests {
             .await
             .unwrap();
         let key_package_data = whitenoise
-            .encoded_key_package(&account, &relays)
+            .encoded_key_package(&account, &relays, None)
             .await
             .unwrap();
 
