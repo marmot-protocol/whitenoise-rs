@@ -98,9 +98,9 @@ pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
 };
 
-// Background notification collection (iOS silent push). The async function
-// is re-exported alongside the result types so Rust callers can drive
-// collection directly without going through the FFI layer.
+// Background notification collection. The async function is re-exported
+// alongside the result types so Rust callers can drive collection directly
+// without going through the FFI layer.
 pub use whitenoise::background_notifications::{
     BackgroundNotificationResult, BackgroundNotificationStatus, NotificationDto,
     NotificationUserDto, collect_notifications_after_push,

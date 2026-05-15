@@ -70,7 +70,16 @@ impl GroupPlane {
     ) -> Result<()> {
         let _update_guard = self.update_lock.lock().await;
 
+        let normalized_groups = Self::normalize_group_specs(group_specs);
+        let subscriptions = Self::build_relay_set_subscriptions(&normalized_groups);
+
         if let Some(previous_state) = self.accounts.read().await.get(&pubkey).cloned() {
+            if previous_state.groups == normalized_groups
+                && previous_state.subscriptions == subscriptions
+            {
+                return Ok(());
+            }
+
             for subscription in previous_state.subscriptions {
                 self.session
                     .unsubscribe(&self.subscription_id(&pubkey, subscription.subscription_index))
@@ -78,7 +87,7 @@ impl GroupPlane {
             }
         }
 
-        if group_specs.is_empty() {
+        if normalized_groups.is_empty() {
             // Keep the account in the map with empty state so health checks
             // (has_account_subscriptions) can distinguish "activated with no
             // groups" from "never activated at all".
@@ -88,9 +97,6 @@ impl GroupPlane {
                 .insert(pubkey, GroupAccountState::default());
             return Ok(());
         }
-
-        let normalized_groups = Self::normalize_group_specs(group_specs);
-        let subscriptions = Self::build_relay_set_subscriptions(&normalized_groups);
 
         // On any failure below, remove the account entry so that
         // has_active_subscription() returns false and recovery is triggered.
@@ -578,6 +584,41 @@ mod tests {
         let state = accounts.get(&pubkey).unwrap();
         assert_eq!(state.groups.len(), 1);
         assert_eq!(state.groups[0].group_id, "stable-group");
+    }
+
+    #[tokio::test]
+    async fn test_update_account_same_non_empty_specs_preserves_existing_state_without_reconnect() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [13; 16]);
+        let pubkey = Keys::generate().public_key();
+        let relay = RelayUrl::parse("wss://same-spec-reconnect.invalid").unwrap();
+        let groups = vec![GroupSubscriptionSpec {
+            group_id: "stable-group".to_string(),
+            relays: vec![relay],
+        }];
+        let subscriptions = GroupPlane::build_relay_set_subscriptions(&groups);
+        plane.accounts.write().await.insert(
+            pubkey,
+            GroupAccountState {
+                groups: groups.clone(),
+                subscriptions,
+            },
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            plane.update_account(pubkey, &groups, None),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "same-spec update should not wait on relay reconnection: {result:?}"
+        );
+        let accounts = plane.accounts.read().await;
+        let state = accounts.get(&pubkey).unwrap();
+        assert_eq!(state.groups, groups);
+        assert_eq!(state.subscriptions.len(), 1);
     }
 
     #[tokio::test]

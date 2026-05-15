@@ -123,7 +123,13 @@ impl BackgroundNotificationResult {
 /// Default quiet window: if no notification arrives within this duration, stop collecting.
 const DEFAULT_QUIET_WINDOW: Duration = Duration::from_millis(1000);
 
-/// Hard ceiling on any caller-provided `max_wait`. iOS gives silent-push
+/// First-notification window. A cold NSE wake has to reconnect, fetch,
+/// decrypt, cache, and emit before anything reaches the broadcast channel, so
+/// the initial wait needs to be longer than the post-first-notification quiet
+/// window.
+const DEFAULT_FIRST_NOTIFICATION_WINDOW: Duration = Duration::from_secs(8);
+
+/// Hard ceiling on any caller-provided `max_wait`. iOS gives notification
 /// handlers roughly 30 seconds of background execution; we clamp to 25s to
 /// leave a safety margin for init, response serialization, and the native
 /// local-notification scheduling that happens after this returns.
@@ -190,8 +196,10 @@ async fn collect_notifications_inner(
         "Starting background notification collection"
     );
 
-    // Step 1: Ensure Whitenoise is initialized (no-op if warm, full boot if cold).
-    let whitenoise = Whitenoise::ensure_initialized(config).await?;
+    // Step 1: Ensure Whitenoise is initialized (no-op if warm, background-safe
+    // boot if cold). The background-safe cold path defers startup subscription
+    // setup until after this function subscribes to notification updates below.
+    let whitenoise = Whitenoise::ensure_initialized_for_background_notifications(config).await?;
 
     // Step 2: Subscribe to notification broadcast BEFORE refreshing subscriptions.
     // This ordering is critical — events processed after ensure_all_subscriptions()
@@ -200,13 +208,12 @@ async fn collect_notifications_inner(
     // drop them silently.
     let mut rx = whitenoise.subscribe_to_notifications().updates;
 
-    // Step 3: Refresh relay subscriptions. This reconnects dead relays and
-    // fetches missed events using `since` timestamps. The event processor
-    // decrypts and processes them, emitting NotificationUpdates.
-    // Propagate errors here — if subscriptions fail to refresh, no events
-    // will arrive and the caller should receive an explicit failure rather
-    // than a misleading "no_data" result.
-    whitenoise.ensure_all_subscriptions().await?;
+    // Step 3: Force a relay subscription refresh. A health-only ensure can
+    // no-op when relays still look connected, even though iOS suspended the
+    // process long enough for it to miss events. Re-subscribing with `since`
+    // gives the event processor a catch-up window to decrypt and emit
+    // NotificationUpdates.
+    whitenoise.setup_all_subscriptions().await?;
 
     let init_elapsed = start.elapsed();
     let drain_budget = max_wait.saturating_sub(init_elapsed);
@@ -261,7 +268,12 @@ async fn drain_notifications(
             break;
         }
 
-        let wait = remaining.min(DEFAULT_QUIET_WINDOW);
+        let wait_window = if collected.is_empty() {
+            DEFAULT_FIRST_NOTIFICATION_WINDOW
+        } else {
+            DEFAULT_QUIET_WINDOW
+        };
+        let wait = remaining.min(wait_window);
         match timeout(wait, rx.recv()).await {
             Ok(Ok(update)) => {
                 tracing::debug!(
@@ -459,6 +471,24 @@ mod tests {
 
         let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
         assert_eq!(collected.len(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_waits_beyond_quiet_window_for_first_notification() {
+        let (tx, mut rx) = broadcast::channel(16);
+        tokio::spawn(async move {
+            tokio::time::sleep(DEFAULT_QUIET_WINDOW + Duration::from_millis(500)).await;
+            tx.send(make_test_notification(
+                NotificationTrigger::NewMessage,
+                "late first notification",
+            ))
+            .expect("send should succeed while rx is alive");
+        });
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(5)).await;
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].content, "late first notification");
     }
 
     #[tokio::test(start_paused = true)]
