@@ -538,6 +538,19 @@ impl Whitenoise {
     /// (not a fresh random one), and `canonical_created_at` is strictly
     /// monotonic past the prior canonical insert. This function trusts those
     /// inputs and just publishes + tracks.
+    ///
+    /// Why this still lives on `Whitenoise` rather than only on
+    /// [`KeyPackageOps`](crate::whitenoise::session::AccountSession#method.key_packages):
+    /// the external-signer login flow inserts the signer into
+    /// `Whitenoise.shared.external_signers` *before* `from_account` builds
+    /// the session, so `AccountSession::from_account` sees no local key and
+    /// leaves `session.signer = None`. Routing the initial external-signer
+    /// publish through `KeyPackageOps::publish_pair` would then trip
+    /// `require_signer() → SignerUnavailable`. Folding the two paths into
+    /// one means rewiring `from_account` (or `insert_account_session`) to
+    /// also consult the `external_signers` map — a session-signer-lifecycle
+    /// refactor that's out of scope for the d-tag-stability fix. See the
+    /// PR #835 review thread on this function for the discussion.
     #[perf_instrument("key_packages")]
     async fn publish_key_package_pair_to_relays(
         &self,
