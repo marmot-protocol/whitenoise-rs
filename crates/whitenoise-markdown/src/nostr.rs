@@ -14,7 +14,11 @@ use crate::ast::NostrHrp;
 /// - A literal `1` separates HRP from data.
 /// - Data is `[a-z0-9]` *excluding* `b`, `i`, `o` and `1` (the standard
 ///   bech32 alphabet), with at least 6 chars.
-/// - Total bech32 string length 8..=90 (per BIP-173).
+/// - Total bech32 string length 8..=1024. The lower bound is BIP-173's
+///   minimum; the upper bound is far above BIP-173's 90 because NIP-19
+///   explicitly waives that limit (TLV-encoded `nevent` / `naddr` /
+///   `nprofile` with multiple relay hints commonly exceed 90 chars). The
+///   cap exists only as a sanity bound against pathological scans.
 /// - All-lowercase: any uppercase letter rejects (mixed case forbidden).
 pub(crate) fn classify_bech32(bytes: &[u8], i: usize) -> Option<(NostrHrp, usize)> {
     let total_start = i;
@@ -41,7 +45,7 @@ pub(crate) fn classify_bech32(bytes: &[u8], i: usize) -> Option<(NostrHrp, usize
         return None;
     }
     let total_len = j - total_start;
-    if !(8..=90).contains(&total_len) {
+    if !(8..=1024).contains(&total_len) {
         return None;
     }
     Some((hrp, j))

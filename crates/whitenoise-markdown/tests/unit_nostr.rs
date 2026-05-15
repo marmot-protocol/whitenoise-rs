@@ -239,3 +239,15 @@ fn bare_npub_uppercase_rejected() {
     let s = format!("NPUB1{NPUB_BODY}");
     assert_eq!(parse_inlines(&s), vec![t(&s)]);
 }
+
+#[test]
+fn nostr_long_real_world_nevent() {
+    // A real-world 122-char `nevent` URI (TLV-encoded with relay hints).
+    // BIP-173's 90-char cap is waived for nostr per NIP-19.
+    let bech32 = "nevent1qgsxve63trnr8rlgnldyrrjz5zlj573tzvjsfhf50uq45xyhrdjygvqqyqcpwgravr6f5r4d0pu225w32jn45u5ufdqefv7hmzyjetaavj0mv9hhk69";
+    let s = format!("see nostr:{bech32} here");
+    assert_eq!(
+        parse_inlines(&s),
+        vec![t("see "), uri(NostrHrp::Nevent, bech32), t(" here"),]
+    );
+}
