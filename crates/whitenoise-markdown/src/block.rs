@@ -911,29 +911,29 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
         // `<...>` form: no unescaped `<`, `>` or newline.
         let start = i + 1;
         let mut j = start;
-        let mut out = String::new();
+        let mut out_bytes: Vec<u8> = Vec::new();
         while j < b.len() && b[j] != b'>' {
             if b[j] == b'<' || b[j] == b'\n' {
                 return None;
             }
             if b[j] == b'\\' && j + 1 < b.len() && is_ascii_punct(b[j + 1]) {
-                out.push(b[j + 1] as char);
+                out_bytes.push(b[j + 1]);
                 j += 2;
                 continue;
             }
-            out.push(b[j] as char);
+            out_bytes.push(b[j]);
             j += 1;
         }
         if j >= b.len() {
             return None;
         }
-        Some((out, j + 1))
+        Some((String::from_utf8(out_bytes).ok()?, j + 1))
     } else {
         // Bare form: no whitespace, balanced parens, no control chars.
         let start = i;
         let mut j = start;
         let mut depth: i32 = 0;
-        let mut out = String::new();
+        let mut out_bytes: Vec<u8> = Vec::new();
         while j < b.len() {
             let c = b[j];
             if c == b' ' || c == b'\t' || c == b'\n' {
@@ -943,7 +943,7 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
                 break;
             }
             if c == b'\\' && j + 1 < b.len() && is_ascii_punct(b[j + 1]) {
-                out.push(b[j + 1] as char);
+                out_bytes.push(b[j + 1]);
                 j += 2;
                 continue;
             }
@@ -956,13 +956,13 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
                 }
                 depth -= 1;
             }
-            out.push(c as char);
+            out_bytes.push(c);
             j += 1;
         }
         if start == j || depth != 0 {
             return None;
         }
-        Some((out, j))
+        Some((String::from_utf8(out_bytes).ok()?, j))
     }
 }
 
@@ -979,22 +979,22 @@ pub(crate) fn parse_link_title(b: &[u8], i: usize) -> Option<(String, usize)> {
         _ => return None,
     };
     let mut j = i + 1;
-    let mut out = String::new();
+    let mut out_bytes: Vec<u8> = Vec::new();
     while j < b.len() {
         let c = b[j];
         if c == b'\\' && j + 1 < b.len() && is_ascii_punct(b[j + 1]) {
-            out.push(b[j + 1] as char);
+            out_bytes.push(b[j + 1]);
             j += 2;
             continue;
         }
         if c == close {
-            return Some((out, j + 1));
+            return Some((String::from_utf8(out_bytes).ok()?, j + 1));
         }
         // Disallow unescaped opening quote of same family inside parens form.
         if open == b'(' && c == b'(' {
             return None;
         }
-        out.push(c as char);
+        out_bytes.push(c);
         j += 1;
     }
     None
@@ -1398,25 +1398,26 @@ fn split_table_row(line: &str) -> Vec<String> {
     }
 
     let mut cells: Vec<String> = Vec::new();
-    let mut cur = String::new();
+    let mut cur_bytes: Vec<u8> = Vec::new();
     let mut k = lo;
     while k < hi {
         let c = bytes[k];
         if c == b'\\' && k + 1 < hi && bytes[k + 1] == b'|' {
-            cur.push('|');
+            cur_bytes.push(b'|');
             k += 2;
             continue;
         }
         if c == b'|' {
-            cells.push(cur.trim().to_string());
-            cur = String::new();
+            let cell = String::from_utf8(std::mem::take(&mut cur_bytes)).unwrap_or_default();
+            cells.push(cell.trim().to_string());
             k += 1;
             continue;
         }
-        cur.push(c as char);
+        cur_bytes.push(c);
         k += 1;
     }
-    cells.push(cur.trim().to_string());
+    let cell = String::from_utf8(cur_bytes).unwrap_or_default();
+    cells.push(cell.trim().to_string());
     cells
 }
 

@@ -54,11 +54,12 @@ fn render_block(b: &Block, out: &mut String) {
             out.push_str("</blockquote>\n");
         }
         Block::List { kind, tight, items } => {
-            let (open, close) = match kind {
-                ListKind::Bullet { .. } => ("<ul>", "</ul>"),
-                ListKind::Ordered { .. } => ("<ol>", "</ol>"),
+            let (open, close): (String, &str) = match kind {
+                ListKind::Bullet { .. } => ("<ul>".to_string(), "</ul>"),
+                ListKind::Ordered { start, .. } if *start == 1 => ("<ol>".to_string(), "</ol>"),
+                ListKind::Ordered { start, .. } => (format!("<ol start=\"{start}\">"), "</ol>"),
             };
-            out.push_str(open);
+            out.push_str(&open);
             out.push('\n');
             for item in items {
                 out.push_str("<li>");

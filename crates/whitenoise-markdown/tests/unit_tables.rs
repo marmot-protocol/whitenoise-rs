@@ -164,6 +164,19 @@ fn table_cell_contains_emphasis() {
 }
 
 #[test]
+fn table_cells_preserve_non_ascii_utf8() {
+    let input = "| 日本 | 語 |\n| - | - |\n| あ🦫 | い🦫 |";
+    assert_eq!(
+        parse_blocks(input),
+        vec![table(
+            vec![Alignment::None, Alignment::None],
+            vec![cell("日本"), cell("語")],
+            vec![vec![cell("あ🦫"), cell("い🦫")]],
+        )]
+    );
+}
+
+#[test]
 fn table_cell_contains_nostr_mention() {
     use whitenoise_markdown::{NostrEntity, NostrHrp};
     let body = "xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9";

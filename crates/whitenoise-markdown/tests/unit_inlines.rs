@@ -103,6 +103,16 @@ fn code_span_no_escapes_inside() {
     assert_eq!(parse_inlines("`\\n`"), vec![code("\\n")]);
 }
 
+#[test]
+fn code_span_preserves_non_ascii_utf8() {
+    assert_eq!(parse_inlines("`日本語🦫`"), vec![code("日本語🦫")]);
+}
+
+#[test]
+fn code_span_normalizes_newline_with_non_ascii() {
+    assert_eq!(parse_inlines("`日本\n語🦫`"), vec![code("日本 語🦫")]);
+}
+
 // ----- Inline math ----------------------------------------------------
 
 #[test]

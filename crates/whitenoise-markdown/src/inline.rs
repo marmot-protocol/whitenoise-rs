@@ -429,14 +429,15 @@ fn normalize_code_span(b: &[u8]) -> String {
     // 1. Replace line endings with single spaces.
     let mut s = String::with_capacity(b.len());
     let mut prev_was_nl = false;
-    for &c in b {
-        if c == b'\n' || c == b'\r' {
+    let src = std::str::from_utf8(b).unwrap_or("");
+    for c in src.chars() {
+        if c == '\n' || c == '\r' {
             if !prev_was_nl {
                 s.push(' ');
             }
             prev_was_nl = true;
         } else {
-            s.push(c as char);
+            s.push(c);
             prev_was_nl = false;
         }
     }
@@ -634,15 +635,17 @@ fn parse_ref_label(b: &[u8], i: usize) -> Option<(String, usize)> {
 /// inside is allowed.
 fn label_text(b: &[u8], start: usize, end: usize) -> String {
     let mut out = String::new();
-    let mut k = start;
-    while k < end {
-        if b[k] == b'\\' && k + 1 < end {
-            out.push(b[k + 1] as char);
-            k += 2;
+    let src = std::str::from_utf8(&b[start..end]).unwrap_or("");
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+        {
+            out.push(next);
+            chars.next();
             continue;
         }
-        out.push(b[k] as char);
-        k += 1;
+        out.push(c);
     }
     out
 }

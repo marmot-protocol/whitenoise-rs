@@ -177,6 +177,43 @@ fn missing_ref_falls_through_to_text() {
     );
 }
 
+// ----- Non-ASCII UTF-8 in links --------------------------------------
+
+#[test]
+fn inline_link_non_ascii_dest_bare() {
+    assert_eq!(
+        parse_inlines("[foo](/日本語🦫)"),
+        vec![link("/日本語🦫", None, vec![t("foo")])]
+    );
+}
+
+#[test]
+fn inline_link_non_ascii_dest_bracketed() {
+    assert_eq!(
+        parse_inlines("[foo](</日本語🦫>)"),
+        vec![link("/日本語🦫", None, vec![t("foo")])]
+    );
+}
+
+#[test]
+fn inline_link_non_ascii_title() {
+    assert_eq!(
+        parse_inlines("[foo](/u \"日本語🦫\")"),
+        vec![link("/u", Some("日本語🦫"), vec![t("foo")])]
+    );
+}
+
+#[test]
+fn shortcut_ref_link_non_ascii_label() {
+    let input = "[日本語🦫]\n\n[日本語🦫]: /url";
+    assert_eq!(
+        parse_blocks(input),
+        vec![Block::Paragraph {
+            inlines: vec![link("/url", None, vec![t("日本語🦫")])]
+        }]
+    );
+}
+
 // ----- Nested-link prevention ----------------------------------------
 
 #[test]
