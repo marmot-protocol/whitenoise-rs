@@ -256,6 +256,30 @@ pub(crate) fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey)
     Ok(())
 }
 
+/// Returns a strictly-monotonic `created_at` for the next kind:30443 publish.
+///
+/// NIP-01 specifies that when two replaceable events share a `created_at`,
+/// relays keep the one with the lowest event id. Reusing the d-tag alone
+/// does not guarantee that a fresh publish replaces the previous canonical
+/// event when both land in the same second — the new event might lose the
+/// id-comparison tiebreaker. Forcing `created_at` strictly above the
+/// previously-recorded insert timestamp (which is always ≥ the previous
+/// event's `created_at`) sidesteps the tie.
+pub(crate) fn monotonic_canonical_created_at(prev_max: Option<i64>) -> Timestamp {
+    let now = Timestamp::now();
+    match prev_max {
+        Some(prev) if prev >= 0 => {
+            let floor = u64::try_from(prev).unwrap_or(0).saturating_add(1);
+            if floor > now.as_secs() {
+                Timestamp::from_secs(floor)
+            } else {
+                now
+            }
+        }
+        _ => now,
+    }
+}
+
 /// Returns the canonical kind:30443 tags and `d` tag to publish.
 ///
 /// If `stored_d_tag` is `Some`, swaps the freshly-generated `Tag::identifier`
@@ -263,7 +287,7 @@ pub(crate) fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey)
 /// in the same NIP-33 addressable slot and replaces the prior event on relays.
 /// If `None`, returns the MDK-generated tags and `d` tag unchanged — this is
 /// the first publish for the account.
-fn apply_d_tag_override(
+pub(crate) fn apply_d_tag_override(
     stored_d_tag: Option<&str>,
     key_package_data: &KeyPackageEventData,
 ) -> (Vec<Tag>, String) {
@@ -465,8 +489,21 @@ impl Whitenoise {
             .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
             .await?;
 
+        // Also look up the highest `created_at` recorded for the canonical
+        // slot. NIP-01 says if two replaceable events share a `created_at`,
+        // relays keep the one with the lowest event id — so reusing the
+        // d-tag alone is not enough to guarantee replacement when two
+        // publishes land in the same second. Force a strictly-monotonic
+        // canonical `created_at` so the new event always wins.
+        let prev_canonical_max = session
+            .repos
+            .published_key_packages
+            .find_max_created_at(MLS_KEY_PACKAGE_KIND)
+            .await?;
+
         let (canonical_tags, canonical_d_tag) =
             apply_d_tag_override(stored_d_tag.as_deref(), key_package_data);
+        let canonical_created_at = monotonic_canonical_created_at(prev_canonical_max);
 
         let canonical_event_id = self
             .publish_key_package_to_relays(
@@ -474,6 +511,7 @@ impl Whitenoise {
                 &key_package_data.content,
                 relay_urls,
                 &canonical_tags,
+                Some(canonical_created_at),
                 signer.clone(),
             )
             .await?;
@@ -493,6 +531,7 @@ impl Whitenoise {
                 &key_package_data.content,
                 relay_urls,
                 &key_package_data.tags_443,
+                None,
                 signer,
             )
             .await
@@ -533,12 +572,20 @@ impl Whitenoise {
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
+        custom_created_at: Option<Timestamp>,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<EventId> {
         let result = self
             .shared
             .relay_control
-            .publish_key_package_with_signer(kind, encoded_key_package, relay_urls, tags, signer)
+            .publish_key_package_with_signer(
+                kind,
+                encoded_key_package,
+                relay_urls,
+                tags,
+                custom_created_at,
+                signer,
+            )
             .await?;
 
         if result.success.is_empty() {
@@ -2051,6 +2098,48 @@ mod tests {
     }
 
     #[test]
+    fn test_monotonic_canonical_created_at_uses_now_when_no_prior() {
+        let now_secs = Timestamp::now().as_secs();
+        let ts = monotonic_canonical_created_at(None);
+        assert!(
+            ts.as_secs() >= now_secs,
+            "with no prior publish the new timestamp must be at least the wall clock"
+        );
+    }
+
+    #[test]
+    fn test_monotonic_canonical_created_at_steps_past_future_prior() {
+        // Pin prior strictly in the future so we can prove the bump.
+        let now_secs = Timestamp::now().as_secs();
+        let prior = i64::try_from(now_secs + 3600).unwrap();
+        let ts = monotonic_canonical_created_at(Some(prior));
+        assert_eq!(
+            ts.as_secs(),
+            u64::try_from(prior).unwrap() + 1,
+            "must produce prev+1 when the wall clock is below the prior publish"
+        );
+    }
+
+    #[test]
+    fn test_monotonic_canonical_created_at_uses_now_when_prior_is_past() {
+        let now_secs = Timestamp::now().as_secs();
+        let prior = i64::try_from(now_secs.saturating_sub(3600)).unwrap();
+        let ts = monotonic_canonical_created_at(Some(prior));
+        assert!(
+            ts.as_secs() >= now_secs,
+            "wall clock wins when the prior publish is in the past"
+        );
+    }
+
+    #[test]
+    fn test_monotonic_canonical_created_at_ignores_negative_prior() {
+        // Defensive: a corrupt DB row shouldn't crash the publish path.
+        let now_secs = Timestamp::now().as_secs();
+        let ts = monotonic_canonical_created_at(Some(-5));
+        assert!(ts.as_secs() >= now_secs);
+    }
+
+    #[test]
     fn test_apply_d_tag_override_uses_stored_d_tag_when_present() {
         let data = sample_key_package_event_data("fresh-from-mdk");
 
@@ -2116,7 +2205,16 @@ mod tests {
             .unwrap()
             .expect("initial publish must record a d_tag for kind:30443");
 
-        // Trigger a second publish through the same code path.
+        let initial_fetch = session.key_packages().fetch_all().await.unwrap();
+        let initial_canonical = initial_fetch
+            .iter()
+            .find(|e| e.kind == MLS_KEY_PACKAGE_KIND)
+            .expect("relay must hold a canonical event after the first publish")
+            .clone();
+
+        // Trigger a second publish through the same code path *in the same
+        // wall-clock second* — the monotonic-created_at logic must keep the
+        // new event id from losing a NIP-01 tiebreaker.
         let keys = whitenoise
             .shared
             .secrets_store
@@ -2128,6 +2226,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        // DB invariant: every canonical row reuses the original slot.
         let canonical_rows: Vec<(String,)> = sqlx::query_as(
             "SELECT d_tag FROM published_key_packages
              WHERE kind = ? AND d_tag IS NOT NULL",
@@ -2145,10 +2244,32 @@ mod tests {
         for (d_tag,) in &canonical_rows {
             assert_eq!(
                 d_tag, &initial_d_tag,
-                "every kind:30443 publish must reuse the original d_tag slot \
-                 so relays NIP-33-replace the previous event instead of accumulating"
+                "every kind:30443 publish must reuse the original d_tag slot"
             );
         }
+
+        // Relay invariant: the relay surfaces exactly one canonical event for
+        // the (kind, pubkey, d) slot, and it is the NEW one — not the original.
+        let after_fetch = session.key_packages().fetch_all().await.unwrap();
+        let canonical_events: Vec<_> = after_fetch
+            .iter()
+            .filter(|e| e.kind == MLS_KEY_PACKAGE_KIND)
+            .collect();
+        assert_eq!(
+            canonical_events.len(),
+            1,
+            "NIP-33 must collapse kind:30443 events sharing the same d-tag to a single row \
+             after replacement; got {} canonical event(s)",
+            canonical_events.len()
+        );
+        assert_ne!(
+            canonical_events[0].id, initial_canonical.id,
+            "the new canonical event must replace the original on the relay"
+        );
+        assert!(
+            canonical_events[0].created_at >= initial_canonical.created_at,
+            "the replacement event must not be older than the one it replaces"
+        );
     }
 
     #[tokio::test]

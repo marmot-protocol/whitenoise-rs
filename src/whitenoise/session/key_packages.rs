@@ -11,7 +11,8 @@ use crate::RelayType;
 use crate::perf_instrument;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::key_packages::{
-    MLS_KEY_PACKAGE_KIND_LEGACY, filter_key_package_events_for_account,
+    MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, apply_d_tag_override,
+    filter_key_package_events_for_account, monotonic_canonical_created_at,
 };
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
@@ -39,9 +40,15 @@ impl<'a> KeyPackageOps<'a> {
 
     // ── Public API ─────────────────────────────────────────────────────
 
-    /// Creates a single MLS key package, then retries relay publishing with
-    /// exponential backoff if publishing fails. The key package is created
-    /// only once to avoid orphaning unused key material in local MLS storage.
+    /// Creates a single MLS key package, then publishes both the canonical
+    /// (kind:30443) and legacy (kind:443) events with retry/backoff on the
+    /// canonical leg. The key package is created only once to avoid
+    /// orphaning unused key material in local MLS storage.
+    ///
+    /// The canonical publish reuses the previously-recorded NIP-33 `d` tag
+    /// slot and uses a strictly-monotonic `created_at`, so it replaces any
+    /// prior canonical event on relays instead of accumulating a new
+    /// addressable-event row.
     #[perf_instrument("key_packages")]
     pub async fn publish(&self) -> Result<()> {
         let relays = self.prepare_relays().await?;
@@ -66,20 +73,8 @@ impl<'a> KeyPackageOps<'a> {
                 tokio::time::sleep(delay).await;
             }
 
-            match self
-                .publish_to_relays(
-                    MLS_KEY_PACKAGE_KIND_LEGACY,
-                    &key_package_data.content,
-                    &relay_urls,
-                    &key_package_data.tags_443,
-                )
-                .await
-            {
-                Ok(event_id) => {
-                    self.track_published(&key_package_data.hash_ref, &event_id)
-                        .await;
-                    return Ok(());
-                }
+            match self.publish_pair(&key_package_data, &relay_urls).await {
+                Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::key_packages",
@@ -98,20 +93,94 @@ impl<'a> KeyPackageOps<'a> {
     }
 
     /// Create a new key package and publish it (single attempt, no retry).
+    ///
+    /// Like [`Self::publish`] but without the retry loop. Used by the
+    /// account-setup path where failures are caught and surfaced as
+    /// warnings, leaving the scheduler to retry.
     #[perf_instrument("key_packages")]
     pub(crate) async fn create_and_publish(&self, relays: &[Relay]) -> Result<()> {
         let key_package_data = self.encoded_key_package(relays).await?;
         let relay_urls = Relay::urls(relays);
-        let event_id = self
+        self.publish_pair(&key_package_data, &relay_urls).await
+    }
+
+    /// Publish the canonical (kind:30443) and legacy (kind:443) key package
+    /// events for an already-encoded `KeyPackageEventData`.
+    ///
+    /// Canonical publishing reuses the persisted `d` tag and bumps
+    /// `created_at` strictly past the last canonical insert timestamp so
+    /// NIP-33 reliably replaces the prior event. Legacy publishing is
+    /// best-effort: a failure logs a warning but does not fail the call,
+    /// matching the dual-publish behavior on the global Whitenoise path.
+    async fn publish_pair(
+        &self,
+        key_package_data: &KeyPackageEventData,
+        relay_urls: &[RelayUrl],
+    ) -> Result<()> {
+        let stored_d_tag = self
+            .session
+            .repos
+            .published_key_packages
+            .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
+            .await?;
+        let prev_canonical_max = self
+            .session
+            .repos
+            .published_key_packages
+            .find_max_created_at(MLS_KEY_PACKAGE_KIND)
+            .await?;
+
+        let (canonical_tags, canonical_d_tag) =
+            apply_d_tag_override(stored_d_tag.as_deref(), key_package_data);
+        let canonical_created_at = monotonic_canonical_created_at(prev_canonical_max);
+
+        let canonical_event_id = self
+            .publish_to_relays(
+                MLS_KEY_PACKAGE_KIND,
+                &key_package_data.content,
+                relay_urls,
+                &canonical_tags,
+                Some(canonical_created_at),
+            )
+            .await?;
+        self.track_published(
+            &key_package_data.hash_ref,
+            &canonical_event_id,
+            MLS_KEY_PACKAGE_KIND,
+            Some(&canonical_d_tag),
+        )
+        .await;
+
+        match self
             .publish_to_relays(
                 MLS_KEY_PACKAGE_KIND_LEGACY,
                 &key_package_data.content,
-                &relay_urls,
+                relay_urls,
                 &key_package_data.tags_443,
+                None,
             )
-            .await?;
-        self.track_published(&key_package_data.hash_ref, &event_id)
-            .await;
+            .await
+        {
+            Ok(legacy_event_id) => {
+                self.track_published(
+                    &key_package_data.hash_ref,
+                    &legacy_event_id,
+                    MLS_KEY_PACKAGE_KIND_LEGACY,
+                    None,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Published canonical kind:30443 key package for account {} but failed \
+                     to publish legacy kind:443 twin: {}",
+                    self.session.account_pubkey.to_hex(),
+                    e,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -363,11 +432,18 @@ impl<'a> KeyPackageOps<'a> {
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
+        custom_created_at: Option<Timestamp>,
     ) -> Result<EventId> {
         let result = self
             .session
             .ephemeral
-            .publish_key_package(kind, encoded_key_package, relay_urls, tags)
+            .publish_key_package(
+                kind,
+                encoded_key_package,
+                relay_urls,
+                tags,
+                custom_created_at,
+            )
             .await?;
 
         if result.success.is_empty() {
@@ -380,17 +456,18 @@ impl<'a> KeyPackageOps<'a> {
     }
 
     #[perf_instrument("key_packages")]
-    async fn track_published(&self, hash_ref: &[u8], event_id: &EventId) {
+    async fn track_published(
+        &self,
+        hash_ref: &[u8],
+        event_id: &EventId,
+        kind: Kind,
+        d_tag: Option<&str>,
+    ) {
         if let Err(e) = self
             .session
             .repos
             .published_key_packages
-            .create(
-                hash_ref,
-                &event_id.to_hex(),
-                MLS_KEY_PACKAGE_KIND_LEGACY,
-                None,
-            )
+            .create(hash_ref, &event_id.to_hex(), kind, d_tag)
             .await
         {
             tracing::warn!(

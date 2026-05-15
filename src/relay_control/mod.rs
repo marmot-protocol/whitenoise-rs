@@ -462,10 +462,18 @@ impl RelayControlPlane {
         encoded_key_package: &str,
         relays: &[RelayUrl],
         tags: &[nostr_sdk::Tag],
+        custom_created_at: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
         self.ephemeral
-            .publish_key_package_with_signer(kind, encoded_key_package, relays, tags, signer)
+            .publish_key_package_with_signer(
+                kind,
+                encoded_key_package,
+                relays,
+                tags,
+                custom_created_at,
+                signer,
+            )
             .await
     }
 

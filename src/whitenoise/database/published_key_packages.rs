@@ -133,6 +133,30 @@ impl PublishedKeyPackage {
         Ok(row.map(|(d,)| d))
     }
 
+    /// Returns the maximum `created_at` recorded for a given event kind, if any.
+    ///
+    /// Used as a lower bound when computing a monotonic Nostr `created_at`
+    /// for the next kind:30443 publish. NIP-01 says that if two replaceable
+    /// events share a `created_at`, the relay keeps the one with the lowest
+    /// event id — so reusing the d-tag alone is not enough to guarantee
+    /// replacement when two publishes land in the same second. Forcing the
+    /// new event's `created_at` strictly above the previous insert timestamp
+    /// (which is always ≥ the previous event's `created_at`) sidesteps the
+    /// tie entirely.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn find_max_created_at(
+        db: &AccountDatabase,
+        kind: Kind,
+    ) -> Result<Option<i64>, DatabaseError> {
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT MAX(created_at) FROM published_key_packages WHERE kind = ?")
+                .bind(i64::from(kind.as_u16()))
+                .fetch_optional(&db.inner.pool)
+                .await?;
+
+        Ok(row.and_then(|(v,)| v))
+    }
+
     /// Looks up all published key packages sharing the same hash reference.
     #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn find_by_hash_ref(
@@ -548,6 +572,71 @@ mod tests {
                 .await
                 .unwrap();
         assert!(legacy_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_max_created_at_returns_none_when_empty() {
+        let (db, _dir) = setup().await;
+
+        let result = PublishedKeyPackage::find_max_created_at(&db, MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_max_created_at_returns_most_recent_for_kind() {
+        let (db, _dir) = setup().await;
+
+        PublishedKeyPackage::create(
+            &db,
+            &[1, 1, 1],
+            "older",
+            MLS_KEY_PACKAGE_KIND,
+            Some("d-old"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE published_key_packages SET created_at = 100 WHERE event_id = ?")
+            .bind("older")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+
+        PublishedKeyPackage::create(
+            &db,
+            &[2, 2, 2],
+            "newer",
+            MLS_KEY_PACKAGE_KIND,
+            Some("d-new"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE published_key_packages SET created_at = 200 WHERE event_id = ?")
+            .bind("newer")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+
+        // Legacy row at a higher timestamp must not bleed into the canonical max.
+        PublishedKeyPackage::create(&db, &[3, 3, 3], "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE published_key_packages SET created_at = 999 WHERE event_id = ?")
+            .bind("legacy")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+
+        let canonical_max = PublishedKeyPackage::find_max_created_at(&db, MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap();
+        assert_eq!(canonical_max, Some(200));
+
+        let legacy_max = PublishedKeyPackage::find_max_created_at(&db, MLS_KEY_PACKAGE_KIND_LEGACY)
+            .await
+            .unwrap();
+        assert_eq!(legacy_max, Some(999));
     }
 
     #[tokio::test]

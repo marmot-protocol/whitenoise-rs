@@ -43,6 +43,11 @@ impl PublishedKeyPackagesRepo {
         Ok(PublishedKeyPackage::find_latest_d_tag(&self.db, kind).await?)
     }
 
+    /// Return the maximum `created_at` recorded for a given event kind, if any.
+    pub async fn find_max_created_at(&self, kind: nostr_sdk::Kind) -> Result<Option<i64>> {
+        Ok(PublishedKeyPackage::find_max_created_at(&self.db, kind).await?)
+    }
+
     /// Mark a published key package as consumed (used by a Welcome).
     pub async fn mark_consumed(&self, event_id: &str) -> Result<bool> {
         Ok(PublishedKeyPackage::mark_consumed(&self.db, event_id).await?)
