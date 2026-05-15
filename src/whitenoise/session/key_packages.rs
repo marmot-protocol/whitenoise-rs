@@ -146,22 +146,19 @@ impl<'a> KeyPackageOps<'a> {
         &self,
         relays: &[Relay],
     ) -> Result<(KeyPackageEventData, Timestamp)> {
-        let stored_d_tag = self
+        // Single query: the d-tag and the insert timestamp both come from
+        // the most recent canonical row. Folding the two lookups avoids the
+        // implication that they could disagree.
+        let latest_canonical = self
             .session
             .repos
             .published_key_packages
-            .find_latest_d_tag(MLS_KEY_PACKAGE_KIND)
+            .find_latest_by_kind(MLS_KEY_PACKAGE_KIND)
             .await?;
-        let prev_canonical_max = self
-            .session
-            .repos
-            .published_key_packages
-            .find_max_created_at(MLS_KEY_PACKAGE_KIND)
-            .await?;
+        let stored_d_tag = latest_canonical.as_ref().and_then(|r| r.d_tag.as_deref());
+        let prev_canonical_max = latest_canonical.as_ref().map(|r| r.created_at);
 
-        let key_package_data = self
-            .encoded_key_package(relays, stored_d_tag.as_deref())
-            .await?;
+        let key_package_data = self.encoded_key_package(relays, stored_d_tag).await?;
         let canonical_created_at = monotonic_canonical_created_at(prev_canonical_max);
 
         Ok((key_package_data, canonical_created_at))

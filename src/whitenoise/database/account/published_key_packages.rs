@@ -38,14 +38,17 @@ impl PublishedKeyPackagesRepo {
         Ok(PublishedKeyPackage::find_by_hash_ref(&self.db, hash_ref).await?)
     }
 
-    /// Return the most recently recorded `d` tag for a given event kind, if any.
-    pub async fn find_latest_d_tag(&self, kind: nostr_sdk::Kind) -> Result<Option<String>> {
-        Ok(PublishedKeyPackage::find_latest_d_tag(&self.db, kind).await?)
-    }
-
-    /// Return the maximum `created_at` recorded for a given event kind, if any.
-    pub async fn find_max_created_at(&self, kind: nostr_sdk::Kind) -> Result<Option<i64>> {
-        Ok(PublishedKeyPackage::find_max_created_at(&self.db, kind).await?)
+    /// Return the most recently inserted row for a given event kind, if any.
+    ///
+    /// Canonical-slot consumers read both `d_tag` and `created_at` from
+    /// this single row. Folding the lookup into one query avoids the
+    /// implication that the d-tag and the insert timestamp could come
+    /// from two different prior publishes.
+    pub async fn find_latest_by_kind(
+        &self,
+        kind: nostr_sdk::Kind,
+    ) -> Result<Option<PublishedKeyPackage>> {
+        Ok(PublishedKeyPackage::find_latest_by_kind(&self.db, kind).await?)
     }
 
     /// Mark a published key package as consumed (used by a Welcome).

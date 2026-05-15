@@ -107,22 +107,37 @@ impl PublishedKeyPackage {
         Ok(row)
     }
 
-    /// Returns the most recently recorded `d` tag for a given event kind, if any.
+    /// Returns the most recently inserted row for a given event kind, if any.
     ///
-    /// Used by the kind:30443 publish path to reuse a single addressable-event
-    /// slot per NIP-33. MDK generates a fresh random `d` tag inside
-    /// `create_key_package_for_event` every time it's called, and the MDK
-    /// docs explicitly say "Callers SHOULD store and reuse this value when
-    /// rotating the KeyPackage." Without reuse, every publish lands as a
-    /// distinct event on relays instead of replacing the previous one.
+    /// Single query that covers both NIP-33 canonical-slot needs:
+    /// - `d_tag` — reuse the previously-published addressable-slot
+    ///   identifier so the next publish replaces the prior canonical event
+    ///   on relays instead of landing in a fresh slot. MDK generates a
+    ///   fresh random `d` tag every call to `create_key_package_for_event`
+    ///   and the MDK docs say "Callers SHOULD store and reuse this value
+    ///   when rotating the KeyPackage."
+    /// - `created_at` (the row's SQLite `unixepoch()` insert timestamp,
+    ///   not the Nostr event's `created_at`) — use as a lower bound when
+    ///   computing a strictly-monotonic event `created_at` for the next
+    ///   publish. NIP-01 says relays keep the lowest-id event on a tie,
+    ///   so reusing the d-tag alone isn't enough under same-second
+    ///   publishes. The row insert timestamp is always ≥ the event's
+    ///   `created_at` (INSERT runs after the publish round-trip), which
+    ///   makes it a sound upper bound for the prior event time.
+    ///
+    /// Folding both lookups into one query saves a DB roundtrip and makes
+    /// it explicit at the call site that the d-tag and the insert time
+    /// come from the *same* prior publish — not two separate rows.
     #[perf_instrument("db::published_key_packages")]
-    pub(crate) async fn find_latest_d_tag(
+    pub(crate) async fn find_latest_by_kind(
         db: &AccountDatabase,
         kind: Kind,
-    ) -> Result<Option<String>, DatabaseError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT d_tag FROM published_key_packages
-             WHERE kind = ? AND d_tag IS NOT NULL
+    ) -> Result<Option<Self>, DatabaseError> {
+        let row = sqlx::query_as::<_, Self>(
+            "SELECT id, key_package_hash_ref, event_id, kind, d_tag,
+                    consumed_at, key_material_deleted, created_at
+             FROM published_key_packages
+             WHERE kind = ?
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
         )
@@ -130,31 +145,7 @@ impl PublishedKeyPackage {
         .fetch_optional(&db.inner.pool)
         .await?;
 
-        Ok(row.map(|(d,)| d))
-    }
-
-    /// Returns the maximum `created_at` recorded for a given event kind, if any.
-    ///
-    /// Used as a lower bound when computing a monotonic Nostr `created_at`
-    /// for the next kind:30443 publish. NIP-01 says that if two replaceable
-    /// events share a `created_at`, the relay keeps the one with the lowest
-    /// event id — so reusing the d-tag alone is not enough to guarantee
-    /// replacement when two publishes land in the same second. Forcing the
-    /// new event's `created_at` strictly above the previous insert timestamp
-    /// (which is always ≥ the previous event's `created_at`) sidesteps the
-    /// tie entirely.
-    #[perf_instrument("db::published_key_packages")]
-    pub(crate) async fn find_max_created_at(
-        db: &AccountDatabase,
-        kind: Kind,
-    ) -> Result<Option<i64>, DatabaseError> {
-        let row: Option<(Option<i64>,)> =
-            sqlx::query_as("SELECT MAX(created_at) FROM published_key_packages WHERE kind = ?")
-                .bind(i64::from(kind.as_u16()))
-                .fetch_optional(&db.inner.pool)
-                .await?;
-
-        Ok(row.and_then(|(v,)| v))
+        Ok(row)
     }
 
     /// Looks up all published key packages sharing the same hash reference.
@@ -515,77 +506,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_latest_d_tag_returns_none_when_empty() {
+    async fn test_find_latest_by_kind_returns_none_when_empty() {
         let (db, _dir) = setup().await;
 
-        let result = PublishedKeyPackage::find_latest_d_tag(&db, MLS_KEY_PACKAGE_KIND)
+        let result = PublishedKeyPackage::find_latest_by_kind(&db, MLS_KEY_PACKAGE_KIND)
             .await
             .unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn test_find_latest_d_tag_returns_most_recent_for_kind() {
-        let (db, _dir) = setup().await;
-
-        // Track an older canonical row.
-        PublishedKeyPackage::create(
-            &db,
-            &[1, 1, 1],
-            "older-canonical",
-            MLS_KEY_PACKAGE_KIND,
-            Some("old-d-tag"),
-        )
-        .await
-        .unwrap();
-        // Bump the older row's created_at into the past so ORDER BY is unambiguous.
-        sqlx::query(
-            "UPDATE published_key_packages SET created_at = unixepoch() - 60 WHERE event_id = ?",
-        )
-        .bind("older-canonical")
-        .execute(&db.inner.pool)
-        .await
-        .unwrap();
-
-        PublishedKeyPackage::create(
-            &db,
-            &[2, 2, 2],
-            "newer-canonical",
-            MLS_KEY_PACKAGE_KIND,
-            Some("new-d-tag"),
-        )
-        .await
-        .unwrap();
-        // Legacy rows without d_tag must not be considered.
-        PublishedKeyPackage::create(&db, &[2, 2, 2], "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
-            .await
-            .unwrap();
-
-        let result = PublishedKeyPackage::find_latest_d_tag(&db, MLS_KEY_PACKAGE_KIND)
-            .await
-            .unwrap();
-        assert_eq!(result.as_deref(), Some("new-d-tag"));
-
-        // Legacy kind has no d_tag rows.
-        let legacy_result =
-            PublishedKeyPackage::find_latest_d_tag(&db, MLS_KEY_PACKAGE_KIND_LEGACY)
-                .await
-                .unwrap();
-        assert!(legacy_result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_find_max_created_at_returns_none_when_empty() {
-        let (db, _dir) = setup().await;
-
-        let result = PublishedKeyPackage::find_max_created_at(&db, MLS_KEY_PACKAGE_KIND)
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_find_max_created_at_returns_most_recent_for_kind() {
+    async fn test_find_latest_by_kind_returns_most_recent_row_per_kind() {
         let (db, _dir) = setup().await;
 
         PublishedKeyPackage::create(
@@ -618,7 +549,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Legacy row at a higher timestamp must not bleed into the canonical max.
+        // A legacy row inserted later must not bleed into the canonical lookup.
         PublishedKeyPackage::create(&db, &[3, 3, 3], "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
             .await
             .unwrap();
@@ -628,15 +559,21 @@ mod tests {
             .await
             .unwrap();
 
-        let canonical_max = PublishedKeyPackage::find_max_created_at(&db, MLS_KEY_PACKAGE_KIND)
+        let canonical = PublishedKeyPackage::find_latest_by_kind(&db, MLS_KEY_PACKAGE_KIND)
             .await
-            .unwrap();
-        assert_eq!(canonical_max, Some(200));
+            .unwrap()
+            .expect("canonical row must exist");
+        assert_eq!(canonical.event_id, "newer");
+        assert_eq!(canonical.d_tag.as_deref(), Some("d-new"));
+        assert_eq!(canonical.created_at, 200);
 
-        let legacy_max = PublishedKeyPackage::find_max_created_at(&db, MLS_KEY_PACKAGE_KIND_LEGACY)
+        let legacy = PublishedKeyPackage::find_latest_by_kind(&db, MLS_KEY_PACKAGE_KIND_LEGACY)
             .await
-            .unwrap();
-        assert_eq!(legacy_max, Some(999));
+            .unwrap()
+            .expect("legacy row must exist");
+        assert_eq!(legacy.event_id, "legacy");
+        assert_eq!(legacy.created_at, 999);
+        assert!(legacy.d_tag.is_none());
     }
 
     #[tokio::test]
