@@ -307,7 +307,7 @@ impl<'a> MediaOps<'a> {
             .and_then(|n| n.to_str())
             .ok_or_else(|| WhitenoiseError::Internal("Invalid file path".to_string()))?;
 
-        let prepared = {
+        let mut prepared = {
             let media_manager = self.session.mdk.media_manager(group_id.clone());
 
             media_manager.encrypt_for_upload_with_options(
@@ -317,6 +317,10 @@ impl<'a> MediaOps<'a> {
                 &options.unwrap_or_default(),
             )?
         };
+        if let Some(metadata) = audio_metadata {
+            prepared.duration_ms = metadata.duration_ms;
+            prepared.waveform = metadata.waveform;
+        }
 
         let blossom_server_url = blossom_server_url.unwrap_or_else(Self::default_blossom_url);
         let upload_keys = nostr_sdk::Keys::generate();
@@ -352,12 +356,8 @@ impl<'a> MediaOps<'a> {
             dimensions: prepared.dimensions.map(|(w, h)| format!("{}x{}", w, h)),
             blurhash: prepared.blurhash.clone(),
             thumbhash: prepared.thumbhash.clone(),
-            duration_ms: audio_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.duration_ms),
-            waveform: audio_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.waveform.clone()),
+            duration_ms: prepared.duration_ms,
+            waveform: prepared.waveform.clone(),
         });
 
         let upload = MediaFileUpload {
@@ -816,6 +816,8 @@ impl<'a> MediaOps<'a> {
             mime_type: media_file.mime_type.clone(),
             filename: filename.to_string(),
             dimensions: None,
+            duration_ms: None,
+            waveform: None,
             scheme_version,
             nonce,
         };

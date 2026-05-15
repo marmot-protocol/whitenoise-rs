@@ -2,12 +2,12 @@
 members = [".", "crates/whitenoise-macros", "crates/whitenoise-cli"]
 
 [workspace.dependencies]
-mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "28ee7badf24195343f452246ce5f4dad4a99ddf2", features = [
+mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1", features = [
     "mip04",
     "mip05",
 ] }
-mdk-sqlite-storage = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "28ee7badf24195343f452246ce5f4dad4a99ddf2" }
-mdk-storage-traits = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "28ee7badf24195343f452246ce5f4dad4a99ddf2" }
+mdk-sqlite-storage = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
+mdk-storage-traits = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44", "nip47", "nip59"] }
 tokio = { version = "1.44", features = ["full"] }
 serde = { version = "1.0.219", features = ["derive"] }

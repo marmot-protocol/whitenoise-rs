@@ -188,14 +188,17 @@ async fn group_metadata_and_membership() {
 
     wait_for_group(&bob.socket, &bob_pk).await;
 
-    // groups show returns the MLS group object
+    // groups show returns the MLS group object plus pending proposal context
     let detail = wn(
         &alice.socket,
         &["--account", &alice_pk, "groups", "show", &gid],
     );
     assert!(detail.is_object(), "group detail should be a JSON object");
+    let detail_group = detail
+        .get("group")
+        .expect("group detail should contain group object");
     assert!(
-        detail.get("mls_group_id").is_some(),
+        detail_group.get("mls_group_id").is_some(),
         "should contain mls_group_id"
     );
 

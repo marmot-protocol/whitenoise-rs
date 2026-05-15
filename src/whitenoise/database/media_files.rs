@@ -12,6 +12,8 @@ use super::{Database, DatabaseError};
 use crate::perf_instrument;
 use crate::whitenoise::error::WhitenoiseError;
 
+const MAX_WAVEFORM_SAMPLES: usize = 16_384;
+
 /// Optional metadata for media files stored as JSONB
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct FileMetadata {
@@ -71,7 +73,9 @@ impl FileMetadata {
     }
 
     pub fn is_valid_waveform(waveform: &[u8]) -> bool {
-        !waveform.is_empty() && waveform.iter().all(|sample| *sample <= 100)
+        !waveform.is_empty()
+            && waveform.len() <= MAX_WAVEFORM_SAMPLES
+            && waveform.iter().all(|sample| *sample <= 100)
     }
 
     pub(crate) fn sanitized_for_storage(&self) -> Self {
@@ -1930,6 +1934,9 @@ mod tests {
             .with_waveform(vec![0, 101]);
 
         assert!(metadata.waveform.is_none());
+
+        let oversized = FileMetadata::new().with_waveform(vec![50; MAX_WAVEFORM_SAMPLES + 1]);
+        assert!(oversized.waveform.is_none());
     }
 
     #[tokio::test]
