@@ -90,7 +90,7 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
     async fn setup(&mut self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let config = self.config();
         let total_iterations = (config.iterations + config.warmup_iterations) as usize;
-        let relay_urls: Vec<String> = context.dev_relays.iter().map(|s| s.to_string()).collect();
+        let publish_relays = context.default_account_relays.clone();
 
         tracing::info!(
             "Setting up login benchmark: {} iterations, {} follows per account",
@@ -110,15 +110,20 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
         let follow_keys: Vec<Keys> = (0..self.follow_count).map(|_| Keys::generate()).collect();
         let follow_pubkeys: Vec<PublicKey> = follow_keys.iter().map(|k| k.public_key()).collect();
 
-        // Publish metadata + relay lists for each follow user concurrently
-        let dev_relays = context.dev_relays.clone();
+        // Publish metadata + relay lists for each follow user concurrently.
+        // Followed-user fixtures are read by the discovery plane (background
+        // metadata + follow-list lookups), so publish to discovery relays. The
+        // NIP-65 payload lists default-account relays — the same role the
+        // account being benchmarked uses for its own published lists.
+        let follow_publish_relays = context.discovery_relays.clone();
+        let follow_payload_relays = context.default_account_relays.clone();
 
         let error_count: usize = stream::iter(follow_keys.into_iter().enumerate())
             .map(|(i, keys)| {
-                let dev_relays = dev_relays.clone();
-                let relay_urls = relay_urls.clone();
+                let follow_publish_relays = follow_publish_relays.clone();
+                let follow_payload_relays = follow_payload_relays.clone();
                 async move {
-                    let test_client = match create_test_client(&dev_relays, keys).await {
+                    let test_client = match create_test_client(&follow_publish_relays, keys).await {
                         Ok(client) => client,
                         Err(e) => return Some(e.to_string()),
                     };
@@ -131,7 +136,7 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
                         )
                         .await?;
 
-                        publish_relay_lists(&test_client, relay_urls).await?;
+                        publish_relay_lists(&test_client, follow_payload_relays).await?;
                         Ok(())
                     }
                     .await;
@@ -169,7 +174,7 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
 
         for i in 0..total_iterations {
             let keys = Keys::generate();
-            let test_client = create_test_client(&context.dev_relays, keys.clone()).await?;
+            let test_client = create_test_client(&publish_relays, keys.clone()).await?;
 
             // Publish metadata
             publish_test_metadata(
@@ -180,7 +185,7 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
             .await?;
 
             // Publish relay lists (NIP-65, Inbox, KeyPackage) pointing to test relays
-            publish_relay_lists(&test_client, relay_urls.clone()).await?;
+            publish_relay_lists(&test_client, publish_relays.clone()).await?;
 
             // Publish the large contact list
             publish_follow_list(&test_client, &follow_pubkeys).await?;

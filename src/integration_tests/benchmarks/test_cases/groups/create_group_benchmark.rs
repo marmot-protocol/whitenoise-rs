@@ -62,7 +62,7 @@ impl BenchmarkTestCase for CreateGroupBenchmark {
             None,
             None,
             None,
-            context.test_relays(),
+            context.default_account_relay_urls(),
             admin_pubkeys,
             None,
         );

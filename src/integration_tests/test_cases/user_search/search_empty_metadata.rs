@@ -47,7 +47,7 @@ impl TestCase for SearchEmptyMetadataTestCase {
         let target_name = "EmptyMetaTarget";
 
         // Step 1: Publish metadata to relays
-        let test_client = create_test_client(&context.dev_relays, target_keys).await?;
+        let test_client = create_test_client(&context.discovery_relays, target_keys).await?;
         publish_test_metadata(&test_client, target_name, "Published via relay").await?;
         test_client.disconnect().await;
         tracing::info!(

@@ -2,7 +2,7 @@ use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::{create_test_client, publish_relay_lists};
 use crate::integration_tests::core::*;
 use async_trait::async_trait;
-use nostr_sdk::{Keys, Metadata, RelayUrl};
+use nostr_sdk::{Keys, Metadata};
 
 /// Tests `resolve_user` for a new user whose metadata is still unknown locally.
 ///
@@ -14,7 +14,6 @@ use nostr_sdk::{Keys, Metadata, RelayUrl};
 pub struct ResolveUserTestCase {
     test_keys: Keys,
     test_metadata: Metadata,
-    test_relays: Vec<RelayUrl>,
 }
 
 impl ResolveUserTestCase {
@@ -32,22 +31,9 @@ impl Default for ResolveUserTestCase {
             .display_name("Background Display")
             .about("Testing resolve_user background discovery");
 
-        let test_relays = if cfg!(debug_assertions) {
-            vec![
-                RelayUrl::parse("ws://localhost:8080").unwrap(),
-                RelayUrl::parse("ws://localhost:7777").unwrap(),
-            ]
-        } else {
-            vec![
-                RelayUrl::parse("wss://relay.damus.io").unwrap(),
-                RelayUrl::parse("wss://relay.primal.net").unwrap(),
-            ]
-        };
-
         Self {
             test_keys: keys,
             test_metadata: metadata,
-            test_relays,
         }
     }
 }
@@ -61,16 +47,18 @@ impl TestCase for ResolveUserTestCase {
         // Create an identity so we can subscribe to events
         context.whitenoise.create_identity().await?;
 
-        // Publish test data
-        let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+        // Publish fixture data to the discovery plane so the background fetch
+        // can find it. The NIP-65 payload lists the same relays so any
+        // subsequent protocol-correct lookup stays local.
+        let discovery_relays = &context.discovery_relays;
+        let test_client = create_test_client(discovery_relays, self.test_keys.clone()).await?;
 
         tracing::info!("Publishing test metadata and relays for test pubkey");
         test_client
             .send_event_builder(nostr_sdk::EventBuilder::metadata(&self.test_metadata))
             .await?;
 
-        let relay_urls: Vec<String> = self.test_relays.iter().map(|url| url.to_string()).collect();
-        publish_relay_lists(&test_client, relay_urls).await?;
+        publish_relay_lists(&test_client, discovery_relays.clone()).await?;
         test_client.disconnect().await;
 
         // `resolve_user` should return the local snapshot immediately.

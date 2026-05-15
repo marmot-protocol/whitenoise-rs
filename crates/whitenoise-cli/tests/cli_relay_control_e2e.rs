@@ -99,7 +99,8 @@ fn search_updates_include_pubkey(updates: &[serde_json::Value], pubkey_hex: &str
 
 #[tokio::test]
 async fn relay_control_snapshot_tracks_seeded_discovery_graph() {
-    publish_user_search_seed_events(LOCAL_DEV_RELAYS)
+    let seed_relays: Vec<String> = LOCAL_DEV_RELAYS.iter().map(|s| (*s).to_string()).collect();
+    publish_user_search_seed_events(&seed_relays)
         .await
         .expect("publish search seed events");
 

@@ -54,7 +54,7 @@ impl TestCase for SearchFollowsOfFollowsTestCase {
         let target_name = "FoFTarget";
 
         // Publish TargetUser's metadata to relays
-        let target_client = create_test_client(&context.dev_relays, target_keys).await?;
+        let target_client = create_test_client(&context.discovery_relays, target_keys).await?;
         publish_test_metadata(&target_client, target_name, "A friend of a friend").await?;
         target_client.disconnect().await;
         tracing::info!(
@@ -63,7 +63,8 @@ impl TestCase for SearchFollowsOfFollowsTestCase {
         );
 
         // Publish MiddleUser's metadata and follow list (pointing to TargetUser)
-        let middle_client = create_test_client(&context.dev_relays, middle_keys.clone()).await?;
+        let middle_client =
+            create_test_client(&context.discovery_relays, middle_keys.clone()).await?;
         publish_test_metadata(&middle_client, "MiddleUser", "Connects searcher to target").await?;
         publish_follow_list(&middle_client, &[target_pubkey]).await?;
         middle_client.disconnect().await;

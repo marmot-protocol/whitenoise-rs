@@ -71,7 +71,7 @@ impl BenchmarkScenario for UserDiscoveryBenchmark {
             pubkeys.push(pubkey);
 
             // Create test client and publish metadata
-            let test_client = create_test_client(&context.dev_relays, keys).await?;
+            let test_client = create_test_client(&context.discovery_relays, keys).await?;
             let metadata = Metadata::new()
                 .name(format!("Benchmark User {}", i))
                 .about("User for benchmark testing");

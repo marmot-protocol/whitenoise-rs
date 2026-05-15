@@ -188,15 +188,22 @@ async fn group_metadata_and_membership() {
 
     wait_for_group(&bob.socket, &bob_pk).await;
 
-    // groups show returns the MLS group object
+    // groups show returns { group: <Group>, required_proposals: [...] }.
     let detail = wn(
         &alice.socket,
         &["--account", &alice_pk, "groups", "show", &gid],
     );
     assert!(detail.is_object(), "group detail should be a JSON object");
+    let group_detail = detail
+        .get("group")
+        .expect("group detail should contain a 'group' field");
     assert!(
-        detail.get("mls_group_id").is_some(),
-        "should contain mls_group_id"
+        group_detail.get("mls_group_id").is_some(),
+        "group should contain mls_group_id"
+    );
+    assert!(
+        detail.get("required_proposals").is_some(),
+        "show response should expose required_proposals"
     );
 
     // members includes both Alice and Bob
@@ -247,6 +254,67 @@ async fn group_metadata_and_membership() {
             "Renamed Group",
         ],
     );
+}
+
+/// Verifies that `cli_group_relay_urls` reads the operator-configured
+/// `default_account_relays` set rather than the compile-time
+/// `Relay::defaults()` bootstrap. Pins the Phase 2 fix that prevents a
+/// private deployment from baking public relays into newly-created groups'
+/// persisted config.
+#[tokio::test]
+async fn group_relays_use_configured_default_account_relays() {
+    let alice = Daemon::start().await;
+    let bob = Daemon::start().await;
+
+    let alice_pk = wn(&alice.socket, &["create-identity"])["pubkey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bob_pk = wn(&bob.socket, &["create-identity"])["pubkey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_key_package(&bob.socket, &bob_pk).await;
+
+    let group = wn(
+        &alice.socket,
+        &[
+            "--account",
+            &alice_pk,
+            "groups",
+            "create",
+            "Relay Config Test",
+            &bob_pk,
+        ],
+    );
+    let gid = group_id_hex(&group);
+
+    let group_relays = wn(
+        &alice.socket,
+        &["--account", &alice_pk, "groups", "relays", &gid],
+    );
+    let group_relay_urls: Vec<String> = group_relays
+        .as_array()
+        .expect("group relays should be an array")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !group_relay_urls.is_empty(),
+        "group relays should not be empty"
+    );
+    for url in &group_relay_urls {
+        assert!(
+            url.starts_with("ws://localhost:"),
+            "group relay {url} should be a local URL configured via --default-account-relays"
+        );
+    }
+    for forbidden in ["relay.damus.io", "relay.primal.net", "nos.lol"] {
+        assert!(
+            group_relay_urls.iter().all(|u| !u.contains(forbidden)),
+            "group relays should not contain public default {forbidden}"
+        );
+    }
 }
 
 #[tokio::test]

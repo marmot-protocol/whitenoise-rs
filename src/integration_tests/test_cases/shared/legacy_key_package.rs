@@ -138,7 +138,7 @@ pub(crate) async fn publish_legacy_capability_key_package(
         .map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
     let event_id = event.id;
 
-    let relay_urls: Vec<&str> = relays.iter().map(|r| r.url.as_str()).collect();
+    let relay_urls: Vec<String> = relays.iter().map(|r| r.url.to_string()).collect();
     let client = create_test_client(&relay_urls, keys).await?;
     client.send_event(&event).await?;
     client.disconnect().await;
@@ -184,7 +184,7 @@ pub(crate) async fn publish_legacy_leaf_key_package(
     let relays = account
         .key_package_relays(&context.whitenoise.shared)
         .await?;
-    let relay_urls: Vec<&str> = relays.iter().map(|relay| relay.url.as_str()).collect();
+    let relay_urls: Vec<String> = relays.iter().map(|relay| relay.url.to_string()).collect();
     let client = create_test_client(&relay_urls, keys).await?;
     client.send_event(&event).await?;
     client.disconnect().await;
