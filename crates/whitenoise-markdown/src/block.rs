@@ -453,7 +453,6 @@ impl BlockParser {
         {
             let header = split_table_row(prev);
             if header.len() == alignments.len() {
-                self.consume_list_blank();
                 self.leaf = Some(Leaf::Table {
                     alignments,
                     header,
@@ -916,7 +915,7 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
             if b[j] == b'<' || b[j] == b'\n' {
                 return None;
             }
-            if b[j] == b'\\' && j + 1 < b.len() && is_ascii_punct(b[j + 1]) {
+            if b[j] == b'\\' && j + 1 < b.len() && scanner::is_ascii_punct(b[j + 1]) {
                 out_bytes.push(b[j + 1]);
                 j += 2;
                 continue;
@@ -942,7 +941,7 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
             if c < 0x20 || c == 0x7f {
                 break;
             }
-            if c == b'\\' && j + 1 < b.len() && is_ascii_punct(b[j + 1]) {
+            if c == b'\\' && j + 1 < b.len() && scanner::is_ascii_punct(b[j + 1]) {
                 out_bytes.push(b[j + 1]);
                 j += 2;
                 continue;
@@ -982,7 +981,7 @@ pub(crate) fn parse_link_title(b: &[u8], i: usize) -> Option<(String, usize)> {
     let mut out_bytes: Vec<u8> = Vec::new();
     while j < b.len() {
         let c = b[j];
-        if c == b'\\' && j + 1 < b.len() && is_ascii_punct(b[j + 1]) {
+        if c == b'\\' && j + 1 < b.len() && scanner::is_ascii_punct(b[j + 1]) {
             out_bytes.push(b[j + 1]);
             j += 2;
             continue;
@@ -998,10 +997,6 @@ pub(crate) fn parse_link_title(b: &[u8], i: usize) -> Option<(String, usize)> {
         j += 1;
     }
     None
-}
-
-fn is_ascii_punct(b: u8) -> bool {
-    matches!(b, b'!'..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~')
 }
 
 /// Lowercase ASCII + collapse internal whitespace (runs of space / tab /

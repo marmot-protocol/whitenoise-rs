@@ -12,9 +12,6 @@
 //!    [`Inline::NostrUri`] for explicit `nostr:<hrp>1…` references —
 //!    parsed inline alongside links and emphasis.
 //!
-//! See `PLAN.md` for the full design and `docs/parse-order.md` for the
-//! parser's first-match-wins precedence.
-//!
 //! ## Architecture
 //!
 //! Two passes that are never fused:
@@ -49,14 +46,7 @@
 //! ));
 //! ```
 //!
-//! ## Serde
-//!
-//! All AST types implement `Serialize` and `Deserialize` when the default
-//! `serde` feature is enabled. Disable it to drop the dependency entirely:
-//!
-//! ```toml
-//! whitenoise-markdown = { version = "0.1", default-features = false }
-//! ```
+//! All AST types implement `Serialize` and `Deserialize` unconditionally.
 
 pub mod ast;
 mod block;
@@ -85,8 +75,7 @@ pub use ast::{
 ///   `nrelay`. `nsec` is deliberately rejected — we never render private
 ///   keys as ergonomic anchors.
 ///
-/// Bech32 strings are validated for *shape* only (no checksum); see
-/// `PLAN.md` §4.
+/// Bech32 strings are validated for *shape* only (no checksum).
 pub fn parse(input: &str) -> Document {
     let (blocks, refs) = block::parse_blocks(input);
     inline::parse_inlines(blocks, &refs)

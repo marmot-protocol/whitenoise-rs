@@ -1,8 +1,7 @@
 //! Bech32 shape validation + nostr HRP classification.
 //!
-//! Shape only — no checksum verification (see `PLAN.md` §4). The recognizer
-//! is called from the inline tokenizer for both `@npub1…` mentions and
-//! `nostr:<hrp>1…` URIs.
+//! Shape only — no checksum verification. The recognizer is called from the
+//! inline tokenizer for both `@npub1…` mentions and `nostr:<hrp>1…` URIs.
 
 use crate::ast::NostrHrp;
 
@@ -68,7 +67,7 @@ fn classify_hrp(b: &[u8]) -> Option<NostrHrp> {
         b"nprofile" => Some(NostrHrp::Nprofile),
         b"naddr" => Some(NostrHrp::Naddr),
         b"nrelay" => Some(NostrHrp::Nrelay),
-        // `nsec` deliberately rejected — see PLAN.md §4.
+        // `nsec` deliberately rejected.
         _ => None,
     }
 }

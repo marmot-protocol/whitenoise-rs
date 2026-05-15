@@ -77,3 +77,9 @@ pub(crate) fn measure_indent(line: &[u8]) -> (usize, usize) {
 pub(crate) fn is_blank(line: &[u8]) -> bool {
     line.iter().all(|&b| b == b' ' || b == b'\t')
 }
+
+/// True if `b` is a CommonMark ASCII-punctuation byte (`!`..=`~` excluding
+/// letters and digits) — the escapable set per the spec.
+pub(crate) fn is_ascii_punct(b: u8) -> bool {
+    matches!(b, b'!'..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~')
+}

@@ -14,6 +14,7 @@ use crate::ast::{
 use crate::block::LinkRef;
 use crate::entity;
 use crate::nostr;
+use crate::scanner;
 
 /// ASCII bytes that have a dedicated arm in `tokenize`'s dispatch match.
 /// Keep in sync with the explicit match arms — used as the exit condition
@@ -137,8 +138,7 @@ impl BracketDelim {
     }
 }
 
-/// Tokenize the raw paragraph/heading text. First-match-wins per
-/// `docs/parse-order.md`.
+/// Tokenize the raw paragraph/heading text. First-match-wins.
 pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline> {
     let bytes = raw.as_bytes();
     let mut out: Vec<Inline> = Vec::new();
@@ -186,7 +186,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                         }
                         continue;
                     }
-                    if is_ascii_punct(next) {
+                    if scanner::is_ascii_punct(next) {
                         buf.push(next as char);
                         i += 2;
                         continue;
@@ -426,12 +426,14 @@ fn try_code_span(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 }
 
 fn normalize_code_span(b: &[u8]) -> String {
-    // 1. Replace line endings with single spaces.
+    // 1. Replace newlines with single spaces. `scanner::lines` already
+    //    normalized `\r\n` / bare `\r` to `\n` before the block pass, so
+    //    only `\n` can appear here.
     let mut s = String::with_capacity(b.len());
     let mut prev_was_nl = false;
     let src = std::str::from_utf8(b).unwrap_or("");
     for c in src.chars() {
-        if c == '\n' || c == '\r' {
+        if c == '\n' {
             if !prev_was_nl {
                 s.push(' ');
             }
@@ -491,10 +493,6 @@ fn try_inline_math(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         k += 1;
     }
     None
-}
-
-fn is_ascii_punct(b: u8) -> bool {
-    matches!(b, b'!'..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~')
 }
 
 // ---------------------------------------------------------------------------
@@ -868,8 +866,8 @@ fn classify_delim_run(bytes: &[u8], i: usize, ch: u8) -> (usize, bool, bool) {
     let next = bytes.get(j).copied();
     let prev_is_ws = prev.is_none_or(is_ascii_ws_for_flank);
     let next_is_ws = next.is_none_or(is_ascii_ws_for_flank);
-    let prev_is_punct = prev.is_some_and(is_ascii_punct);
-    let next_is_punct = next.is_some_and(is_ascii_punct);
+    let prev_is_punct = prev.is_some_and(scanner::is_ascii_punct);
+    let next_is_punct = next.is_some_and(scanner::is_ascii_punct);
     let left_flanking = !next_is_ws && (!next_is_punct || prev_is_ws || prev_is_punct);
     let right_flanking = !prev_is_ws && (!prev_is_punct || next_is_ws || next_is_punct);
     let (can_open, can_close) = match ch {
@@ -1081,7 +1079,8 @@ fn trim_run_text(out: &mut [Inline], pos: usize, n: usize, from_right: bool) -> 
                 s.pop();
             }
         } else {
-            s.drain(..n);
+            let byte_end = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
+            s.drain(..byte_end);
         }
         s.is_empty()
     } else {

@@ -1,9 +1,8 @@
 //! End-to-end "spec-style" tests: parse → render → compare against a
 //! hand-written expected HTML string. These are not the full CommonMark
-//! spec JSON suite (which would be checked into `tests/fixtures/` per
-//! PLAN.md §6 and isn't bundled with this checkout), but they exercise
-//! the same parse → render path and pin the renderer's output for
-//! representative cases across every block + inline construct.
+//! spec JSON suite, but they exercise the same parse → render path and pin
+//! the renderer's output for representative cases across every block +
+//! inline construct.
 
 use whitenoise_markdown::parse;
 

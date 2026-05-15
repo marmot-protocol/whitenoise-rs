@@ -147,7 +147,7 @@ fn nostr_uri_in_parens() {
 
 #[test]
 fn nostr_nsec_rejected() {
-    // `nsec1…` must never match — see PLAN.md §4.
+    // `nsec1…` must never match.
     let s = format!("nostr:nsec1{NPUB_BODY}");
     assert_eq!(parse_inlines(&s), vec![t(&s)]);
 }

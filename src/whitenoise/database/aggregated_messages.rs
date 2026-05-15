@@ -53,6 +53,7 @@ struct AggregatedMessageRow {
     pub tags: Tags,
     pub reply_to_id: Option<EventId>,
     pub deletion_event_id: Option<EventId>,
+    pub content_tokens: whitenoise_markdown::Document,
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
     pub delivery_status: Option<DeliveryStatus>,
@@ -129,9 +130,13 @@ where
             None => None,
         };
 
-        // The `content_tokens` column is intentionally not deserialized here.
-        // The markdown AST exposed on `ChatMessage` is re-derived from `content`
-        // in `row_to_chat_message`, so the legacy column is now dead storage.
+        let content_tokens_str: String = row.try_get("content_tokens")?;
+        let content_tokens =
+            serde_json::from_str(&content_tokens_str).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "content_tokens".to_string(),
+                source: Box::new(e),
+            })?;
+
         let reactions_str: String = row.try_get("reactions")?;
         let reactions =
             serde_json::from_str(&reactions_str).map_err(|e| sqlx::Error::ColumnDecode {
@@ -182,6 +187,7 @@ where
             tags,
             reply_to_id,
             deletion_event_id,
+            content_tokens,
             reactions,
             media_attachments,
             delivery_status,
@@ -1710,10 +1716,6 @@ impl AggregatedMessage {
         // Convert DateTime<Utc> to Timestamp (seconds)
         let created_at = Timestamp::from(row.created_at.timestamp() as u64);
 
-        // Markdown AST is derived on read rather than persisted: re-parsing
-        // from `content` is cheap and avoids a stale-AST class of bugs.
-        let content_tokens = whitenoise_markdown::parse(&row.content);
-
         Ok(ChatMessage {
             id: row.message_id.to_string(),
             author: row.author,
@@ -1723,7 +1725,7 @@ impl AggregatedMessage {
             is_reply: row.reply_to_id.is_some(),
             reply_to_id: row.reply_to_id.map(|id| id.to_string()),
             is_deleted: row.deletion_event_id.is_some(),
-            content_tokens,
+            content_tokens: row.content_tokens,
             reactions: row.reactions,
             kind: row.kind.as_u16(),
             media_attachments: row.media_attachments,
@@ -3036,7 +3038,8 @@ mod tests {
         // Insert a reaction targeting the parent, using direct SQL since
         // insert_reaction needs a Message struct from MDK
         let tags_json = serde_json::to_string(&vec![vec!["e", &parent_id]]).unwrap();
-        let empty_tokens = serde_json::to_string(&Vec::<String>::new()).unwrap();
+        let empty_tokens =
+            serde_json::to_string(&whitenoise_markdown::Document::default()).unwrap();
         let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
         let empty_media = serde_json::to_string(&Vec::<String>::new()).unwrap();
 

@@ -7,12 +7,8 @@ edition = "2024"
 rust-version = "1.90.0"
 publish = false
 
-[features]
-default = ["serde"]
-serde = ["dep:serde"]
-
 [dependencies]
-serde = { workspace = true, optional = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 # `serde_json` is used **only** by the test suite to round-trip the AST
