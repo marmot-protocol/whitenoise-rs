@@ -1,0 +1,70 @@
+name: Toolchain Staleness
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: toolchain-staleness
+  cancel-in-progress: false
+
+jobs:
+  check-toolchain:
+    name: Check Rust toolchain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check pinned Rust toolchain
+        id: toolchain
+        run: python3 scripts/check_toolchain_staleness.py
+
+      - name: Open issue if toolchain is stale
+        if: steps.toolchain.outputs.stale == 'true'
+        uses: actions/github-script@v7
+        env:
+          PINNED_RUST: ${{ steps.toolchain.outputs.pinned }}
+          LATEST_RUST: ${{ steps.toolchain.outputs.latest }}
+        with:
+          script: |
+            const title = 'Update pinned Rust toolchain to latest stable';
+            const { owner, repo } = context.repo;
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existingIssue = openIssues.find((issue) => {
+              return !issue.pull_request && issue.title === title;
+            });
+
+            if (existingIssue) {
+              core.notice(`Toolchain staleness issue already exists: ${existingIssue.html_url}`);
+              return;
+            }
+
+            const pinned = process.env.PINNED_RUST;
+            const latest = process.env.LATEST_RUST;
+            const body = [
+              'The pinned Rust toolchain in `rust-toolchain.toml` is behind latest stable.',
+              '',
+              `- Pinned: \`${pinned}\``,
+              `- Latest stable: \`${latest}\``,
+              '',
+              'Please update `rust-toolchain.toml` and any CI workflow pins that mirror it, then run `just precommit-quick`.',
+            ].join('\n');
+
+            const { data: issue } = await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+            });
+            core.notice(`Created toolchain staleness issue: ${issue.html_url}`);
