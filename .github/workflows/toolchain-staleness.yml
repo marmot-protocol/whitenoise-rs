@@ -18,22 +18,81 @@ jobs:
     name: Check Rust toolchain
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Check pinned Rust toolchain
-        id: toolchain
-        run: python3 scripts/check_toolchain_staleness.py
-
-      - name: Open issue if toolchain is stale
-        if: steps.toolchain.outputs.stale == 'true'
-        uses: actions/github-script@v7
-        env:
-          PINNED_RUST: ${{ steps.toolchain.outputs.pinned }}
-          LATEST_RUST: ${{ steps.toolchain.outputs.latest }}
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
+            const fs = require('fs');
             const title = 'Update pinned Rust toolchain to latest stable';
             const { owner, repo } = context.repo;
+
+            const parseVersion = (value) => {
+              const match = value.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+              if (!match) {
+                return null;
+              }
+
+              return match.slice(1).map((part) => Number.parseInt(part, 10));
+            };
+
+            const formatVersion = (version) => version.join('.');
+
+            const compareVersions = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] !== right[index]) {
+                  return left[index] - right[index];
+                }
+              }
+
+              return 0;
+            };
+
+            const toolchain = fs.readFileSync('rust-toolchain.toml', 'utf8');
+            const channel = toolchain.match(/^\s*channel\s*=\s*"([^"]+)"/m)?.[1];
+            if (!channel) {
+              throw new Error('rust-toolchain.toml must define toolchain.channel');
+            }
+
+            const pinnedVersion = parseVersion(channel);
+            const stableManifestUrl = 'https://static.rust-lang.org/dist/channel-rust-stable.toml';
+            const response = await fetch(stableManifestUrl);
+            if (!response.ok) {
+              throw new Error(`Failed to fetch ${stableManifestUrl}: ${response.status}`);
+            }
+
+            const stableManifest = await response.text();
+            const latestChannel = stableManifest.match(
+              /^\[pkg\.rust\][\s\S]*?^\s*version\s*=\s*"([^"]+)"/m
+            )?.[1];
+            if (!latestChannel) {
+              throw new Error('stable manifest must define pkg.rust.version');
+            }
+
+            const latestVersion = parseVersion(latestChannel);
+            if (!latestVersion) {
+              throw new Error(
+                `stable manifest returned an unparseable Rust version: ${latestChannel}`
+              );
+            }
+
+            if (!pinnedVersion) {
+              core.info(
+                `rust-toolchain.toml uses channel '${channel}'; ` +
+                  `latest stable is ${formatVersion(latestVersion)}. Treating this as not stale.`
+              );
+              return;
+            }
+
+            const pinned = formatVersion(pinnedVersion);
+            const latest = formatVersion(latestVersion);
+            if (compareVersions(pinnedVersion, latestVersion) >= 0) {
+              core.info(`Rust toolchain is current: pinned ${pinned}, latest stable ${latest}.`);
+              return;
+            }
+
+            core.info(`Rust toolchain is stale: pinned ${pinned}, latest stable ${latest}.`);
 
             const openIssues = await github.paginate(github.rest.issues.listForRepo, {
               owner,
@@ -50,8 +109,6 @@ jobs:
               return;
             }
 
-            const pinned = process.env.PINNED_RUST;
-            const latest = process.env.LATEST_RUST;
             const body = [
               'The pinned Rust toolchain in `rust-toolchain.toml` is behind latest stable.',
               '',
