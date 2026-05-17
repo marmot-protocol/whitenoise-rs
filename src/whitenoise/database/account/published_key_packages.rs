@@ -39,11 +39,6 @@ impl PublishedKeyPackagesRepo {
     }
 
     /// Return the most recently inserted row for a given event kind, if any.
-    ///
-    /// Canonical-slot consumers read both `d_tag` and `created_at` from
-    /// this single row. Folding the lookup into one query avoids the
-    /// implication that the d-tag and the insert timestamp could come
-    /// from two different prior publishes.
     pub async fn find_latest_by_kind(
         &self,
         kind: nostr_sdk::Kind,

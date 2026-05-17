@@ -124,10 +124,6 @@ impl PublishedKeyPackage {
     ///   publishes. The row insert timestamp is always ≥ the event's
     ///   `created_at` (INSERT runs after the publish round-trip), which
     ///   makes it a sound upper bound for the prior event time.
-    ///
-    /// Folding both lookups into one query saves a DB roundtrip and makes
-    /// it explicit at the call site that the d-tag and the insert time
-    /// come from the *same* prior publish — not two separate rows.
     #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn find_latest_by_kind(
         db: &AccountDatabase,
