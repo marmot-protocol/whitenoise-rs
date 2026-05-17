@@ -41,7 +41,7 @@ pub async fn process_messages(
     let mut orphaned_messages = Vec::new();
 
     let mut sorted_messages = messages;
-    sorted_messages.sort_unstable_by(|a, b| a.created_at.cmp(&b.created_at));
+    sorted_messages.sort_unstable_by_key(|message| message.created_at);
 
     if config.enable_debug_logging {
         tracing::debug!(
@@ -89,33 +89,31 @@ pub async fn process_messages(
     // Pass 2: Process orphaned messages (their targets should exist now)
     for message in orphaned_messages {
         match message.kind {
-            Kind::Reaction => {
+            Kind::Reaction
                 if reaction_handler::process_reaction(message, &mut processed_messages, config)
                     .is_err()
-                    && config.enable_debug_logging
-                {
-                    tracing::warn!(
-                        "Reaction {} references non-existent message, ignoring",
-                        message.id
-                    );
-                }
+                    && config.enable_debug_logging =>
+            {
+                tracing::warn!(
+                    "Reaction {} references non-existent message, ignoring",
+                    message.id
+                );
             }
-            Kind::EventDeletion => {
+            Kind::EventDeletion
                 if !try_process_deletion(message, &mut processed_messages)
-                    && config.enable_debug_logging
-                {
-                    tracing::warn!(
-                        "Deletion {} references non-existent message, ignoring",
-                        message.id
-                    );
-                }
+                    && config.enable_debug_logging =>
+            {
+                tracing::warn!(
+                    "Deletion {} references non-existent message, ignoring",
+                    message.id
+                );
             }
             _ => {}
         }
     }
 
     let mut result: Vec<ChatMessage> = processed_messages.into_values().collect();
-    result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    result.sort_by_key(|message| message.created_at);
 
     if config.enable_debug_logging {
         tracing::debug!("Returning {} aggregated messages", result.len());

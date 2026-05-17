@@ -464,6 +464,35 @@ mod tests {
         assert_eq!(eligible[0].event_id, "old");
     }
 
+    /// The outer `WHERE key_material_deleted = 0` filter prevents re-returning
+    /// rows the cleanup task has already processed. Without it, the scheduler
+    /// would re-attempt MDK deletion every tick for a hash_ref that's already
+    /// been cleared — wasteful and noisy.
+    #[tokio::test]
+    async fn test_find_eligible_excludes_already_deleted_rows() {
+        let (db, _dir) = setup().await;
+
+        // Old-enough consumed row that's ALSO already had its key material deleted.
+        sqlx::query(
+            "INSERT INTO published_key_packages \
+                (key_package_hash_ref, event_id, consumed_at, key_material_deleted) \
+             VALUES (?, ?, unixepoch() - 60, 1)",
+        )
+        .bind(&[9u8, 9, 9] as &[u8])
+        .bind("already_cleaned")
+        .execute(&db.inner.pool)
+        .await
+        .unwrap();
+
+        let eligible = PublishedKeyPackage::find_eligible_for_cleanup(&db, 30)
+            .await
+            .unwrap();
+        assert!(
+            eligible.is_empty(),
+            "rows with key_material_deleted = 1 must not be returned"
+        );
+    }
+
     #[tokio::test]
     async fn test_mark_key_material_deleted_by_hash_ref_marks_twins() {
         let (db, _dir) = setup().await;

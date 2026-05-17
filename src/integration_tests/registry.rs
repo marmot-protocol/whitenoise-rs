@@ -76,6 +76,7 @@ scenario_registry! {
     "app-settings" => AppSettingsScenario,
     "drafts" => DraftsScenario,
     "metadata-management" => MetadataManagementScenario,
+    "mute-list" => MuteListScenario,
     "basic-messaging" => BasicMessagingScenario,
     "follow-management" => FollowManagementScenario,
     "subscription-processing" => SubscriptionProcessingScenario,
@@ -251,20 +252,36 @@ mod tests {
 
     #[test]
     fn test_get_all_scenario_names() {
-        // Test that all scenario names are returned
-        let names = get_all_scenario_names();
-        assert_eq!(names.len(), 22);
-        assert!(names.contains(&"account-management"));
-        assert!(names.contains(&"basic-messaging"));
-        assert!(names.contains(&"drafts"));
-        assert!(names.contains(&"user-discovery"));
-        assert!(names.contains(&"scheduler"));
-        assert!(names.contains(&"message-streaming"));
-        assert!(names.contains(&"chat-list"));
-        assert!(names.contains(&"chat-list-streaming"));
-        assert!(names.contains(&"notification-streaming"));
-        assert!(names.contains(&"create-group-with-legacy-member"));
-        assert!(names.contains(&"add-member-to-strict-group-rejected"));
-        assert!(names.contains(&"upgrade-required-proposals-after-legacy-self-update"));
+        let mut actual = get_all_scenario_names();
+        actual.sort_unstable();
+
+        let mut expected = vec![
+            "account-management",
+            "add-member-to-strict-group-rejected",
+            "advanced-messaging",
+            "app-settings",
+            "basic-messaging",
+            "chat-list",
+            "chat-list-streaming",
+            "chat-media-upload",
+            "create-group-with-legacy-member",
+            "drafts",
+            "follow-management",
+            "group-membership",
+            "group-state-streaming",
+            "login-flow",
+            "message-streaming",
+            "metadata-management",
+            "mute-list",
+            "notification-streaming",
+            "scheduler",
+            "subscription-processing",
+            "upgrade-required-proposals-after-legacy-self-update",
+            "user-discovery",
+            "user-search",
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
     }
 }

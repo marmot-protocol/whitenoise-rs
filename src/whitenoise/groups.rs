@@ -788,6 +788,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_secs: None,
         };
 
         let update_result = whitenoise
@@ -854,6 +855,7 @@ mod tests {
             admins: Some(vec![new_admin_pubkey]),
             relays: None,
             nostr_group_id: None,
+            disappearing_message_secs: None,
         };
         whitenoise
             .require_session(&creator_account.pubkey)
@@ -904,6 +906,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_secs: None,
         };
         let update_result = whitenoise
             .require_session(&creator_account.pubkey)
@@ -1690,6 +1693,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_secs: None,
         };
 
         let update_result = whitenoise
@@ -1854,6 +1858,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_secs: None,
         };
 
         whitenoise
@@ -2197,6 +2202,7 @@ mod tests {
             admins: None,
             relays: Some(unreachable_urls),
             nostr_group_id: None,
+            disappearing_message_secs: None,
         };
         whitenoise
             .require_session(&creator.pubkey)
@@ -2329,6 +2335,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_secs: None,
         };
         let result = whitenoise
             .require_session(&creator.pubkey)

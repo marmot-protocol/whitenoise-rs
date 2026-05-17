@@ -330,10 +330,30 @@ mod tests {
 
     use super::*;
     use crate::whitenoise::error::WhitenoiseError;
-    use crate::whitenoise::message_aggregator::DeliveryStatus;
+    use crate::whitenoise::message_aggregator::{
+        ChatMessage, DeliveryStatus, ReactionSummary, reaction_handler,
+    };
     use crate::whitenoise::message_streaming::{MessageStreamManager, UpdateTrigger};
     use crate::whitenoise::session::messages::cascade_delivery_failure;
     use crate::whitenoise::test_utils::*;
+
+    fn test_chat_message(seed: u64, author: PublicKey, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: format!("{seed:0>64x}"),
+            author,
+            content: content.to_string(),
+            created_at: Timestamp::now(),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: ReactionSummary::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+        }
+    }
 
     /// Test successful message sending with various scenarios:
     /// - Default tags (None)
@@ -1812,6 +1832,253 @@ mod tests {
         .await
         .unwrap();
         assert!(has_status, "Deletion event should have delivery status");
+    }
+
+    #[tokio::test]
+    async fn test_send_deletion_rejects_cross_author_message_target() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let target = test_chat_message(0xca501, member.pubkey, "Member-owned message");
+        AggregatedMessage::insert_message(
+            &target,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap();
+
+        let deletion_tags = Some(vec![Tag::parse(vec!["e", &target.id]).unwrap()]);
+        let result = creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .send(String::new(), 5, deletion_tags)
+            .await
+            .unwrap();
+
+        assert!(
+            !result.last_message_deleted,
+            "cross-author deletion must not report that it deleted the last message"
+        );
+
+        let cached = AggregatedMessage::find_by_id(
+            &target.id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !cached.is_deleted,
+            "cross-author deletion must not mark the target deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_deletion_rejects_cross_author_reaction_target() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let reaction_id = EventId::from_hex(&format!("{:0>64x}", 0xea501u64)).unwrap();
+        let mut parent = test_chat_message(0xca502, creator.pubkey, "Parent message");
+        reaction_handler::add_reaction_to_message(
+            &mut parent,
+            &member.pubkey,
+            "+",
+            Timestamp::now(),
+            reaction_id,
+        );
+        AggregatedMessage::insert_message(
+            &parent,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap();
+
+        let reaction_tags = Tags::from_list(vec![Tag::parse(vec!["e", &parent.id]).unwrap()]);
+        let empty_tokens =
+            serde_json::to_string(&Vec::<crate::nostr_manager::parser::SerializableToken>::new())
+                .unwrap();
+        let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
+        let empty_media =
+            serde_json::to_string(&Vec::<crate::whitenoise::media_files::MediaFile>::new())
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO aggregated_messages
+             (message_id, mls_group_id, author, created_at, kind, content, tags,
+              content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 7, '+', ?, ?, ?, ?)",
+        )
+        .bind(reaction_id.to_string())
+        .bind(group.mls_group_id.as_slice())
+        .bind(member.pubkey.to_hex())
+        .bind(1000i64)
+        .bind(serde_json::to_string(&reaction_tags).unwrap())
+        .bind(&empty_tokens)
+        .bind(&empty_reactions)
+        .bind(&empty_media)
+        .execute(&creator_session.account_db.inner.pool)
+        .await
+        .unwrap();
+
+        let deletion_tags = Some(vec![
+            Tag::parse(vec!["e", &reaction_id.to_string()]).unwrap(),
+        ]);
+        let deletion_result = creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .send(String::new(), 5, deletion_tags)
+            .await
+            .unwrap();
+        assert!(
+            !deletion_result.last_message_deleted,
+            "cross-author reaction deletion must not report that it deleted the last message"
+        );
+
+        let parent_after_delete = AggregatedMessage::find_by_id(
+            &parent.id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let total_reactions: usize = parent_after_delete
+            .reactions
+            .by_emoji
+            .values()
+            .map(|reaction| reaction.count)
+            .sum();
+        assert_eq!(
+            total_reactions, 1,
+            "cross-author deletion must not remove another author's reaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cascade_deletion_failure_skips_unmarked_reaction_targets() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let group_id = GroupId::from_slice(&[0xcb; 32]);
+        let reaction_author = Keys::generate().public_key();
+        let reaction_id = EventId::from_hex(&format!("{:0>64x}", 0xea502u64)).unwrap();
+
+        let mut parent = test_chat_message(0xca503, account.pubkey, "Parent message");
+        reaction_handler::add_reaction_to_message(
+            &mut parent,
+            &reaction_author,
+            "+",
+            Timestamp::now(),
+            reaction_id,
+        );
+        let original_reactions = parent.reactions.clone();
+        AggregatedMessage::insert_message(
+            &parent,
+            &group_id,
+            &account.pubkey,
+            &session.account_db.inner,
+        )
+        .await
+        .unwrap();
+
+        let reaction_tags = Tags::from_list(vec![Tag::parse(vec!["e", &parent.id]).unwrap()]);
+        let empty_tokens =
+            serde_json::to_string(&Vec::<crate::nostr_manager::parser::SerializableToken>::new())
+                .unwrap();
+        let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
+        let empty_media =
+            serde_json::to_string(&Vec::<crate::whitenoise::media_files::MediaFile>::new())
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO aggregated_messages
+             (message_id, mls_group_id, author, created_at, kind, content, tags,
+              content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 7, '+', ?, ?, ?, ?)",
+        )
+        .bind(reaction_id.to_string())
+        .bind(group_id.as_slice())
+        .bind(reaction_author.to_hex())
+        .bind(1000i64)
+        .bind(serde_json::to_string(&reaction_tags).unwrap())
+        .bind(&empty_tokens)
+        .bind(&empty_reactions)
+        .bind(&empty_media)
+        .execute(&session.account_db.inner.pool)
+        .await
+        .unwrap();
+
+        let deletion_event_id = format!("{:0>64x}", 0xde502u64);
+        let deletion_tags = Tags::from_list(vec![
+            Tag::parse(vec!["e", &reaction_id.to_string()]).unwrap(),
+        ]);
+        let stream_manager = MessageStreamManager::new();
+
+        cascade_delivery_failure(
+            5,
+            &deletion_event_id,
+            &deletion_tags,
+            &account.pubkey,
+            "",
+            &group_id,
+            &session.account_db.inner,
+            &stream_manager,
+        )
+        .await;
+
+        let parent_after_cascade = AggregatedMessage::find_by_id(
+            &parent.id,
+            &group_id,
+            &account.pubkey,
+            &session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parent_after_cascade.reactions, original_reactions,
+            "rollback should not restore a reaction target that this deletion never marked"
+        );
     }
 
     /// Test cascade_delivery_failure for kind 7 (reaction) removes reaction from parent.

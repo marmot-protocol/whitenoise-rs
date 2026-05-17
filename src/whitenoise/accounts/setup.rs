@@ -241,10 +241,10 @@ impl Whitenoise {
 
     #[perf_instrument("accounts")]
     pub(super) async fn load_default_relays(&self) -> Result<Vec<Relay>> {
-        let mut default_relays = Vec::new();
-        for Relay { url, .. } in Relay::defaults() {
-            let relay = self.find_or_create_relay_by_url(&url).await?;
-            default_relays.push(relay);
+        let urls = &self.config().default_account_relays;
+        let mut default_relays = Vec::with_capacity(urls.len());
+        for url in urls {
+            default_relays.push(self.find_or_create_relay_by_url(url).await?);
         }
         Ok(default_relays)
     }
@@ -1082,6 +1082,22 @@ mod tests {
     use mdk_core::prelude::*;
 
     #[tokio::test]
+    async fn test_load_default_relays_honours_with_default_account_relays() {
+        let override_urls = vec![
+            RelayUrl::parse("ws://override-relay-a:9999").unwrap(),
+            RelayUrl::parse("ws://override-relay-b:9999").unwrap(),
+        ];
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise_with(|config| {
+            config.with_default_account_relays(override_urls.clone())
+        })
+        .await;
+
+        let relays = whitenoise.load_default_relays().await.unwrap();
+
+        assert_eq!(Relay::urls(&relays), override_urls);
+    }
+
+    #[tokio::test]
     async fn test_active_group_count_no_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
@@ -1155,6 +1171,7 @@ mod tests {
             None,
             vec![relay1.clone(), relay2.clone()],
             vec![creator_account.pubkey],
+            None,
         );
 
         let group = whitenoise
@@ -1545,6 +1562,7 @@ mod tests {
             None,
             vec![relay_url.clone()],
             vec![creator_account.pubkey],
+            None,
         );
 
         whitenoise
@@ -1582,6 +1600,7 @@ mod tests {
             None,
             vec![relay_url.clone()],
             vec![creator_account.pubkey],
+            None,
         );
 
         whitenoise

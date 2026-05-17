@@ -41,6 +41,8 @@ pub enum Language {
     #[default]
     System,
     English,
+    ChineseSimplified,
+    ChineseTraditional,
     Spanish,
     French,
     German,
@@ -53,15 +55,17 @@ pub enum Language {
 impl fmt::Display for Language {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Language::System => write!(f, "system"),
-            Language::English => write!(f, "en"),
-            Language::Spanish => write!(f, "es"),
-            Language::French => write!(f, "fr"),
-            Language::German => write!(f, "de"),
-            Language::Italian => write!(f, "it"),
-            Language::Portuguese => write!(f, "pt"),
-            Language::Russian => write!(f, "ru"),
-            Language::Turkish => write!(f, "tr"),
+            Self::System => write!(f, "system"),
+            Self::English => write!(f, "en"),
+            Self::ChineseSimplified => write!(f, "zh"),
+            Self::ChineseTraditional => write!(f, "zh_Hant"),
+            Self::Spanish => write!(f, "es"),
+            Self::French => write!(f, "fr"),
+            Self::German => write!(f, "de"),
+            Self::Italian => write!(f, "it"),
+            Self::Portuguese => write!(f, "pt"),
+            Self::Russian => write!(f, "ru"),
+            Self::Turkish => write!(f, "tr"),
         }
     }
 }
@@ -71,15 +75,20 @@ impl FromStr for Language {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "system" => Ok(Language::System),
-            "en" | "english" => Ok(Language::English),
-            "es" | "spanish" => Ok(Language::Spanish),
-            "fr" | "french" => Ok(Language::French),
-            "de" | "german" => Ok(Language::German),
-            "it" | "italian" => Ok(Language::Italian),
-            "pt" | "portuguese" => Ok(Language::Portuguese),
-            "ru" | "russian" => Ok(Language::Russian),
-            "tr" | "turkish" => Ok(Language::Turkish),
+            "system" => Ok(Self::System),
+            "en" | "english" => Ok(Self::English),
+            "zh" | "zh_hans" | "zh-hans" | "chinese" | "chinese-simplified"
+            | "simplified-chinese" => Ok(Self::ChineseSimplified),
+            "zh_hant" | "zh-hant" | "chinese-traditional" | "traditional-chinese" => {
+                Ok(Self::ChineseTraditional)
+            }
+            "es" | "spanish" => Ok(Self::Spanish),
+            "fr" | "french" => Ok(Self::French),
+            "de" | "german" => Ok(Self::German),
+            "it" | "italian" => Ok(Self::Italian),
+            "pt" | "portuguese" => Ok(Self::Portuguese),
+            "ru" | "russian" => Ok(Self::Russian),
+            "tr" | "turkish" => Ok(Self::Turkish),
             _ => Err(format!("Unsupported language: {}", s)),
         }
     }
@@ -196,6 +205,8 @@ mod tests {
         for variant in [
             Language::System,
             Language::English,
+            Language::ChineseSimplified,
+            Language::ChineseTraditional,
             Language::Spanish,
             Language::French,
             Language::German,
@@ -212,6 +223,14 @@ mod tests {
     #[test]
     fn language_from_str_accepts_full_names() {
         assert_eq!(Language::from_str("english").unwrap(), Language::English);
+        assert_eq!(
+            Language::from_str("simplified-chinese").unwrap(),
+            Language::ChineseSimplified
+        );
+        assert_eq!(
+            Language::from_str("traditional-chinese").unwrap(),
+            Language::ChineseTraditional
+        );
         assert_eq!(Language::from_str("spanish").unwrap(), Language::Spanish);
         assert_eq!(Language::from_str("french").unwrap(), Language::French);
         assert_eq!(Language::from_str("german").unwrap(), Language::German);
@@ -227,8 +246,32 @@ mod tests {
     #[test]
     fn language_from_str_is_case_insensitive() {
         assert_eq!(Language::from_str("EN").unwrap(), Language::English);
+        assert_eq!(
+            Language::from_str("zh_Hant").unwrap(),
+            Language::ChineseTraditional
+        );
         assert_eq!(Language::from_str("SPANISH").unwrap(), Language::Spanish);
         assert_eq!(Language::from_str("Fr").unwrap(), Language::French);
+    }
+
+    #[test]
+    fn language_from_str_accepts_chinese_locale_aliases() {
+        assert_eq!(
+            Language::from_str("zh").unwrap(),
+            Language::ChineseSimplified
+        );
+        assert_eq!(
+            Language::from_str("zh-Hans").unwrap(),
+            Language::ChineseSimplified
+        );
+        assert_eq!(
+            Language::from_str("zh_hans").unwrap(),
+            Language::ChineseSimplified
+        );
+        assert_eq!(
+            Language::from_str("zh-Hant").unwrap(),
+            Language::ChineseTraditional
+        );
     }
 
     #[test]

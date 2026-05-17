@@ -54,6 +54,7 @@ impl TestCase for CreateDmTestCase {
                     None,
                     context.test_relays(),
                     vec![creator.pubkey, other.pubkey],
+                    None,
                 ),
                 None,
             )

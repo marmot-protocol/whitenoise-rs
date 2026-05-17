@@ -122,7 +122,35 @@ pub struct GroupPushToken {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupPushDebugInfo {
     pub total_token_count: usize,
+    pub active_token_count: usize,
+    pub stale_token_count: usize,
+    pub missing_relay_hint_count: usize,
     pub last_token_list_updated_at: Option<DateTime<Utc>>,
+    pub local_registration: LocalPushRegistrationDebugInfo,
+    pub tokens: Vec<GroupPushTokenDebugEntry>,
+}
+
+/// Redacted local registration status for group push-token debugging.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LocalPushRegistrationDebugInfo {
+    pub registered: bool,
+    pub shareable: bool,
+    pub notifications_enabled: bool,
+    pub local_leaf_index: Option<u32>,
+    pub local_token_cached: bool,
+}
+
+/// Redacted cached group-token status for one MLS leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GroupPushTokenDebugEntry {
+    pub member_pubkey: PublicKey,
+    pub leaf_index: u32,
+    pub server_pubkey: PublicKey,
+    pub has_relay_hint: bool,
+    pub active_leaf: bool,
+    pub member_matches_active_leaf: bool,
+    pub is_local_member: bool,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl fmt::Debug for PushRegistration {
@@ -159,7 +187,6 @@ impl fmt::Debug for GroupPushToken {
 /// Maximum number of concurrently-active delayed MIP-05 token-list response tasks.
 /// Tasks that cannot acquire a permit are dropped; the requester can retry via a
 /// subsequent token request event.
-#[cfg(test)]
 pub(crate) const MAX_CONCURRENT_TOKEN_RESPONSE_TASKS: usize = 10;
 
 const PUSH_GROUP_MESSAGE_KINDS: [u16; 3] = [
@@ -1557,11 +1584,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(debug_info.total_token_count, 2);
+        assert_eq!(debug_info.active_token_count, 0);
+        assert_eq!(debug_info.stale_token_count, 2);
+        assert_eq!(debug_info.missing_relay_hint_count, 0);
         assert_eq!(
             debug_info.last_token_list_updated_at,
             [first_token.updated_at, second_token.updated_at]
                 .into_iter()
                 .max()
+        );
+        assert_eq!(
+            debug_info.local_registration,
+            LocalPushRegistrationDebugInfo {
+                registered: false,
+                shareable: false,
+                notifications_enabled: true,
+                local_leaf_index: None,
+                local_token_cached: false,
+            }
+        );
+        assert_eq!(debug_info.tokens.len(), 2);
+        assert!(debug_info.tokens.iter().all(|token| !token.active_leaf));
+        assert!(
+            debug_info
+                .tokens
+                .iter()
+                .all(|token| !token.member_matches_active_leaf)
+        );
+
+        let serialized = serde_json::to_string(&debug_info).unwrap();
+        assert!(
+            !serialized.contains("ciphertext-one") && !serialized.contains("ciphertext-two"),
+            "debug info must stay redacted when serialized"
         );
     }
 

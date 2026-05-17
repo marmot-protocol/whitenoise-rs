@@ -89,47 +89,25 @@ int-test-flamegraph:
     CARGO_PROFILE_RELEASE_STRIP=false \
     cargo flamegraph --release --bin integration_test --features integration-tests --deterministic -- --data-dir ./dev/data/integration_test/ --logs-dir ./dev/data/integration_test/
 
-# Run performance benchmarks (not included in CI)
+# Run performance benchmarks (not included in CI).
+# Passing latency_ms>0 routes the bench through toxiproxy with that latency
+# applied per direction (validated by experiments/04-toxiproxy-validation).
 # Usage:
-#   just benchmark                      # Run all benchmarks
-#   just benchmark messaging-performance  # Run specific benchmark
-benchmark scenario="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    rm -rf ./dev/data/benchmark_test/
-    if [ -z "{{scenario}}" ]; then
-        echo "Running all benchmarks..."
-        RUST_LOG=warn,benchmark_test=info,whitenoise=info \
-        cargo run --bin benchmark_test --features benchmark-tests --release -- \
-        --data-dir ./dev/data/benchmark_test/ --logs-dir ./dev/data/benchmark_test/
-    else
-        echo "Running benchmark: {{scenario}}"
-        RUST_LOG=warn,benchmark_test=info,whitenoise=info \
-        cargo run --bin benchmark_test --features benchmark-tests --release -- \
-        --data-dir ./dev/data/benchmark_test/ --logs-dir ./dev/data/benchmark_test/ \
-        "{{scenario}}"
-    fi
-    rm -rf ./dev/data/benchmark_test/
+#   just benchmark                                 # all scenarios, fast localhost
+#   just benchmark messaging-performance           # specific scenario, fast localhost
+#   just benchmark messaging-performance 100       # specific scenario, 100ms WAN latency
+benchmark scenario="" latency_ms="0":
+    @bash scripts/benchmark.sh "{{scenario}}" "{{latency_ms}}"
 
-# Run benchmarks and emit JSON output
+# Run benchmarks and emit JSON output.
+# Passing latency_ms>0 routes the bench through toxiproxy; the latency value
+# is suffixed onto the output filename so WAN runs don't overwrite localhost runs.
 # Usage:
-#   just benchmark-json                      # All scenarios
-#   just benchmark-json messaging-performance  # Specific scenario
-benchmark-json scenario="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p ./benchmark_results
-    rm -rf ./dev/data/benchmark_test/ && mkdir -p ./dev/data/benchmark_test
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    SUFFIX=""
-    [ -n "{{scenario}}" ] && SUFFIX="_{{scenario}}"
-    RUST_LOG=warn,benchmark_test=info,whitenoise=info \
-        cargo run --release --features benchmark-tests --bin benchmark_test -- \
-        --data-dir ./dev/data/benchmark_test \
-        --logs-dir ./dev/data/benchmark_test/logs \
-        --output-json "./benchmark_results/result_${TIMESTAMP}${SUFFIX}.json" \
-        {{scenario}}
-    rm -rf ./dev/data/benchmark_test
+#   just benchmark-json                                 # all scenarios, fast localhost
+#   just benchmark-json messaging-performance           # specific scenario, fast localhost
+#   just benchmark-json messaging-performance 100       # specific scenario, 100ms WAN latency
+benchmark-json scenario="" latency_ms="0":
+    @bash scripts/benchmark-json.sh "{{scenario}}" "{{latency_ms}}"
 
 # Run only stable-tier benchmark scenarios and merge results into a single JSON.
 # Used by the merge-gating CI job so relay-tier failures cannot block a merge.
@@ -255,6 +233,17 @@ benchmark-startup iterations="1":
 #   just benchmark-startup-seeded 5 ./test_fixtures/nostr/other.json      # custom fixture
 benchmark-startup-seeded iterations="5" fixture="./test_fixtures/nostr/jeff_contacts.json":
     @bash scripts/benchmark-startup-seeded.sh {{iterations}} {{fixture}}
+
+# Measure initialization timing under a simulated WAN latency (toxiproxy).
+# Brings up the docker-compose `latency` profile, applies a one-way latency
+# toxic to both relay proxies, runs the seeded bench against the proxy ports,
+# and tears down on exit. Validated by experiments/04-toxiproxy-validation.
+# Usage:
+#   just benchmark-startup-wan                                              # 100ms, 5 warm runs
+#   just benchmark-startup-wan 200                                          # 200ms, 5 warm runs
+#   just benchmark-startup-wan 50 10                                        # 50ms, 10 warm runs
+benchmark-startup-wan latency_ms="100" iterations="5" fixture="./test_fixtures/nostr/jeff_contacts.json":
+    @bash scripts/benchmark-startup-wan.sh {{latency_ms}} {{iterations}} {{fixture}}
 
 # Run benchmarks and save results with timestamp
 # Usage:
@@ -395,8 +384,9 @@ update:
 # - RUSTSEC-2024-0384: instant unmaintained (transitive via rust-nostr, low risk)
 # - RUSTSEC-2026-0002: lru unsound (transitive via nostr-sdk, awaiting upstream fix)
 # - RUSTSEC-2026-0037: quinn-proto DoS via malformed QUIC handshake (transitive via nostr-blossom → reqwest → quinn; awaiting upstream fix)
+# - RUSTSEC-2026-0124: libcrux-chacha20poly1305 panic (transitive optional hpke-rs libcrux backend; not selected by our all-features/all-targets graph, awaiting upstream fix)
 audit:
-    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0037
+    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0037 --ignore RUSTSEC-2026-0124
 
 # Generate and open documentation
 doc:
@@ -412,8 +402,12 @@ test-nextest:
     cargo nextest run --all-features --all-targets
     cargo test --all-features --doc
 
-# Filename regex for excluding test infrastructure from coverage metrics
-coverage_ignore := '(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs)'
+# Filename regex for excluding test infrastructure from coverage metrics.
+# Also excludes the per-account Rust migration framework (mostly mechanical
+# `CREATE TABLE`/`ALTER TABLE` SQL with no branch logic) and the
+# whitenoise-cli crate (thin pass-through dispatch — its e2e tests live
+# under `tests/cli_*` and don't contribute to the lib coverage measurement).
+coverage_ignore := '(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs|rust_migrations/|crates/whitenoise-cli/)'
 
 # Generate code coverage report (lcov format, matches CI flags)
 coverage:

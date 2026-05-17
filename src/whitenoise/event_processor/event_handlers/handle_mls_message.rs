@@ -255,29 +255,28 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<()> {
+        // Capture the pre-deletion last message so authorized deletes can emit
+        // LastMessageDeleted after cache_deletion mutates the target row.
         let last_message_id = self.get_last_message_id(account_pubkey, group_id).await;
-
-        for (trigger, msg) in self
+        let updates = self
             .cache_deletion(account_pubkey, group_id, message)
-            .await?
-        {
+            .await?;
+        let deleted_last_message = last_message_id.as_ref().is_some_and(|last_message_id| {
+            updates.iter().any(|(trigger, msg)| {
+                matches!(trigger, UpdateTrigger::MessageDeleted) && &msg.id == last_message_id
+            })
+        });
+
+        for (trigger, msg) in updates {
             self.emit_message_update(group_id, trigger, msg);
         }
 
-        // Check if the deleted message was the last message.
-        // This check must happen AFTER get_last_message_id but the
-        // result is only valid for the FIRST handler (before cache_deletion
-        // modifies shared state). We emit for ALL subscribed accounts because
-        // subsequent handlers will see incorrect post-deletion state.
-        if let Some(last_message_id) = last_message_id {
-            let deleted_ids = extract_deletion_target_ids(&message.tags);
-            if deleted_ids.contains(&last_message_id) {
-                self.emit_chat_list_update_for_group(
-                    group_id,
-                    ChatListUpdateTrigger::LastMessageDeleted,
-                )
-                .await;
-            }
+        if deleted_last_message {
+            self.emit_chat_list_update_for_group(
+                group_id,
+                ChatListUpdateTrigger::LastMessageDeleted,
+            )
+            .await;
         }
 
         Ok(())
@@ -787,7 +786,7 @@ impl Whitenoise {
                     target: "whitenoise::cache",
                     deletion_author = %deletion_author.to_hex(),
                     target_author = %reaction.author.to_hex(),
-                    target_id = target_id,
+                    target_id = %target_id,
                     "Ignoring deletion whose author does not match reaction author"
                 );
                 return Ok(None);
@@ -821,7 +820,7 @@ impl Whitenoise {
                     target: "whitenoise::cache",
                     deletion_author = %deletion_author.to_hex(),
                     target_author = %msg.author.to_hex(),
-                    target_id = target_id,
+                    target_id = %target_id,
                     "Ignoring deletion whose author does not match message author"
                 );
                 return Ok(None);
@@ -915,6 +914,7 @@ impl Whitenoise {
         let orphaned_deletions = AggregatedMessage::find_orphaned_deletions(
             &message.id,
             group_id,
+            &message.author,
             &session.account_db.inner,
         )
         .await?;
@@ -967,30 +967,21 @@ impl Whitenoise {
             .await?;
         }
 
-        // Apply orphaned deletions, but only those whose author matches the
-        // target message author. Cross-author deletions never legitimately
-        // apply and would let a malicious peer wipe other members' content.
+        // Apply orphaned deletions through the same path used for live deletes.
+        // `find_orphaned_deletions` has already filtered to matching authors.
         for deletion in orphaned_deletions {
-            if deletion.author != message.author {
-                tracing::warn!(
-                    target: "whitenoise::cache",
-                    deletion_author = %deletion.author.to_hex(),
-                    target_author = %message.author.to_hex(),
-                    target_id = %message.id,
-                    "Ignoring orphaned deletion whose author does not match message author"
-                );
-                continue;
+            if let Some((UpdateTrigger::MessageDeleted, deleted_message)) = self
+                .apply_single_deletion(
+                    account_pubkey,
+                    &deletion.author,
+                    &message.id,
+                    &deletion.event_id,
+                    group_id,
+                )
+                .await?
+            {
+                message = deleted_message;
             }
-
-            message.is_deleted = true;
-            AggregatedMessage::mark_deleted(
-                &message.id,
-                group_id,
-                &deletion.event_id.to_string(),
-                &deletion.author,
-                &session.account_db.inner,
-            )
-            .await?;
         }
 
         Ok(message)
@@ -999,7 +990,7 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use mdk_core::mip05::{
         ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
@@ -1009,8 +1000,8 @@ mod tests {
 
     use super::*;
     use crate::whitenoise::{
-        aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus,
-        push_notifications::GroupPushToken, test_utils::*,
+        aggregated_message::AggregatedMessage, group_information::GroupInformation,
+        message_aggregator::DeliveryStatus, push_notifications::GroupPushToken, test_utils::*,
     };
 
     fn make_token_tag(seed: u8) -> TokenTag {
@@ -1032,6 +1023,66 @@ mod tests {
             member_account,
         )
         .await
+    }
+
+    async fn setup_three_member_accepted_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_one: &Account,
+        member_two: &Account,
+    ) -> GroupId {
+        let group_id =
+            setup_three_member_group(whitenoise, admin_account, member_one, member_two).await;
+
+        GroupInformation::create_for_group(whitenoise, &group_id, None, "Test group")
+            .await
+            .unwrap();
+
+        for account in [admin_account, member_one, member_two] {
+            let (account_group, _) =
+                AccountGroup::get_or_create(whitenoise, &account.pubkey, &group_id, None)
+                    .await
+                    .unwrap();
+            account_group.accept(whitenoise).await.unwrap();
+        }
+
+        group_id
+    }
+
+    async fn assert_cached_peer_tokens(
+        session: &Arc<AccountSession>,
+        group_id: &GroupId,
+        expected_tokens: &[(&Account, u32, &TokenTag)],
+    ) {
+        let stored = GroupPushToken::find_by_account_and_group(
+            &session.account_pubkey,
+            group_id,
+            &session.account_db.inner.pool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stored.len(),
+            expected_tokens.len(),
+            "receiver should cache exactly the other participants' push tokens"
+        );
+
+        for (account, leaf_index, token_tag) in expected_tokens {
+            let cached_token = stored
+                .iter()
+                .find(|token| token.member_pubkey == account.pubkey)
+                .expect("expected participant token should be cached");
+            assert_eq!(cached_token.account_pubkey, session.account_pubkey);
+            assert_eq!(cached_token.mls_group_id, *group_id);
+            assert_eq!(cached_token.leaf_index, *leaf_index);
+            assert_eq!(cached_token.server_pubkey, token_tag.server_pubkey);
+            assert_eq!(cached_token.relay_hint, Some(token_tag.relay_hint.clone()));
+            assert_eq!(
+                cached_token.encrypted_token,
+                token_tag.encrypted_token.to_base64()
+            );
+        }
     }
 
     /// Test handling of different MLS message types: regular messages, reactions, and deletions
@@ -1149,6 +1200,234 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(cached_msg.is_deleted, "Message should be marked as deleted");
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_rejects_cross_author_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let mut message_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Protected admin message".to_string(),
+        );
+        message_inner.ensure_id();
+        let message_id = message_inner.id.unwrap();
+        let message_event = admin_mdk
+            .create_message(&group_id, message_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .await
+            .unwrap();
+
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let mut deletion_inner = UnsignedEvent::new(
+            member_account.pubkey,
+            Timestamp::now(),
+            Kind::EventDeletion,
+            vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
+            String::new(),
+        );
+        deletion_inner.ensure_id();
+        let deletion_event = member_mdk
+            .create_message(&group_id, deletion_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .await
+            .unwrap();
+
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            &group_id,
+            &admin_account.pubkey,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!cached_msg.is_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_rejects_cross_author_orphaned_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let mut message_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Late protected admin message".to_string(),
+        );
+        message_inner.ensure_id();
+        let future_message_id = message_inner.id.unwrap();
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+
+        let mut deletion_inner = UnsignedEvent::new(
+            member_account.pubkey,
+            Timestamp::now(),
+            Kind::EventDeletion,
+            vec![Tag::parse(vec!["e", &future_message_id.to_string()]).unwrap()],
+            String::new(),
+        );
+        deletion_inner.ensure_id();
+        let deletion_event = member_mdk
+            .create_message(&group_id, deletion_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .await
+            .unwrap();
+
+        let message_event = admin_mdk
+            .create_message(&group_id, message_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .await
+            .unwrap();
+
+        let cached_msg = AggregatedMessage::find_by_id(
+            &future_message_id.to_string(),
+            &group_id,
+            &admin_account.pubkey,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!cached_msg.is_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_rejects_cross_author_reaction_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let mut message_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Reaction parent".to_string(),
+        );
+        message_inner.ensure_id();
+        let message_id = message_inner.id.unwrap();
+        let message_event = admin_mdk
+            .create_message(&group_id, message_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .await
+            .unwrap();
+
+        let mut reaction_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Reaction,
+            vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
+            "+".to_string(),
+        );
+        reaction_inner.ensure_id();
+        let reaction_id = reaction_inner.id.unwrap();
+        let reaction_event = admin_mdk
+            .create_message(&group_id, reaction_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, reaction_event)
+            .await
+            .unwrap();
+
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let mut deletion_inner = UnsignedEvent::new(
+            member_account.pubkey,
+            Timestamp::now(),
+            Kind::EventDeletion,
+            vec![Tag::parse(vec!["e", &reaction_id.to_string()]).unwrap()],
+            String::new(),
+        );
+        deletion_inner.ensure_id();
+        let deletion_event = member_mdk
+            .create_message(&group_id, deletion_inner, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .await
+            .unwrap();
+
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            &group_id,
+            &admin_account.pubkey,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let total_reactions: usize = cached_msg
+            .reactions
+            .by_emoji
+            .values()
+            .map(|reaction| reaction.count)
+            .sum();
+        assert_eq!(total_reactions, 1);
+
+        let cached_reaction = AggregatedMessage::find_reaction_by_id(
+            &reaction_id.to_string(),
+            &group_id,
+            &admin_session.account_db.inner,
+        )
+        .await
+        .unwrap();
+        assert!(cached_reaction.is_some());
     }
 
     #[tokio::test]
@@ -1715,6 +1994,210 @@ mod tests {
         .await
         .unwrap();
         assert!(cached_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_updates_token_request_cache_inside_response_cooldown() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+
+        let first_token = make_token_tag(10);
+        let first_request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![first_token])
+                .unwrap();
+        let first_request_id = first_request.id.expect("447 rumor must have an event id");
+        let first_event = admin_mdk
+            .create_message(&group_id, first_request, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_session, &member_account, first_event)
+            .await
+            .unwrap();
+
+        let replacement_token = make_token_tag(11);
+        let expected_encrypted_token = replacement_token.encrypted_token.to_base64();
+        let replacement_request = build_token_request_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            vec![replacement_token],
+        )
+        .unwrap();
+        let replacement_request_id = replacement_request
+            .id
+            .expect("447 replacement rumor must have an event id");
+        let replacement_event = admin_mdk
+            .create_message(&group_id, replacement_request, None)
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_session, &member_account, replacement_event)
+            .await
+            .unwrap();
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &member_session.account_db.inner.pool,
+        )
+        .await
+        .unwrap();
+        let admin_token = stored
+            .iter()
+            .find(|token| token.leaf_index == admin_leaf_index)
+            .expect("admin token should stay cached");
+        assert_eq!(
+            admin_token.encrypted_token, expected_encrypted_token,
+            "rapid re-gossip should refresh cached encrypted token state"
+        );
+
+        assert!(
+            member_session
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), first_request_id)),
+            "the first token request should still schedule one token-list response"
+        );
+        assert!(
+            !member_session
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), replacement_request_id)),
+            "a rate-limited re-gossip must not schedule another token-list response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_gossips_token_requests_to_all_other_participants() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+        let member_one = members[0].0.clone();
+        let member_two = members[1].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_one, &member_two]).await;
+
+        let group_id = setup_three_member_accepted_group(
+            &whitenoise,
+            &admin_account,
+            &member_one,
+            &member_two,
+        )
+        .await;
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let member_one_session = whitenoise.require_session(&member_one.pubkey).unwrap();
+        let member_two_session = whitenoise.require_session(&member_two.pubkey).unwrap();
+
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let member_one_mdk = whitenoise
+            .create_mdk_for_account(member_one.pubkey)
+            .unwrap();
+        let member_two_mdk = whitenoise
+            .create_mdk_for_account(member_two.pubkey)
+            .unwrap();
+        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+        let member_one_leaf_index = member_one_mdk.own_leaf_index(&group_id).unwrap();
+        let member_two_leaf_index = member_two_mdk.own_leaf_index(&group_id).unwrap();
+
+        let admin_token = make_token_tag(30);
+        let admin_request = build_token_request_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            vec![admin_token.clone()],
+        )
+        .unwrap();
+        let admin_event = admin_mdk
+            .create_message(&group_id, admin_request, None)
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_one_session, &member_one, admin_event.clone())
+            .await
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_two_session, &member_two, admin_event)
+            .await
+            .unwrap();
+
+        let member_one_token = make_token_tag(31);
+        let member_one_request = build_token_request_rumor(
+            member_one.pubkey,
+            Timestamp::now(),
+            vec![member_one_token.clone()],
+        )
+        .unwrap();
+        let member_one_event = member_one_mdk
+            .create_message(&group_id, member_one_request, None)
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, member_one_event.clone())
+            .await
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_two_session, &member_two, member_one_event)
+            .await
+            .unwrap();
+
+        let member_two_token = make_token_tag(32);
+        let member_two_request = build_token_request_rumor(
+            member_two.pubkey,
+            Timestamp::now(),
+            vec![member_two_token.clone()],
+        )
+        .unwrap();
+        let member_two_event = member_two_mdk
+            .create_message(&group_id, member_two_request, None)
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&admin_session, &admin_account, member_two_event.clone())
+            .await
+            .unwrap();
+        whitenoise
+            .handle_mls_message(&member_one_session, &member_one, member_two_event)
+            .await
+            .unwrap();
+
+        assert_cached_peer_tokens(
+            &admin_session,
+            &group_id,
+            &[
+                (&member_one, member_one_leaf_index, &member_one_token),
+                (&member_two, member_two_leaf_index, &member_two_token),
+            ],
+        )
+        .await;
+        assert_cached_peer_tokens(
+            &member_one_session,
+            &group_id,
+            &[
+                (&admin_account, admin_leaf_index, &admin_token),
+                (&member_two, member_two_leaf_index, &member_two_token),
+            ],
+        )
+        .await;
+        assert_cached_peer_tokens(
+            &member_two_session,
+            &group_id,
+            &[
+                (&admin_account, admin_leaf_index, &admin_token),
+                (&member_one, member_one_leaf_index, &member_one_token),
+            ],
+        )
+        .await;
+
+        admin_session.cancel();
+        member_one_session.cancel();
+        member_two_session.cancel();
     }
 
     #[tokio::test]

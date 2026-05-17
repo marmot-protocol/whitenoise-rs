@@ -302,6 +302,12 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
     }
 }
 
+impl crate::whitenoise::database::IsLockError for WhitenoiseError {
+    fn is_lock_error(&self) -> bool {
+        matches!(self, Self::Database(inner) if inner.is_sqlite_lock_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
