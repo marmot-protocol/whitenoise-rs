@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use ::rand::RngCore;
 use nostr_sdk::{PublicKey, RelayUrl};
@@ -12,6 +13,7 @@ use tokio::sync::{
     watch,
 };
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
 
 pub mod account_settings;
 pub mod accounts;
@@ -274,6 +276,7 @@ pub struct Whitenoise {
 /// concurrent first-callers internally, replacing the previous
 /// `ENSURE_INITIALIZED_LOCK` mutex without losing the race-free guarantee.
 static GLOBAL_WHITENOISE: OnceCell<Arc<Whitenoise>> = OnceCell::const_new();
+const DELETE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Marker carried in [`WhitenoiseComponents`] to defer construction of the
 /// standard [`WhitenoiseEventTracker`] until inside `Arc::new_cyclic`, where
@@ -1095,14 +1098,42 @@ impl Whitenoise {
     pub async fn delete_all_data(&self) -> Result<()> {
         tracing::debug!(target: "whitenoise::delete_all_data", "Deleting all data");
 
-        // Shutdown gracefully before deleting data
-        self.shutdown().await?;
+        // Delete is a destructive local reset. Give async workers a brief
+        // grace period to stop cleanly, then abort any task still blocked on
+        // relay or other background work so local cleanup can proceed.
+        let delete_shutdown_deadline = Instant::now() + DELETE_SHUTDOWN_GRACE;
+        self.shutdown_for_delete(delete_shutdown_deadline).await?;
 
-        // Deactivate session-owned inbox planes before tearing down shared infra
-        self.account_manager.deactivate_all_inboxes().await;
+        // Deactivate session-owned inbox planes before tearing down shared infra.
+        // This may touch relay/session shutdown paths, so it is best-effort
+        // during a destructive local reset.
+        if timeout(
+            Self::remaining_delete_grace(delete_shutdown_deadline),
+            self.account_manager.deactivate_all_inboxes(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                target: "whitenoise::delete_all_data",
+                "Timed out while deactivating inboxes; continuing with local data wipe"
+            );
+        }
 
-        // Tear down shared relay-control subscriptions (group, ephemeral, telemetry)
-        self.shared.relay_control.shutdown_all().await;
+        // Tear down shared relay-control subscriptions (group, ephemeral,
+        // telemetry). Relay cleanup must not block local deletion indefinitely.
+        if timeout(
+            Self::remaining_delete_grace(delete_shutdown_deadline),
+            self.shared.relay_control.shutdown_all(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                target: "whitenoise::delete_all_data",
+                "Timed out while shutting down relay control; continuing with local data wipe"
+            );
+        }
 
         // Remove database files and key material.
         let accounts = Account::all(&self.shared.database).await?;
@@ -1340,6 +1371,57 @@ impl Whitenoise {
         tracing::info!(target: "whitenoise::scheduler", "Scheduler shutdown complete");
     }
 
+    #[perf_instrument("whitenoise")]
+    async fn shutdown_for_delete(&self, deadline: Instant) -> Result<()> {
+        tracing::info!(
+            target: "whitenoise::delete_all_data",
+            "Initiating bounded shutdown before local data wipe"
+        );
+
+        if timeout(
+            Self::remaining_delete_grace(deadline),
+            self.shutdown_event_processing(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                target: "whitenoise::delete_all_data",
+                "Timed out while signalling event processor shutdown; continuing with delete"
+            );
+        }
+
+        self.shutdown_scheduled_tasks_for_delete(deadline).await;
+        self.wait_for_pending_background_tasks_for_delete(deadline)
+            .await;
+
+        tracing::info!(
+            target: "whitenoise::delete_all_data",
+            "Bounded shutdown before local data wipe complete"
+        );
+        Ok(())
+    }
+
+    async fn shutdown_scheduled_tasks_for_delete(&self, deadline: Instant) {
+        tracing::info!(
+            target: "whitenoise::scheduler",
+            "Initiating bounded scheduler shutdown for delete"
+        );
+
+        let _ = self.scheduler_shutdown.send(true);
+        let handles = {
+            let mut handles = self.scheduler_handles.lock().await;
+            handles.drain(..).collect::<Vec<_>>()
+        };
+
+        Self::await_or_abort_tasks(handles, deadline, "scheduler task").await;
+
+        tracing::info!(
+            target: "whitenoise::scheduler",
+            "Bounded scheduler shutdown for delete complete"
+        );
+    }
+
     /// Returns the number of currently running scheduler tasks.
     ///
     /// This is primarily useful for integration testing to verify the scheduler is running.
@@ -1409,6 +1491,67 @@ impl Whitenoise {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    async fn wait_for_pending_background_tasks_for_delete(&self, deadline: Instant) {
+        loop {
+            let drained: Vec<JoinHandle<()>> = {
+                let mut handles = self.background_handles.lock().await;
+                if handles.is_empty() {
+                    break;
+                }
+                handles.drain(..).collect()
+            };
+
+            Self::await_or_abort_tasks(drained, deadline, "background task").await;
+        }
+    }
+
+    async fn await_or_abort_tasks(
+        handles: Vec<JoinHandle<()>>,
+        deadline: Instant,
+        label: &'static str,
+    ) {
+        for mut handle in handles {
+            let remaining = Self::remaining_delete_grace(deadline);
+            if remaining.is_zero() {
+                Self::abort_task(handle, label).await;
+                continue;
+            }
+
+            match timeout(remaining, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.is_panic() => {
+                    tracing::error!(target: "whitenoise::delete_all_data", "{label} panicked: {:?}", e);
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(target: "whitenoise::delete_all_data", "{label} cancelled: {:?}", e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "whitenoise::delete_all_data",
+                        "{label} did not stop within shared {:?} grace period; aborting",
+                        DELETE_SHUTDOWN_GRACE
+                    );
+                    Self::abort_task(handle, label).await;
+                }
+            }
+        }
+    }
+
+    fn remaining_delete_grace(deadline: Instant) -> Duration {
+        deadline.saturating_duration_since(Instant::now())
+    }
+
+    async fn abort_task(handle: JoinHandle<()>, label: &'static str) {
+        handle.abort();
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                tracing::error!(target: "whitenoise::delete_all_data", "{label} panicked after abort: {:?}", e);
+            } else {
+                tracing::debug!(target: "whitenoise::delete_all_data", "{label} aborted: {:?}", e);
             }
         }
     }
@@ -2453,6 +2596,61 @@ mod tests {
             let mls_dir = whitenoise.config().data_dir.join("mls");
             assert!(mls_dir.exists());
             assert!(mls_dir.is_dir());
+        }
+
+        #[tokio::test]
+        async fn test_delete_all_data_aborts_stuck_background_task() {
+            struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+            impl Drop for DropFlag {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let database_path = whitenoise.shared.database.path.clone();
+            let database_key_id = whitenoise.database_key_id().to_string();
+            keyring::get_or_create_db_key(
+                &whitenoise.config().keyring_service_id,
+                &database_key_id,
+            )
+            .expect("Failed to create app database key");
+
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped_in_task = dropped.clone();
+            whitenoise
+                .spawn_background(async move {
+                    let _drop_flag = DropFlag(dropped_in_task);
+                    std::future::pending::<()>().await;
+                })
+                .await;
+            assert_eq!(
+                whitenoise.background_handles.lock().await.len(),
+                1,
+                "test must register the stuck task before delete_all_data starts"
+            );
+
+            let result = tokio::time::timeout(
+                DELETE_SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+                whitenoise.delete_all_data(),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "delete_all_data should complete within the bounded shutdown grace"
+            );
+            assert!(result.unwrap().is_ok(), "delete_all_data should succeed");
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "delete_all_data should abort stuck registered background tasks"
+            );
+            assert!(
+                whitenoise.background_handles.lock().await.is_empty(),
+                "delete_all_data should drain the registered background task handles"
+            );
+            assert!(!database_path.exists());
         }
 
         #[cfg(unix)]
@@ -4482,6 +4680,14 @@ mod tests {
     mod scheduler_lifecycle_tests {
         use super::*;
 
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         #[tokio::test]
         async fn test_scheduler_handles_stored_after_init() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -4562,6 +4768,32 @@ mod tests {
             );
 
             whitenoise.wait_for_pending_background_tasks().await;
+        }
+
+        #[tokio::test]
+        async fn test_delete_shutdown_aborts_task_after_shared_deadline() {
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped_in_task = dropped.clone();
+            let handle = tokio::spawn(async move {
+                let _drop_flag = DropFlag(dropped_in_task);
+                std::future::pending::<()>().await;
+            });
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                Whitenoise::await_or_abort_tasks(vec![handle], deadline, "test task"),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "Delete shutdown should abort a stuck task instead of hanging"
+            );
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "Aborted task future should be dropped"
+            );
         }
 
         #[tokio::test]
