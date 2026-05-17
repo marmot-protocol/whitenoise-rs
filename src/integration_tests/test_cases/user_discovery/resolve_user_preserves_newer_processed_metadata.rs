@@ -55,7 +55,7 @@ impl TestCase for ResolveUserPreservesNewerProcessedMetadataTestCase {
         let newer_timestamp = Timestamp::now();
         let older_timestamp = Timestamp::from(newer_timestamp.as_secs().saturating_sub(3600));
 
-        let client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+        let client = create_test_client(&context.discovery_relays, self.test_keys.clone()).await?;
         let newer_event_id = *client
             .send_event_builder(
                 EventBuilder::metadata(&self.newer_metadata).custom_created_at(newer_timestamp),

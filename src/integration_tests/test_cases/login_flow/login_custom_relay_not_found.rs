@@ -46,7 +46,11 @@ impl TestCase for LoginCustomRelayNotFoundTestCase {
 
         // Step 2: Try a custom relay -- lists won't be there either since
         // we never published anything.
-        let custom_relay_url = RelayUrl::parse(context.dev_relays[0])?;
+        let custom_relay = context
+            .default_account_relays
+            .first()
+            .expect("test requires at least one configured default-account relay");
+        let custom_relay_url = RelayUrl::parse(custom_relay)?;
         let result = context
             .whitenoise
             .login_with_custom_relay(&expected_pubkey, custom_relay_url)

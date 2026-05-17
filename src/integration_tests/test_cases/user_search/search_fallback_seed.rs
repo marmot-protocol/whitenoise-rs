@@ -43,7 +43,7 @@ impl TestCase for SearchFallbackSeedTestCase {
 
         // Seed Jeff's metadata, contact list, and Max's metadata to local relays
         // so the pipeline can resolve them without hitting the public network.
-        publish_user_search_seed_events(&context.dev_relays).await?;
+        publish_user_search_seed_events(&context.discovery_relays).await?;
         tracing::info!("Seeded fallback events to local relays");
 
         // --- Search 1: "Jeff" should find the fallback seed itself ---

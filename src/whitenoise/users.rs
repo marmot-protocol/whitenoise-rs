@@ -533,7 +533,7 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_mock_whitenoise_with};
     use chrono::{Duration, Utc};
     use std::collections::HashSet;
 
@@ -1330,6 +1330,37 @@ mod tests {
             assert!(
                 !urls.is_empty(),
                 "Configured discovery relays should be available as the fallback"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_returns_empty_when_no_relays_configured_anywhere() {
+            // A private-relay deployment with no discovery relays configured
+            // (and no user-published lists) must NOT fall back to a built-in
+            // public default set — that would leak metadata to public
+            // infrastructure. Returning an empty list is the correct,
+            // fail-closed behaviour; `key_package_lookup` already handles it
+            // gracefully via `KeyPackageLookup::NotFound`.
+            let (whitenoise, _data_temp, _logs_temp) =
+                create_mock_whitenoise_with(|config| config.with_discovery_relays(vec![])).await;
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                metadata_known_at: None,
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
+
+            let urls = saved_user
+                .key_package_relay_urls(&whitenoise.shared)
+                .await
+                .unwrap();
+            assert!(
+                urls.is_empty(),
+                "Expected empty relay list when nothing is configured; got {urls:?}"
             );
         }
     }
