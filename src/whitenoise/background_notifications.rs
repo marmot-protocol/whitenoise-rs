@@ -123,7 +123,13 @@ impl BackgroundNotificationResult {
 /// Default quiet window: if no notification arrives within this duration, stop collecting.
 const DEFAULT_QUIET_WINDOW: Duration = Duration::from_millis(1000);
 
-/// Hard ceiling on any caller-provided `max_wait`. iOS gives silent-push
+/// First-notification window. A cold NSE wake has to reconnect, fetch,
+/// decrypt, cache, and emit before anything reaches the broadcast channel, so
+/// the initial wait needs to be longer than the post-first-notification quiet
+/// window.
+const DEFAULT_FIRST_NOTIFICATION_WINDOW: Duration = Duration::from_secs(8);
+
+/// Hard ceiling on any caller-provided `max_wait`. iOS gives notification
 /// handlers roughly 30 seconds of background execution; we clamp to 25s to
 /// leave a safety margin for init, response serialization, and the native
 /// local-notification scheduling that happens after this returns.
@@ -190,8 +196,11 @@ async fn collect_notifications_inner(
         "Starting background notification collection"
     );
 
-    // Step 1: Ensure Whitenoise is initialized (no-op if warm, full boot if cold).
-    let whitenoise = Whitenoise::ensure_initialized(config).await?;
+    // Step 1: Ensure Whitenoise is initialized (no-op if warm, background-safe
+    // boot if cold). The background-safe cold path defers startup subscription
+    // setup until after this function subscribes to notification updates below.
+    let (whitenoise, cold_start) =
+        Whitenoise::ensure_initialized_for_background_notifications(config).await?;
 
     // Step 2: Subscribe to notification broadcast BEFORE refreshing subscriptions.
     // This ordering is critical — events processed after ensure_all_subscriptions()
@@ -200,13 +209,12 @@ async fn collect_notifications_inner(
     // drop them silently.
     let mut rx = whitenoise.subscribe_to_notifications().updates;
 
-    // Step 3: Refresh relay subscriptions. This reconnects dead relays and
-    // fetches missed events using `since` timestamps. The event processor
-    // decrypts and processes them, emitting NotificationUpdates.
-    // Propagate errors here — if subscriptions fail to refresh, no events
-    // will arrive and the caller should receive an explicit failure rather
-    // than a misleading "no_data" result.
-    whitenoise.ensure_all_subscriptions().await?;
+    // Step 3: Force a relay subscription refresh. A health-only ensure can
+    // no-op when relays still look connected, even though iOS suspended the
+    // process long enough for it to miss events. Re-subscribing with `since`
+    // gives the event processor a catch-up window to decrypt and emit
+    // NotificationUpdates.
+    whitenoise.setup_all_subscriptions().await?;
 
     let init_elapsed = start.elapsed();
     let drain_budget = max_wait.saturating_sub(init_elapsed);
@@ -214,13 +222,14 @@ async fn collect_notifications_inner(
         target: "whitenoise::background_notifications",
         init_ms = init_elapsed.as_millis() as u64,
         drain_budget_ms = drain_budget.as_millis() as u64,
+        cold_start,
         "Subscriptions refreshed, starting collection window"
     );
 
     // Step 4: Collect notifications with quiet-window + hard deadline +
     // size cap (MAX_COLLECTED). Uses the *remaining* budget after init so
     // the total call stays within `max_wait`.
-    let collected = drain_notifications(&mut rx, drain_budget).await;
+    let collected = drain_notifications(&mut rx, drain_budget, cold_start).await;
 
     tracing::info!(
         target: "whitenoise::background_notifications",
@@ -246,6 +255,7 @@ async fn collect_notifications_inner(
 async fn drain_notifications(
     rx: &mut broadcast::Receiver<NotificationUpdate>,
     max_wait: Duration,
+    cold_start: bool,
 ) -> Vec<NotificationUpdate> {
     let deadline = Instant::now() + max_wait;
     let mut collected = Vec::with_capacity(MAX_COLLECTED);
@@ -261,7 +271,12 @@ async fn drain_notifications(
             break;
         }
 
-        let wait = remaining.min(DEFAULT_QUIET_WINDOW);
+        let wait_window = if collected.is_empty() && cold_start {
+            DEFAULT_FIRST_NOTIFICATION_WINDOW
+        } else {
+            DEFAULT_QUIET_WINDOW
+        };
+        let wait = remaining.min(wait_window);
         match timeout(wait, rx.recv()).await {
             Ok(Ok(update)) => {
                 tracing::debug!(
@@ -434,7 +449,7 @@ mod tests {
         }
 
         // Generous deadline — we want the cap, not the deadline, to stop us.
-        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
 
         assert_eq!(
             collected.len(),
@@ -457,8 +472,68 @@ mod tests {
             .expect("send should succeed while rx is alive");
         }
 
-        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
         assert_eq!(collected.len(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_returns_empty_when_channel_closes_before_data() {
+        let (tx, mut rx) = broadcast::channel(16);
+        drop(tx);
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
+
+        assert!(collected.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_keeps_latest_after_lagged_receiver() {
+        let (tx, mut rx) = broadcast::channel(1);
+        tx.send(make_test_notification(
+            NotificationTrigger::NewMessage,
+            "missed notification",
+        ))
+        .expect("send should succeed while rx is alive");
+        tx.send(make_test_notification(
+            NotificationTrigger::NewMessage,
+            "latest notification",
+        ))
+        .expect("send should succeed while rx is alive");
+        drop(tx);
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].content, "latest notification");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_waits_beyond_quiet_window_for_first_notification() {
+        let (tx, mut rx) = broadcast::channel(16);
+        tokio::spawn(async move {
+            tokio::time::sleep(DEFAULT_QUIET_WINDOW + Duration::from_millis(500)).await;
+            tx.send(make_test_notification(
+                NotificationTrigger::NewMessage,
+                "late first notification",
+            ))
+            .expect("send should succeed while rx is alive");
+        });
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(5), true).await;
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].content, "late first notification");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_warm_start_uses_quiet_window_for_first_notification() {
+        let (_tx, mut rx) = broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), false).await;
+
+        assert!(collected.is_empty());
+        assert_eq!(tokio::time::Instant::now() - started, DEFAULT_QUIET_WINDOW);
     }
 
     #[tokio::test(start_paused = true)]
@@ -478,7 +553,7 @@ mod tests {
             .expect("send should succeed while rx is alive");
         }
 
-        let collected = drain_notifications(&mut rx, Duration::ZERO).await;
+        let collected = drain_notifications(&mut rx, Duration::ZERO, true).await;
         assert_eq!(collected.len(), 0, "zero budget must not drain any events");
     }
 
@@ -487,5 +562,24 @@ mod tests {
         // Sanity check: the clamp must be strictly below the iOS 30s ceiling
         // so we never outlive the system-provided background budget.
         assert!(IOS_MAX_WAIT < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn collect_notifications_after_push_reports_initialization_failure() {
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let logs_dir = tempfile::tempdir().expect("temp logs dir");
+        let config = WhitenoiseConfig::new(data_dir.path(), logs_dir.path(), "   ");
+
+        let result = collect_notifications_after_push(config, Duration::from_millis(1)).await;
+
+        assert_eq!(result.status, BackgroundNotificationStatus::Failed);
+        assert!(result.notifications.is_empty());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .expect("failure should include an error")
+                .contains("keyring_service_id cannot be empty")
+        );
     }
 }

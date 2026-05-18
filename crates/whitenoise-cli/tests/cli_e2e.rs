@@ -202,7 +202,10 @@ async fn group_metadata_and_membership() {
         "group should contain mls_group_id"
     );
     assert!(
-        detail.get("required_proposals").is_some(),
+        detail
+            .get("required_proposals")
+            .and_then(|v| v.as_array())
+            .is_some(),
         "show response should expose required_proposals"
     );
 
