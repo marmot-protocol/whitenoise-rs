@@ -474,6 +474,37 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn drain_notifications_returns_empty_when_channel_closes_before_data() {
+        let (tx, mut rx) = broadcast::channel(16);
+        drop(tx);
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+
+        assert!(collected.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_keeps_latest_after_lagged_receiver() {
+        let (tx, mut rx) = broadcast::channel(1);
+        tx.send(make_test_notification(
+            NotificationTrigger::NewMessage,
+            "missed notification",
+        ))
+        .expect("send should succeed while rx is alive");
+        tx.send(make_test_notification(
+            NotificationTrigger::NewMessage,
+            "latest notification",
+        ))
+        .expect("send should succeed while rx is alive");
+        drop(tx);
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].content, "latest notification");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn drain_notifications_waits_beyond_quiet_window_for_first_notification() {
         let (tx, mut rx) = broadcast::channel(16);
         tokio::spawn(async move {
@@ -517,5 +548,24 @@ mod tests {
         // Sanity check: the clamp must be strictly below the iOS 30s ceiling
         // so we never outlive the system-provided background budget.
         assert!(IOS_MAX_WAIT < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn collect_notifications_after_push_reports_initialization_failure() {
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let logs_dir = tempfile::tempdir().expect("temp logs dir");
+        let config = WhitenoiseConfig::new(data_dir.path(), logs_dir.path(), "   ");
+
+        let result = collect_notifications_after_push(config, Duration::from_millis(1)).await;
+
+        assert_eq!(result.status, BackgroundNotificationStatus::Failed);
+        assert!(result.notifications.is_empty());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .expect("failure should include an error")
+                .contains("keyring_service_id cannot be empty")
+        );
     }
 }

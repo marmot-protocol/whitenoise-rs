@@ -74,7 +74,8 @@ impl GroupPlane {
         let subscriptions = Self::build_relay_set_subscriptions(&normalized_groups);
 
         if let Some(previous_state) = self.accounts.read().await.get(&pubkey).cloned() {
-            if previous_state.groups == normalized_groups
+            if since.is_none()
+                && previous_state.groups == normalized_groups
                 && previous_state.subscriptions == subscriptions
             {
                 return Ok(());
@@ -619,6 +620,37 @@ mod tests {
         let state = accounts.get(&pubkey).unwrap();
         assert_eq!(state.groups, groups);
         assert_eq!(state.subscriptions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_account_same_specs_with_since_forces_refresh() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [14; 16]);
+        let pubkey = Keys::generate().public_key();
+        let relay = RelayUrl::parse("wss://same-spec-refresh.invalid").unwrap();
+        let groups = vec![GroupSubscriptionSpec {
+            group_id: "stable-group".to_string(),
+            relays: vec![relay],
+        }];
+        let subscriptions = GroupPlane::build_relay_set_subscriptions(&groups);
+        plane.accounts.write().await.insert(
+            pubkey,
+            GroupAccountState {
+                groups: groups.clone(),
+                subscriptions,
+            },
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            plane.update_account(pubkey, &groups, Some(Timestamp::now())),
+        )
+        .await;
+
+        assert!(
+            !matches!(result, Ok(Ok(()))),
+            "same-spec catch-up update with since must attempt a subscription refresh"
+        );
     }
 
     #[tokio::test]
