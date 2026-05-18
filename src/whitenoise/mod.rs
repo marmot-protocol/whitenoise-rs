@@ -1378,17 +1378,20 @@ impl Whitenoise {
             "Initiating bounded shutdown before local data wipe"
         );
 
-        if timeout(
+        match timeout(
             Self::remaining_delete_grace(deadline),
             self.shutdown_event_processing(),
         )
         .await
-        .is_err()
         {
-            tracing::warn!(
-                target: "whitenoise::delete_all_data",
-                "Timed out while signalling event processor shutdown; continuing with delete"
-            );
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                tracing::warn!(
+                    target: "whitenoise::delete_all_data",
+                    "Timed out while signalling event processor shutdown; continuing with delete"
+                );
+            }
         }
 
         self.shutdown_scheduled_tasks_for_delete(deadline).await;
