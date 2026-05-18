@@ -1,0 +1,483 @@
+{
+  "blocks": [
+    {
+      "Heading": {
+        "level": 1,
+        "inlines": [
+          {
+            "Text": "Bare URLs"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "All six recognized schemes, bare (no "
+          },
+          {
+            "Code": "<>"
+          },
+          {
+            "Text": "):"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "https: "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "https://example.com/path?q=1",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "http: "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "http://example.com",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "mailto: "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "mailto:foo@bar.com",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "tel: "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "tel:+15551234567",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "whitenoise: "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "whitenoise://group/abc",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "whitenoise-staging: "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "whitenoise-staging://group/abc",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Mid-sentence: see "
+          },
+          {
+            "Autolink": {
+              "url": "https://example.com",
+              "kind": "Uri"
+            }
+          },
+          {
+            "Text": " for details."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Trailing-punct stripping: visit "
+          },
+          {
+            "Autolink": {
+              "url": "https://example.com",
+              "kind": "Uri"
+            }
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Trailing-punct cluster: really?! "
+          },
+          {
+            "Autolink": {
+              "url": "https://example.com",
+              "kind": "Uri"
+            }
+          },
+          {
+            "Text": "?!"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Balanced parens kept: see "
+          },
+          {
+            "Autolink": {
+              "url": "https://en.wikipedia.org/wiki/Foo_(bar)",
+              "kind": "Uri"
+            }
+          },
+          {
+            "Text": " — note the closing paren stays."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Unbalanced paren stripped: (see "
+          },
+          {
+            "Autolink": {
+              "url": "https://example.com",
+              "kind": "Uri"
+            }
+          },
+          {
+            "Text": ")."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Word-internal stays literal: xhttps://example.com."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Opaque whitenoise stays literal: whitenoise:foo."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Bare "
+          },
+          {
+            "Code": "nostr:"
+          },
+          {
+            "Text": " URI uses the structured path:"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "NostrUri": {
+                        "hrp": "Nevent",
+                        "bech32": "nevent1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Inside emphasis: "
+          },
+          {
+            "Emph": [
+              {
+                "Autolink": {
+                  "url": "https://example.com",
+                  "kind": "Uri"
+                }
+              }
+            ]
+          },
+          {
+            "Text": " and "
+          },
+          {
+            "Strong": [
+              {
+                "Autolink": {
+                  "url": "https://example.com",
+                  "kind": "Uri"
+                }
+              }
+            ]
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "In a list:"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "click "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "https://example.com",
+                        "kind": "Uri"
+                      }
+                    },
+                    {
+                      "Text": " to continue"
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "or "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "mailto:help@example.com",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "deep link: "
+                    },
+                    {
+                      "Autolink": {
+                        "url": "whitenoise://thread/xyz",
+                        "kind": "Uri"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "In a blockquote:"
+          }
+        ]
+      }
+    },
+    {
+      "BlockQuote": {
+        "blocks": [
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "visit "
+                },
+                {
+                  "Autolink": {
+                    "url": "https://example.com",
+                    "kind": "Uri"
+                  }
+                },
+                {
+                  "Text": " when ready"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Angle-bracket form still works for any scheme: "
+          },
+          {
+            "Autolink": {
+              "url": "ftp://example.com/file",
+              "kind": "Uri"
+            }
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    }
+  ]
+}

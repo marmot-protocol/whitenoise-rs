@@ -45,7 +45,7 @@ impl TestCase for ResolveUserKnownMetadataNoRefreshTestCase {
 
         context.whitenoise.create_identity().await?;
 
-        let client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+        let client = create_test_client(&context.discovery_relays, self.test_keys.clone()).await?;
 
         let initial_event_id = *client
             .send_event_builder(EventBuilder::metadata(&self.initial_metadata))

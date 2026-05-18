@@ -199,7 +199,8 @@ async fn collect_notifications_inner(
     // Step 1: Ensure Whitenoise is initialized (no-op if warm, background-safe
     // boot if cold). The background-safe cold path defers startup subscription
     // setup until after this function subscribes to notification updates below.
-    let whitenoise = Whitenoise::ensure_initialized_for_background_notifications(config).await?;
+    let (whitenoise, cold_start) =
+        Whitenoise::ensure_initialized_for_background_notifications(config).await?;
 
     // Step 2: Subscribe to notification broadcast BEFORE refreshing subscriptions.
     // This ordering is critical — events processed after ensure_all_subscriptions()
@@ -221,13 +222,14 @@ async fn collect_notifications_inner(
         target: "whitenoise::background_notifications",
         init_ms = init_elapsed.as_millis() as u64,
         drain_budget_ms = drain_budget.as_millis() as u64,
+        cold_start,
         "Subscriptions refreshed, starting collection window"
     );
 
     // Step 4: Collect notifications with quiet-window + hard deadline +
     // size cap (MAX_COLLECTED). Uses the *remaining* budget after init so
     // the total call stays within `max_wait`.
-    let collected = drain_notifications(&mut rx, drain_budget).await;
+    let collected = drain_notifications(&mut rx, drain_budget, cold_start).await;
 
     tracing::info!(
         target: "whitenoise::background_notifications",
@@ -253,6 +255,7 @@ async fn collect_notifications_inner(
 async fn drain_notifications(
     rx: &mut broadcast::Receiver<NotificationUpdate>,
     max_wait: Duration,
+    cold_start: bool,
 ) -> Vec<NotificationUpdate> {
     let deadline = Instant::now() + max_wait;
     let mut collected = Vec::with_capacity(MAX_COLLECTED);
@@ -268,7 +271,7 @@ async fn drain_notifications(
             break;
         }
 
-        let wait_window = if collected.is_empty() {
+        let wait_window = if collected.is_empty() && cold_start {
             DEFAULT_FIRST_NOTIFICATION_WINDOW
         } else {
             DEFAULT_QUIET_WINDOW
@@ -446,7 +449,7 @@ mod tests {
         }
 
         // Generous deadline — we want the cap, not the deadline, to stop us.
-        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
 
         assert_eq!(
             collected.len(),
@@ -469,7 +472,7 @@ mod tests {
             .expect("send should succeed while rx is alive");
         }
 
-        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
         assert_eq!(collected.len(), 5);
     }
 
@@ -478,7 +481,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(16);
         drop(tx);
 
-        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
 
         assert!(collected.is_empty());
     }
@@ -498,7 +501,7 @@ mod tests {
         .expect("send should succeed while rx is alive");
         drop(tx);
 
-        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), true).await;
 
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].content, "latest notification");
@@ -516,10 +519,21 @@ mod tests {
             .expect("send should succeed while rx is alive");
         });
 
-        let collected = drain_notifications(&mut rx, Duration::from_secs(5)).await;
+        let collected = drain_notifications(&mut rx, Duration::from_secs(5), true).await;
 
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].content, "late first notification");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_warm_start_uses_quiet_window_for_first_notification() {
+        let (_tx, mut rx) = broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60), false).await;
+
+        assert!(collected.is_empty());
+        assert_eq!(tokio::time::Instant::now() - started, DEFAULT_QUIET_WINDOW);
     }
 
     #[tokio::test(start_paused = true)]
@@ -539,7 +553,7 @@ mod tests {
             .expect("send should succeed while rx is alive");
         }
 
-        let collected = drain_notifications(&mut rx, Duration::ZERO).await;
+        let collected = drain_notifications(&mut rx, Duration::ZERO, true).await;
         assert_eq!(collected.len(), 0, "zero budget must not drain any events");
     }
 

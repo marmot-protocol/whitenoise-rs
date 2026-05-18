@@ -59,7 +59,7 @@ impl TestCase for CreateGroupTestCase {
                     None, // image_hash
                     None, // image_key
                     None, // image_nonce
-                    context.test_relays(),
+                    context.default_account_relay_urls(),
                     admin_pubkeys,
                     None,
                 ),

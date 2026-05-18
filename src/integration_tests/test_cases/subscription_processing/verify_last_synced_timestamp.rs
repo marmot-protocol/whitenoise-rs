@@ -96,7 +96,7 @@ impl VerifyLastSyncedTimestampTestCase {
         let account = context.whitenoise.find_account_by_pubkey(&pubkey).await?;
         let nsec = context.whitenoise.export_account_nsec(&account).await?;
         let keys = Keys::parse(&nsec)?;
-        let client = create_test_client(&context.dev_relays, keys.clone()).await?;
+        let client = create_test_client(&context.discovery_relays, keys.clone()).await?;
         let contact = Keys::generate().public_key();
 
         let tags = vec![Tag::custom(TagKind::p(), [contact.to_hex()])];
@@ -118,7 +118,7 @@ impl VerifyLastSyncedTimestampTestCase {
         event_timestamp: Timestamp,
     ) -> Result<(), WhitenoiseError> {
         let keys = Keys::generate();
-        let client = create_test_client(&context.dev_relays, keys.clone()).await?;
+        let client = create_test_client(&context.discovery_relays, keys.clone()).await?;
         let metadata = Metadata {
             name: Some("Test metadata for sync verification".to_string()),
             ..Default::default()

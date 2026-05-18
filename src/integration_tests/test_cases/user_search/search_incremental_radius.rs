@@ -49,7 +49,7 @@ impl TestCase for SearchIncrementalRadiusTestCase {
         let target_name = "IncrTarget";
 
         // Publish TargetUser's metadata to relays
-        let target_client = create_test_client(&context.dev_relays, target_keys).await?;
+        let target_client = create_test_client(&context.discovery_relays, target_keys).await?;
         publish_test_metadata(&target_client, target_name, "Incremental radius target").await?;
         target_client.disconnect().await;
         tracing::info!(
@@ -58,7 +58,8 @@ impl TestCase for SearchIncrementalRadiusTestCase {
         );
 
         // Publish MiddleUser's metadata and follow list (pointing to TargetUser)
-        let middle_client = create_test_client(&context.dev_relays, middle_keys.clone()).await?;
+        let middle_client =
+            create_test_client(&context.discovery_relays, middle_keys.clone()).await?;
         publish_test_metadata(&middle_client, "IncrMiddle", "Connects searcher to target").await?;
         publish_follow_list(&middle_client, &[target_pubkey]).await?;
         middle_client.disconnect().await;

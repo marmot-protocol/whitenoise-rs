@@ -22,7 +22,6 @@ use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 
-use crate::nostr_manager::parser::Parser;
 use crate::perf_span;
 use crate::whitenoise::media_files::MediaFile;
 
@@ -53,7 +52,7 @@ impl MessageAggregator {
     /// Fetch and aggregate messages for a specific group
     /// This is the main entry point that handles the complete pipeline:
     /// 1. Fetch raw messages from mdk
-    /// 2. Parse content tokens for each message
+    /// 2. Parse the markdown AST for each message
     /// 3. Aggregate reactions, replies, and deletions
     /// 4. Return structured ChatMessage objects
     ///
@@ -61,14 +60,12 @@ impl MessageAggregator {
     /// * `pubkey` - The public key of the user requesting messages (for account access)
     /// * `group_id` - The group to fetch and aggregate messages for
     /// * `messages` - The raw messages to process (from mdk.get_messages())
-    /// * `parser` - Reference to the nostr parser for tokenizing message content
     /// * `media_files` - Vector of MediaFile records for linking media to messages
     pub async fn aggregate_messages_for_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
         messages: Vec<Message>,
-        parser: &dyn Parser,
         media_files: Vec<MediaFile>,
     ) -> Result<Vec<ChatMessage>, ProcessingError> {
         let _span = perf_span!("aggregator::aggregate_messages_for_group");
@@ -82,7 +79,7 @@ impl MessageAggregator {
         }
 
         // Use the processor module to handle the actual processing
-        processor::process_messages(messages, parser, &self.config, media_files).await
+        processor::process_messages(messages, &self.config, media_files).await
     }
 
     /// Process a single message (kind 9) into a ChatMessage
@@ -90,12 +87,10 @@ impl MessageAggregator {
     ///
     /// # Arguments
     /// * `message` - The raw message to process (must be kind 9)
-    /// * `parser` - Reference to the nostr parser for tokenizing message content
     /// * `media_files` - Vector of MediaFile records for linking media to this message
     pub(crate) async fn process_single_message(
         &self,
         message: &Message,
-        parser: &dyn Parser,
         media_files: Vec<MediaFile>,
     ) -> Result<ChatMessage, ProcessingError> {
         let _span = perf_span!("aggregator::process_single_message");
@@ -112,7 +107,7 @@ impl MessageAggregator {
             .collect();
 
         // Process the message using the core processor logic
-        processor::process_regular_message(message, parser, &media_files_map).await
+        processor::process_regular_message(message, &media_files_map).await
     }
 
     /// Get the current configuration

@@ -27,25 +27,20 @@ impl TestCase for LoginCustomRelayTestCase {
         let keys = Keys::generate();
         let expected_pubkey = keys.public_key();
 
-        // In the test environment we have two local relays.
-        // Publish relay lists only on the SECOND relay so that login_start
-        // (which queries default relays) won't find them on the first attempt
-        // if there were separate pools. In practice with local Docker relays
-        // both relays are defaults, so we publish to a specific one and then
-        // use it as the "custom" relay.
-        //
-        // Since the test Docker environment has ws://localhost:8080 and
-        // ws://localhost:7777, we publish to the second relay and use it as
-        // the custom search target.
-        let custom_relay = if context.dev_relays.len() > 1 {
-            context.dev_relays[1]
-        } else {
-            context.dev_relays[0]
-        };
+        // login_start queries the configured default-account relays; pick a
+        // distinct one as the "custom" relay so we exercise the custom-relay
+        // path when there is more than one configured. Falls back to the
+        // first entry when only one default-account relay is configured.
+        let custom_relay = context
+            .default_account_relays
+            .get(1)
+            .or_else(|| context.default_account_relays.first())
+            .cloned()
+            .expect("test requires at least one configured default-account relay");
 
-        let test_client = create_test_client(&[custom_relay], keys.clone()).await?;
-        let relay_urls = vec![custom_relay.to_string()];
-        publish_relay_lists(&test_client, relay_urls).await?;
+        let publish_relays = vec![custom_relay.clone()];
+        let test_client = create_test_client(&publish_relays, keys.clone()).await?;
+        publish_relay_lists(&test_client, publish_relays).await?;
         test_client.disconnect().await;
 
         // Step 1: login_start -- since the relay lists exist on a relay that
@@ -73,7 +68,7 @@ impl TestCase for LoginCustomRelayTestCase {
         }
 
         // Step 2: Provide the custom relay where lists are published.
-        let custom_relay_url = RelayUrl::parse(custom_relay)?;
+        let custom_relay_url = RelayUrl::parse(&custom_relay)?;
         let result = context
             .whitenoise
             .login_with_custom_relay(&expected_pubkey, custom_relay_url)
