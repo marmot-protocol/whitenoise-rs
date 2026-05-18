@@ -436,7 +436,9 @@ mod tests {
         account: &crate::whitenoise::accounts::Account,
         relays: &[Relay],
     ) -> Result<EventId, crate::whitenoise::error::WhitenoiseError> {
-        let key_package_data = whitenoise.encoded_key_package(account, relays).await?;
+        let key_package_data = whitenoise
+            .encoded_key_package(account, relays, None)
+            .await?;
 
         let nsec = whitenoise.export_account_nsec(account).await?;
         let secret_key =
