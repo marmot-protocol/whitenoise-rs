@@ -86,3 +86,87 @@ impl PublishedKeyPackagesRepo {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::{Keys, Kind};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    async fn setup() -> (PublishedKeyPackagesRepo, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let pubkey = Keys::generate().public_key();
+        let db = Arc::new(
+            AccountDatabase::new(pubkey, dir.path().join("acct.db"))
+                .await
+                .unwrap(),
+        );
+        // Matches the project-wide account-DB test pattern: stamp the schema
+        // directly because `AccountDatabase::new` uses `open_without_migrations`
+        // and running the full migration timeline here would require wiring
+        // a shared pool. NOTE: the CREATE TABLE below must stay in sync with
+        // `fresh_account_schema.sql`; until a `setup_account_db_with_migrations`
+        // helper exists, divergence here will silently mask production drift.
+        sqlx::query("DROP TABLE IF EXISTS published_key_packages")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE published_key_packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_package_hash_ref BLOB NOT NULL,
+                event_id TEXT NOT NULL UNIQUE,
+                kind INTEGER NOT NULL DEFAULT 443,
+                d_tag TEXT NULL,
+                consumed_at INTEGER,
+                key_material_deleted INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )",
+        )
+        .execute(&db.inner.pool)
+        .await
+        .unwrap();
+        (PublishedKeyPackagesRepo::new(db), dir)
+    }
+
+    /// Regression: `mark_key_material_deleted(id)` clears the flag for a single
+    /// row identified by primary key, NOT by hash_ref. The companion
+    /// `mark_key_material_deleted_by_hash_ref` is the hash-scoped variant.
+    /// This is the contrapositive of PR #822: a future refactor that
+    /// "fixes consistency" by accidentally hash_ref-scoping the by-id variant
+    /// must trip this test.
+    #[tokio::test]
+    async fn mark_key_material_deleted_by_id_flips_one_row_only() {
+        let (repo, _dir) = setup().await;
+        let hash_ref = b"hash_id_scoped";
+
+        repo.create(hash_ref, "evt_a_id", Kind::Custom(30443), Some("d"))
+            .await
+            .unwrap();
+        repo.create(hash_ref, "evt_b_id", Kind::Custom(443), None)
+            .await
+            .unwrap();
+
+        // Resolve the canonical row's id and flip only it.
+        let canonical = repo
+            .find_by_event_id("evt_a_id")
+            .await
+            .unwrap()
+            .expect("must exist");
+        repo.mark_key_material_deleted(canonical.id).await.unwrap();
+
+        let twins = repo.find_by_hash_ref(hash_ref).await.unwrap();
+        assert_eq!(twins.len(), 2);
+        let deleted_kinds: Vec<i64> = twins
+            .iter()
+            .filter(|t| t.key_material_deleted)
+            .map(|t| t.kind)
+            .collect();
+        assert_eq!(
+            deleted_kinds,
+            vec![30443_i64],
+            "by-id variant must only flip the canonical row"
+        );
+    }
+}

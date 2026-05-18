@@ -94,3 +94,75 @@ impl GroupPushTokensRepo {
         .await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::Keys;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn make_group_id(byte: u8) -> GroupId {
+        GroupId::from_slice(&[byte; 32])
+    }
+
+    async fn setup() -> (GroupPushTokensRepo, PublicKey, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let pubkey = Keys::generate().public_key();
+        let db = Arc::new(
+            AccountDatabase::new(pubkey, dir.path().join("acct.db"))
+                .await
+                .unwrap(),
+        );
+        // Matches the project-wide account-DB test pattern: stamp the schema
+        // directly because `AccountDatabase::new` uses `open_without_migrations`
+        // and running the full migration timeline here would require wiring
+        // a shared pool. NOTE: the CREATE TABLE below must stay in sync with
+        // `fresh_account_schema.sql`; until a `setup_account_db_with_migrations`
+        // helper exists, divergence here will silently mask production drift.
+        sqlx::query("DROP TABLE IF EXISTS group_push_tokens")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE group_push_tokens (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                mls_group_id    BLOB NOT NULL,
+                member_pubkey   TEXT NOT NULL,
+                leaf_index      INTEGER NOT NULL CHECK (leaf_index >= 0),
+                server_pubkey   TEXT NOT NULL,
+                relay_hint      TEXT,
+                encrypted_token TEXT NOT NULL CHECK (
+                    length(trim(encrypted_token, ' ' || char(9) || char(10) || char(13))) > 0
+                ),
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                UNIQUE(mls_group_id, leaf_index)
+            )",
+        )
+        .execute(&db.inner.pool)
+        .await
+        .unwrap();
+        (GroupPushTokensRepo::new(pubkey, db), pubkey, dir)
+    }
+
+    /// The wrapper's only added behavior is binding `account_pubkey` to the
+    /// returned record. Inner [`GroupPushToken`] tests cover the SQL semantics.
+    #[tokio::test]
+    async fn upsert_binds_repo_account_pubkey_to_returned_token() {
+        let (repo, account_pubkey, _dir) = setup().await;
+        let group_id = make_group_id(2);
+        let member = Keys::generate().public_key();
+        let server = Keys::generate().public_key();
+        let hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        let inserted = repo
+            .upsert(&group_id, &member, 0, &server, Some(&hint), "ENCRYPTED")
+            .await
+            .unwrap();
+        assert_eq!(
+            inserted.account_pubkey, account_pubkey,
+            "upsert must bind the repo's account_pubkey to the returned token"
+        );
+    }
+}

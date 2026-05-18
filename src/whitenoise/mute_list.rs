@@ -89,6 +89,28 @@ mod tests {
         );
     }
 
+    /// Self-block guard: `block_user(self.pubkey)` must return `Ok(())`
+    /// without inserting a row (`session/mute_list.rs:48-50`). Without the
+    /// guard, the publish path would put the account's own pubkey in its own
+    /// NIP-51 mute list and the block emit would fire against the account
+    /// itself — both observable in the UI as nonsense state.
+    #[tokio::test]
+    async fn block_user_self_block_is_no_op() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+
+        let result = session.mute_list().block_user(&account.pubkey).await;
+        assert!(result.is_ok(), "block_user on self must return Ok");
+
+        assert!(
+            !MuteListEntry::exists(&account.pubkey, &session.account_db)
+                .await
+                .unwrap(),
+            "self-block must not insert a mute-list entry"
+        );
+    }
+
     #[tokio::test]
     async fn unblock_user_returns_ok_if_not_blocked() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;

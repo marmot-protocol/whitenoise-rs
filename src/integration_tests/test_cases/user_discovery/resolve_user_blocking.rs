@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use nostr_sdk::{EventId, Keys, Metadata, RelayUrl};
 
@@ -22,7 +24,6 @@ pub struct ResolveUserBlockingTestCase {
     should_have_metadata: bool,
     should_have_relays: bool,
     test_metadata: Option<Metadata>,
-    test_relays: Vec<RelayUrl>,
 }
 
 impl ResolveUserBlockingTestCase {
@@ -33,7 +34,6 @@ impl ResolveUserBlockingTestCase {
             should_have_metadata: false,
             should_have_relays: false,
             test_metadata: None,
-            test_relays: vec![],
         }
     }
 
@@ -49,21 +49,7 @@ impl ResolveUserBlockingTestCase {
     }
 
     pub fn with_relays(mut self) -> Self {
-        let test_relays = if cfg!(debug_assertions) {
-            vec![
-                RelayUrl::parse("ws://localhost:8080").unwrap(),
-                RelayUrl::parse("ws://localhost:7777").unwrap(),
-            ]
-        } else {
-            vec![
-                RelayUrl::parse("wss://relay.damus.io").unwrap(),
-                RelayUrl::parse("wss://relay.primal.net").unwrap(),
-                RelayUrl::parse("wss://nos.lol").unwrap(),
-            ]
-        };
-
         self.should_have_relays = true;
-        self.test_relays = test_relays;
         self
     }
 
@@ -71,7 +57,8 @@ impl ResolveUserBlockingTestCase {
         &self,
         context: &ScenarioContext,
     ) -> Result<EventId, WhitenoiseError> {
-        let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+        let test_client =
+            create_test_client(&context.discovery_relays, self.test_keys.clone()).await?;
 
         let metadata = self
             .test_metadata
@@ -87,12 +74,16 @@ impl ResolveUserBlockingTestCase {
         Ok(event_id)
     }
 
-    async fn publish_relays_data(&self, context: &ScenarioContext) -> Result<(), WhitenoiseError> {
-        let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+    async fn publish_relays_data(
+        &self,
+        context: &ScenarioContext,
+        published_relays: &[String],
+    ) -> Result<(), WhitenoiseError> {
+        let test_client =
+            create_test_client(&context.discovery_relays, self.test_keys.clone()).await?;
 
         tracing::info!(target: LOG_TARGET, "Publishing test relay list for test pubkey");
-        let relay_urls: Vec<String> = self.test_relays.iter().map(|url| url.to_string()).collect();
-        publish_relay_lists(&test_client, relay_urls).await?;
+        publish_relay_lists(&test_client, published_relays.to_vec()).await?;
 
         test_client.disconnect().await;
         Ok(())
@@ -108,6 +99,13 @@ impl TestCase for ResolveUserBlockingTestCase {
             "Testing resolve_user_blocking for pubkey: {}",
             test_pubkey
         );
+
+        // The user's published NIP-65 payload lists the configured
+        // `default_account_relays`. Both sides of the post-resolution assertion
+        // derive from the same source so the invariant remains "the user has
+        // exactly the relays we published".
+        let published_relays = context.default_account_relays.clone();
+
         let user_exists = context
             .whitenoise
             .find_user_by_pubkey(&test_pubkey)
@@ -123,7 +121,7 @@ impl TestCase for ResolveUserBlockingTestCase {
         if self.should_have_metadata {
             let metadata_event_id = self.publish_metadata(context).await?;
             let metadata_client =
-                create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+                create_test_client(&context.discovery_relays, self.test_keys.clone()).await?;
             wait_for_latest_metadata_event(
                 &metadata_client,
                 test_pubkey,
@@ -135,10 +133,10 @@ impl TestCase for ResolveUserBlockingTestCase {
         }
 
         if self.should_have_relays {
-            self.publish_relays_data(context).await?;
+            self.publish_relays_data(context, &published_relays).await?;
 
             let relay_client =
-                create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+                create_test_client(&context.discovery_relays, self.test_keys.clone()).await?;
             wait_for_relay_list_indexed(&relay_client, test_pubkey).await?;
             relay_client.disconnect().await;
         }
@@ -215,14 +213,21 @@ impl TestCase for ResolveUserBlockingTestCase {
                 )
                 .await?;
 
-            let relay_urls: Vec<&RelayUrl> = user_relays.iter().map(|r| &r.url).collect();
-            for expected_relay in &self.test_relays {
-                assert!(
-                    relay_urls.contains(&expected_relay),
-                    "User should have relay {} that was published",
-                    expected_relay
-                );
-            }
+            let expected: HashSet<RelayUrl> = published_relays
+                .iter()
+                .map(|s| {
+                    RelayUrl::parse(s).map_err(|e| {
+                        WhitenoiseError::Internal(format!(
+                            "Invalid relay URL in default_account_relays: {s} ({e})"
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let actual: HashSet<RelayUrl> = user_relays.iter().map(|r| r.url.clone()).collect();
+            assert_eq!(
+                actual, expected,
+                "stored NIP-65 relay set should exactly match the published set"
+            );
 
             tracing::info!(
                 target: LOG_TARGET,

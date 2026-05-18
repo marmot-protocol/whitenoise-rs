@@ -151,6 +151,13 @@ pub struct WhitenoiseConfig {
 
     /// Configured discovery relays for the relay-control discovery plane.
     pub discovery_relays: Vec<RelayUrl>,
+
+    /// Relay URLs adopted as a freshly-created account's NIP-65, Inbox, and
+    /// KeyPackage lists when no existing relay-list events are found on the
+    /// network. Seeded from [`Relay::defaults`]; override with
+    /// [`Self::with_default_account_relays`] for benchmarks or private
+    /// (non-public-relay) deployments.
+    pub default_account_relays: Vec<RelayUrl>,
 }
 
 impl WhitenoiseConfig {
@@ -175,6 +182,7 @@ impl WhitenoiseConfig {
             #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
+            default_account_relays: Relay::urls(&Relay::defaults()),
         }
     }
 
@@ -201,11 +209,22 @@ impl WhitenoiseConfig {
             #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
+            default_account_relays: Relay::urls(&Relay::defaults()),
         }
     }
 
     pub fn with_discovery_relays(mut self, discovery_relays: Vec<RelayUrl>) -> Self {
         self.discovery_relays = discovery_relays;
+        self
+    }
+
+    /// Override the relay URLs adopted as a freshly-created account's NIP-65,
+    /// Inbox, and KeyPackage lists when the network has no existing relay-list
+    /// events for the account. Production callers should almost never set this
+    /// — it is intended for benchmarks and private (non-public-relay)
+    /// deployments where the public defaults are inappropriate.
+    pub fn with_default_account_relays(mut self, default_account_relays: Vec<RelayUrl>) -> Self {
+        self.default_account_relays = default_account_relays;
         self
     }
 
@@ -699,12 +718,32 @@ impl Whitenoise {
     /// This is the authoritative constructor: it sets up data and log
     /// directories, initializes logging and the database, seeds default
     /// relays and settings, spawns the event-processing loop, scheduled
-    /// tasks, discovery sync worker, and session subscriptions.
+    /// tasks, and the discovery sync worker.
+    ///
+    /// **Relay-bound init is performed asynchronously and continues after
+    /// this function returns.** Two background tasks are spawned: one brings
+    /// the discovery plane online (connecting to the configured discovery
+    /// relays and warming the ephemeral pool against the same URLs); the
+    /// other ensures per-account inbox / group-plane subscriptions are
+    /// operational and signals the discovery sync worker. Callers that need
+    /// synchronously-live subscriptions (for example, the iOS background-push
+    /// path) must call [`Self::ensure_all_subscriptions`] before depending on
+    /// inbound event delivery — the existing FFI entry point in
+    /// [`crate::whitenoise::background_notifications`] already does this.
+    ///
+    /// Operations that read or publish through the discovery plane
+    /// (`fetch_user_relays`, the discovery sync worker's own rebuild, etc.)
+    /// will lazy-connect on first use if the background task has not yet
+    /// completed, so no caller has to wait explicitly. The
+    /// `subscription_health_check` scheduled task is the recovery safety net
+    /// for any transient relay failure within either deferred task.
     ///
     /// Callers own the returned `Arc` for the lifetime of the process (or the
     /// test) and drop it to tear the instance down. Sessions and event
     /// handlers receive their own `Arc<Whitenoise>` clones internally via the
-    /// weak self-reference stamped at construction.
+    /// weak self-reference stamped at construction. Both deferred tasks are
+    /// registered with the background-task pool, so [`Self::shutdown`] waits
+    /// for them to complete before returning.
     #[perf_instrument("whitenoise")]
     pub async fn new(mut config: WhitenoiseConfig) -> Result<Arc<Self>> {
         init_timing::start();
@@ -830,10 +869,12 @@ impl Whitenoise {
 
         init_timing::record("core_services");
 
-        // Create default relays in the database if they don't exist
-        // TODO: Make this batch fetch and insert all relays at once
-        for relay in Relay::defaults() {
-            let _ = whitenoise.find_or_create_relay_by_url(&relay.url).await?;
+        // Seed the relays table with the configured default-account relays so
+        // a private-relay deployment does not carry stale rows for relays it
+        // never uses. The discovery plane owns its own relay set elsewhere.
+        // TODO: Make this batch fetch and insert all relays at once.
+        for url in &whitenoise.config().default_account_relays {
+            let _ = whitenoise.find_or_create_relay_by_url(url).await?;
         }
 
         // Create default app settings in the database if they don't exist
@@ -841,13 +882,31 @@ impl Whitenoise {
 
         init_timing::record("database_seeding");
 
-        whitenoise
-            .shared
-            .relay_control
-            .start_discovery_plane()
-            .await?;
+        // Two invariants make deferring the discovery-plane start safe:
+        //   1. No init step below (`restore_sessions`,
+        //      `sync_message_cache_on_startup`, `backfill_dm_peer_pubkeys`,
+        //      the worker spawns) touches the discovery plane. Preserve this
+        //      when adding steps here.
+        //   2. The deferred subscription setup signals the discovery worker,
+        //      whose `sync_discovery_subscriptions` itself calls
+        //      `discovery.start()`. Both paths converge on
+        //      `ensure_relays_connected`, which is idempotent at the
+        //      relay-client layer.
+        {
+            let wn = Arc::clone(&whitenoise);
+            whitenoise
+                .spawn_background(async move {
+                    if let Err(error) = wn.shared.relay_control.start_discovery_plane().await {
+                        tracing::warn!(
+                            target: "whitenoise::new",
+                            "Background discovery-plane start failed: {error}"
+                        );
+                    }
+                })
+                .await;
+        }
 
-        init_timing::record("discovery_plane");
+        init_timing::record("discovery_plane_spawned");
 
         // Restore account sessions before any startup step that resolves a
         // session by pubkey. `sync_message_cache_on_startup` reads per-account
@@ -934,10 +993,26 @@ impl Whitenoise {
 
         init_timing::record("background_tasks");
 
-        // Fetch events and setup subscriptions after event processing has started
-        whitenoise.setup_all_subscriptions().await?;
+        // `ensure_all_subscriptions` is the right primitive here (not
+        // `setup_all_subscriptions`): it checks per-account operational state
+        // and skips accounts whose subscriptions were already set up by a
+        // concurrent `login` / `create_identity`, so this composes safely with
+        // any account-creation work that runs after `Whitenoise::new` returns.
+        {
+            let wn = Arc::clone(&whitenoise);
+            whitenoise
+                .spawn_background(async move {
+                    if let Err(error) = wn.ensure_all_subscriptions().await {
+                        tracing::warn!(
+                            target: "whitenoise::new",
+                            "Background subscription setup failed: {error}"
+                        );
+                    }
+                })
+                .await;
+        }
 
-        init_timing::record("subscription_setup");
+        init_timing::record("subscription_setup_spawned");
 
         tracing::debug!(
             target: "whitenoise::new",
@@ -1459,18 +1534,24 @@ pub mod test_utils {
     ///   - `mpsc::Receiver<ProcessableEvent>`: The event receiver paired with the instance sender
     ///   - `TempDir`: The temporary directory for data storage
     ///   - `TempDir`: The temporary directory for log storage
-    async fn create_mock_whitenoise_internal() -> (
+    async fn create_mock_whitenoise_internal_with<F>(
+        customize: F,
+    ) -> (
         Arc<Whitenoise>,
         mpsc::Receiver<ProcessableEvent>,
         TempDir,
         TempDir,
-    ) {
+    )
+    where
+        F: FnOnce(WhitenoiseConfig) -> WhitenoiseConfig,
+    {
         Whitenoise::initialize_mock_keyring_store();
 
         // Wait for local relays to be ready in test environment
         wait_for_test_relays().await;
 
         let (config, data_temp, logs_temp) = create_test_config();
+        let config = customize(config);
 
         // Create directories manually to avoid issues
         std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -1514,8 +1595,20 @@ pub mod test_utils {
     }
 
     pub(crate) async fn create_mock_whitenoise() -> (Arc<Whitenoise>, TempDir, TempDir) {
+        create_mock_whitenoise_with(|config| config).await
+    }
+
+    /// Build a mock Whitenoise with a customised [`WhitenoiseConfig`]. Use when
+    /// a test needs to exercise a non-default config knob (e.g. an overridden
+    /// `default_account_relays`).
+    pub(crate) async fn create_mock_whitenoise_with<F>(
+        customize: F,
+    ) -> (Arc<Whitenoise>, TempDir, TempDir)
+    where
+        F: FnOnce(WhitenoiseConfig) -> WhitenoiseConfig,
+    {
         let (whitenoise, _event_receiver, data_temp, logs_temp) =
-            create_mock_whitenoise_internal().await;
+            create_mock_whitenoise_internal_with(customize).await;
         (whitenoise, data_temp, logs_temp)
     }
 
@@ -2169,6 +2262,33 @@ mod tests {
         }
 
         #[test]
+        fn test_whitenoise_config_default_account_relays_seed() {
+            let data_dir = std::path::Path::new("/test/data");
+            let logs_dir = std::path::Path::new("/test/logs");
+            let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.test.app");
+
+            assert_eq!(
+                config.default_account_relays,
+                Relay::urls(&Relay::defaults()),
+                "fresh config should seed default_account_relays from Relay::defaults()"
+            );
+        }
+
+        #[test]
+        fn test_whitenoise_config_with_default_account_relays_overrides_seed() {
+            let data_dir = std::path::Path::new("/test/data");
+            let logs_dir = std::path::Path::new("/test/logs");
+            let override_urls = vec![
+                RelayUrl::parse("ws://override-relay-a:9999").unwrap(),
+                RelayUrl::parse("ws://override-relay-b:9999").unwrap(),
+            ];
+            let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.test.app")
+                .with_default_account_relays(override_urls.clone());
+
+            assert_eq!(config.default_account_relays, override_urls);
+        }
+
+        #[test]
         fn test_keyring_service_id_normalization_trims_whitespace() {
             let data_dir = std::path::Path::new("/test/data");
             let logs_dir = std::path::Path::new("/test/logs");
@@ -2649,7 +2769,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -2664,7 +2784,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -2730,7 +2850,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -2785,7 +2905,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3190,7 +3310,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3281,7 +3401,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3340,7 +3460,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3395,7 +3515,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3599,7 +3719,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3614,7 +3734,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3831,7 +3951,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -4570,7 +4690,7 @@ mod tests {
                     is_reply: false,
                     reply_to_id: None,
                     is_deleted: false,
-                    content_tokens: vec![],
+                    content_tokens: whitenoise_markdown::Document::default(),
                     reactions: message_aggregator::ReactionSummary::default(),
                     kind: 9,
                     media_attachments: vec![],

@@ -1,5 +1,10 @@
 [workspace]
-members = [".", "crates/whitenoise-macros", "crates/whitenoise-cli"]
+members = [
+    ".",
+    "crates/whitenoise-macros",
+    "crates/whitenoise-cli",
+    "crates/whitenoise-markdown",
+]
 
 [workspace.dependencies]
 mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1", features = [
@@ -17,6 +22,7 @@ chrono = { version = "0.4.40", features = ["serde"] }
 hex = "0.4"
 tracing = "0.1"
 tempfile = "3.19.1"
+whitenoise-markdown = { path = "crates/whitenoise-markdown" }
 
 [package]
 name = "whitenoise"
@@ -99,6 +105,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64ct = "=1.7.3"
 whitenoise-macros = { path = "crates/whitenoise-macros" }
+whitenoise-markdown = { workspace = true }
 tempfile = { workspace = true }
 indicatif = { version = "0.18.3", optional = true }
 

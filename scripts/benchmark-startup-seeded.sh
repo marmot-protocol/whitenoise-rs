@@ -22,7 +22,12 @@ set -euo pipefail
 ITERATIONS="${1:-5}"
 FIXTURE="${2:-./test_fixtures/nostr/jeff_contacts.json}"
 DATA_DIR="./dev/data/startup_bench"
-RELAYS="wss://nos.lol wss://relay.primal.net wss://relay.damus.io"
+# Publish to the local nostr-rs-relay (port 8080) only — strfry on port 7777
+# defaults to maxEventSize = 65 536 bytes and rejects contact lists larger
+# than ~64 KB. The benchmark binary hard-codes both local relays as discovery
+# relays, so an event landing on either one is enough for the warm-init runs
+# to sync follows.
+RELAYS="ws://localhost:8080"
 RUST_LOG_TIMING="warn,whitenoise::init_timing=info"
 RUST_LOG_LOGIN="warn,whitenoise=info"
 
@@ -43,16 +48,23 @@ echo ""
 
 # ---------------------------------------------------------------------------
 # Benchmark phases
+#
+# Every phase that opens an encrypted database wipes "$DATA_DIR" first.
+# The benchmark binary uses an in-memory mock keyring, so the random DB
+# encryption key generated in one process dies with it — reusing the same
+# data dir across processes opens encrypted SQLite files with an empty
+# keyring and fails. Each phase therefore starts from a clean slate it
+# owns the keys for.
 # ---------------------------------------------------------------------------
 
-rm -rf "$DATA_DIR"
-
 echo "=== Cold Init (empty database) ==="
+rm -rf "$DATA_DIR"
 RUST_LOG="$RUST_LOG_TIMING" \
 "${CARGO_BIN[@]}" --data-dir "$DATA_DIR" --logs-dir "$DATA_DIR" --init-only
 
 echo ""
 echo "=== Login (syncing contacts from relays) ==="
+rm -rf "$DATA_DIR"
 RUST_LOG="$RUST_LOG_LOGIN" \
 "${CARGO_BIN[@]}" --data-dir "$DATA_DIR" --logs-dir "$DATA_DIR" --login "$SEC"
 

@@ -999,11 +999,15 @@ async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<Str
         .cloned()
 }
 
-fn cli_group_relay_urls() -> Vec<RelayUrl> {
-    whitenoise::Relay::defaults()
-        .into_iter()
-        .map(|r| r.url)
-        .collect()
+/// Relay URLs adopted by newly-created MLS groups.
+///
+/// Reads the operator-configured `default_account_relays` set so a
+/// private-relay deployment bakes its own relays into newly-created groups
+/// instead of the public bootstrap defaults. The relay set is persisted into
+/// the MLS group config at creation time and is not refreshed on later boots,
+/// so this is the load-bearing decision for the group's lifetime.
+fn cli_group_relay_urls(wn: &Whitenoise) -> Vec<RelayUrl> {
+    wn.config().default_account_relays.clone()
 }
 
 async fn create_group(
@@ -1026,7 +1030,7 @@ async fn create_group(
         None, // image_hash
         None, // image_key
         None, // image_nonce
-        cli_group_relay_urls(),
+        cli_group_relay_urls(wn),
         vec![account.pubkey], // admins — creator only
         None,
     );

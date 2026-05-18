@@ -5660,6 +5660,7 @@ dependencies = [
  "unicode-normalization",
  "webpki-roots 1.0.7",
  "whitenoise-macros",
+ "whitenoise-markdown",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
 ]
@@ -5691,6 +5692,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "whitenoise-markdown"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,7 +1,6 @@
 pub use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 
 use crate::{
-    nostr_manager::parser::ContentParser,
     perf_instrument,
     types::MessageWithTokens,
     whitenoise::{
@@ -296,13 +295,7 @@ impl Whitenoise {
         let processed_messages = self
             .shared
             .message_aggregator
-            .aggregate_messages_for_group(
-                pubkey,
-                group_id,
-                new_events.clone(),
-                &ContentParser::new(),
-                media_files,
-            )
+            .aggregate_messages_for_group(pubkey, group_id, new_events.clone(), media_files)
             .await?;
 
         AggregatedMessage::save_events(
@@ -347,7 +340,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
-            content_tokens: vec![],
+            content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
@@ -433,8 +426,8 @@ mod tests {
         let message_with_tokens = result.unwrap();
         assert_eq!(message_with_tokens.message.content, url_message);
         assert!(
-            !message_with_tokens.tokens.is_empty(),
-            "Expected URL to be parsed as token"
+            !message_with_tokens.tokens.blocks.is_empty(),
+            "Expected URL to be parsed into Markdown blocks"
         );
     }
 
@@ -1936,8 +1929,7 @@ mod tests {
 
         let reaction_tags = Tags::from_list(vec![Tag::parse(vec!["e", &parent.id]).unwrap()]);
         let empty_tokens =
-            serde_json::to_string(&Vec::<crate::nostr_manager::parser::SerializableToken>::new())
-                .unwrap();
+            serde_json::to_string(&whitenoise_markdown::Document::default()).unwrap();
         let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
         let empty_media =
             serde_json::to_string(&Vec::<crate::whitenoise::media_files::MediaFile>::new())
@@ -2024,8 +2016,7 @@ mod tests {
 
         let reaction_tags = Tags::from_list(vec![Tag::parse(vec!["e", &parent.id]).unwrap()]);
         let empty_tokens =
-            serde_json::to_string(&Vec::<crate::nostr_manager::parser::SerializableToken>::new())
-                .unwrap();
+            serde_json::to_string(&whitenoise_markdown::Document::default()).unwrap();
         let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
         let empty_media =
             serde_json::to_string(&Vec::<crate::whitenoise::media_files::MediaFile>::new())

@@ -1,7 +1,6 @@
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
-use crate::nostr_manager::parser::ContentParser;
 use crate::types::MessageWithTokens;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::aggregated_message::AggregatedMessage;
@@ -92,15 +91,14 @@ impl<'a> MessageOpsForGroup<'a> {
 
     // ── Read operations ────────────────────────────────────────────
 
-    /// Fetch raw MLS messages from MDK storage with parsed content tokens.
+    /// Fetch raw MLS messages from MDK storage with parsed Markdown AST.
     pub async fn fetch(&self) -> Result<Vec<MessageWithTokens>> {
-        let parser = ContentParser::new();
         let messages = self.session.mdk.get_messages(self.group_id, None)?;
         Ok(messages
             .iter()
             .map(|m| MessageWithTokens {
                 message: m.clone(),
-                tokens: parser.parse(&m.content),
+                tokens: whitenoise_markdown::parse(&m.content),
             })
             .collect())
     }
@@ -236,7 +234,7 @@ impl<'a> MessageOpsForGroup<'a> {
                     mdk_core::error::Error::MessageNotFound,
                 ))?;
 
-        let tokens = ContentParser::new().parse(&mdk_message.content);
+        let tokens = whitenoise_markdown::parse(&mdk_message.content);
 
         let mut last_message_deleted = false;
         match kind {
@@ -392,7 +390,7 @@ impl<'a> MessageOpsForGroup<'a> {
             .session
             .shared
             .message_aggregator
-            .process_single_message(mdk_message, &ContentParser::new(), media_files)
+            .process_single_message(mdk_message, media_files)
             .await
             .map(|mut msg| {
                 msg.delivery_status = Some(DeliveryStatus::Sending);

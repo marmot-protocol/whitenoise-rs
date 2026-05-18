@@ -45,8 +45,8 @@ impl TestCase for ResolveUserUnknownMetadataNoResultTestCase {
             test_pubkey
         );
 
-        let client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
-        let expected_relays = context.test_relays();
+        let client = create_test_client(&context.discovery_relays, self.test_keys.clone()).await?;
+        let expected_relays = context.discovery_relay_urls();
         let relay_urls = expected_relays
             .iter()
             .map(|relay_url| relay_url.to_string())

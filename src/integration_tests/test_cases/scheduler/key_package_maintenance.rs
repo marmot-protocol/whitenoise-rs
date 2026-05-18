@@ -327,7 +327,7 @@ async fn publish_backdated_key_package(
     let event_id = event.id;
 
     // Create a test client and publish
-    let relay_urls: Vec<&str> = relays.iter().map(|r| r.url.as_str()).collect();
+    let relay_urls: Vec<String> = relays.iter().map(|r| r.url.to_string()).collect();
     let client = create_test_client(&relay_urls, keys).await?;
     client.send_event(&event).await?;
     client.disconnect().await;

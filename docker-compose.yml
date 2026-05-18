@@ -53,6 +53,26 @@ services:
       setup:
         condition: service_completed_successfully
 
+  # Network-latency simulator used by the WAN-latency benchmark recipe.
+  # Profile-gated so `just docker-up` / `docker-down` ignore it; only the
+  # `benchmark-startup-wan` recipe enables it via `--profile latency`.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: ["latency"]
+    ports:
+      - "127.0.0.1:8474:8474" # control API
+      - "127.0.0.1:18080:18080" # → nostr-rs-relay
+      - "127.0.0.1:17777:17777" # → strfry-nostr-relay
+    volumes:
+      - ./dev/toxiproxy.json:/etc/toxiproxy/proxies.json:ro
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/proxies.json"]
+    restart: unless-stopped
+    depends_on:
+      nostr-rs-relay:
+        condition: service_started
+      strfry-nostr-relay:
+        condition: service_started
+
   transponder:
     image: whitenoise-rs-transponder:latest
     build:
@@ -74,7 +94,14 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
     healthcheck:
-      test: ["CMD", "/usr/local/bin/transponder", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
+      test:
+        [
+          "CMD",
+          "/usr/local/bin/transponder",
+          "healthcheck",
+          "--url",
+          "http://127.0.0.1:8080/health",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -33,8 +33,15 @@ impl User {
     /// Fallback order:
     /// 1. User's KeyPackage relays (kind 10051)
     /// 2. User's NIP-65 relays (kind 10002)
-    /// 3. Whitenoise discovery/fallback relays
-    /// 4. Default bootstrap relays from `Relay::defaults()`
+    /// 3. Whitenoise's configured discovery relays
+    ///
+    /// May return an empty vector when the user has no published lists and the
+    /// deployment has no configured discovery relays. Callers must treat this
+    /// as "lookup not possible" — the immediate caller `key_package_lookup`
+    /// maps it to `KeyPackageLookup::NotFound`. This is the correct
+    /// fail-closed behaviour for private-relay deployments; falling back to a
+    /// built-in public default set would leak metadata to public
+    /// infrastructure.
     #[perf_instrument("users")]
     pub async fn key_package_relay_urls(
         &self,
@@ -62,25 +69,15 @@ impl User {
             self.pubkey
         );
 
-        let fallback_relays = shared.fallback_relay_urls().await;
-        if !fallback_relays.is_empty() {
-            return Ok(fallback_relays);
-        }
-
-        tracing::warn!(
-            target: "whitenoise::users::key_package",
-            "User {} has no configured discovery relays available either, trying default relays",
-            self.pubkey
-        );
-
-        Ok(Relay::urls(&Relay::defaults()))
+        Ok(shared.fallback_relay_urls().await)
     }
 
     /// Fetches the user's MLS key package event from relays.
     ///
     /// Relay resolution follows [`key_package_relay_urls`](Self::key_package_relay_urls):
-    /// the user's KeyPackage relays, then NIP-65, then configured discovery
-    /// relays, then default bootstrap relays.
+    /// the user's KeyPackage relays, then NIP-65, then this deployment's
+    /// configured discovery relays. Returns `Ok(None)` when no relays are
+    /// available for the lookup.
     ///
     /// # Arguments
     ///

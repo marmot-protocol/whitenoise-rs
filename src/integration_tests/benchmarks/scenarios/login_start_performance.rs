@@ -54,7 +54,7 @@ impl BenchmarkScenario for LoginStartPerformanceBenchmark {
     async fn setup(&mut self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let config = self.config();
         let total_iterations = (config.iterations + config.warmup_iterations) as usize;
-        let relay_urls: Vec<String> = context.dev_relays.iter().map(|s| s.to_string()).collect();
+        let publish_relays = context.default_account_relays.clone();
 
         tracing::info!(
             "Setting up login-start benchmark: {} iterations",
@@ -65,7 +65,7 @@ impl BenchmarkScenario for LoginStartPerformanceBenchmark {
 
         for i in 0..total_iterations {
             let keys = Keys::generate();
-            let test_client = create_test_client(&context.dev_relays, keys.clone()).await?;
+            let test_client = create_test_client(&publish_relays, keys.clone()).await?;
 
             publish_test_metadata(
                 &test_client,
@@ -75,7 +75,7 @@ impl BenchmarkScenario for LoginStartPerformanceBenchmark {
             .await?;
 
             // Publish all 3 relay lists so login_start finds them
-            publish_relay_lists(&test_client, relay_urls.clone()).await?;
+            publish_relay_lists(&test_client, publish_relays.clone()).await?;
 
             test_client.disconnect().await;
             prepared_keys.push(keys);

@@ -7,18 +7,16 @@
 #[cfg(test)]
 mod integration_tests {
     use super::super::*;
-    use crate::nostr_manager::parser::MockParser;
     use nostr_sdk::prelude::*;
 
     #[tokio::test]
     async fn test_empty_messages_integration() {
         let aggregator = MessageAggregator::new();
-        let parser = MockParser::new();
         let group_id = GroupId::from_slice(&[1; 32]);
         let pubkey = Keys::generate().public_key();
 
         let result = aggregator
-            .aggregate_messages_for_group(&pubkey, &group_id, vec![], &parser, vec![])
+            .aggregate_messages_for_group(&pubkey, &group_id, vec![], vec![])
             .await
             .unwrap();
 
