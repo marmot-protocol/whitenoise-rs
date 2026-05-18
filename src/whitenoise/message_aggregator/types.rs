@@ -4,7 +4,6 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::media_files::MediaFile;
 
 /// Tracks the delivery state of an outgoing message.
@@ -52,8 +51,9 @@ pub struct ChatMessage {
     /// Whether this message has been deleted
     pub is_deleted: bool,
 
-    /// Parsed tokens from the message content (mentions, hashtags, etc.)
-    pub content_tokens: Vec<SerializableToken>,
+    /// Parsed Markdown AST (CommonMark + GFM + nostr extensions) of the message
+    /// content. Empty `Document` when content is empty.
+    pub content_tokens: whitenoise_markdown::Document,
 
     /// Aggregated reactions on this message
     pub reactions: ReactionSummary,

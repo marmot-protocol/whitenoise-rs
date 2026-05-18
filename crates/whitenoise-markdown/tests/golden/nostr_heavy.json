@@ -1,0 +1,384 @@
+{
+  "blocks": [
+    {
+      "Heading": {
+        "level": 1,
+        "inlines": [
+          {
+            "Text": "Nostr Heavy"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Bare mention at start: "
+          },
+          {
+            "NostrMention": {
+              "hrp": "Npub",
+              "bech32": "npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+            }
+          },
+          {
+            "Text": " — followed by text."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Mid-sentence: hello "
+          },
+          {
+            "NostrMention": {
+              "hrp": "Npub",
+              "bech32": "npub1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz"
+            }
+          },
+          {
+            "Text": ", how are you?"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "In parens: ("
+          },
+          {
+            "NostrMention": {
+              "hrp": "Npub",
+              "bech32": "npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+            }
+          },
+          {
+            "Text": ")."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Bare (no "
+          },
+          {
+            "Code": "@"
+          },
+          {
+            "Text": ") at start: "
+          },
+          {
+            "NostrMention": {
+              "hrp": "Npub",
+              "bech32": "npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+            }
+          },
+          {
+            "Text": " — followed by text."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Bare mid-sentence: hello "
+          },
+          {
+            "NostrMention": {
+              "hrp": "Npub",
+              "bech32": "npub1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz"
+            }
+          },
+          {
+            "Text": ", how are you?"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Bare in parens: ("
+          },
+          {
+            "NostrMention": {
+              "hrp": "Npub",
+              "bech32": "npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+            }
+          },
+          {
+            "Text": ")."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "URI forms — all six accepted HRPs:"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "npub: "
+                    },
+                    {
+                      "NostrUri": {
+                        "hrp": "Npub",
+                        "bech32": "npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "note: "
+                    },
+                    {
+                      "NostrUri": {
+                        "hrp": "Note",
+                        "bech32": "note1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "nevent: "
+                    },
+                    {
+                      "NostrUri": {
+                        "hrp": "Nevent",
+                        "bech32": "nevent1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "nprofile: "
+                    },
+                    {
+                      "NostrUri": {
+                        "hrp": "Nprofile",
+                        "bech32": "nprofile1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "naddr: "
+                    },
+                    {
+                      "NostrUri": {
+                        "hrp": "Naddr",
+                        "bech32": "naddr1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "nrelay: "
+                    },
+                    {
+                      "NostrUri": {
+                        "hrp": "Nrelay",
+                        "bech32": "nrelay1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Rejected HRP stays literal: nostr:nsec1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Left-boundary rule rejects "
+          },
+          {
+            "Code": "foo@npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+          },
+          {
+            "Text": " (letter precedes)."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "In a list:"
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": false,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "mention "
+                    },
+                    {
+                      "NostrMention": {
+                        "hrp": "Npub",
+                        "bech32": "npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "uri "
+                    },
+                    {
+                      "NostrUri": {
+                        "hrp": "Note",
+                        "bech32": "note1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "In a blockquote:"
+          }
+        ]
+      }
+    },
+    {
+      "BlockQuote": {
+        "blocks": [
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "ping "
+                },
+                {
+                  "NostrMention": {
+                    "hrp": "Npub",
+                    "bech32": "npub1qzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqzqz"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

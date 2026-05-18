@@ -1,0 +1,334 @@
+{
+  "blocks": [
+    {
+      "Heading": {
+        "level": 1,
+        "inlines": [
+          {
+            "Text": "Nested Containers"
+          }
+        ]
+      }
+    },
+    {
+      "BlockQuote": {
+        "blocks": [
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "Outer quote"
+                }
+              ]
+            }
+          },
+          {
+            "BlockQuote": {
+              "blocks": [
+                {
+                  "Paragraph": {
+                    "inlines": [
+                      {
+                        "Text": "Inner quote with "
+                      },
+                      {
+                        "Strong": [
+                          {
+                            "Text": "bold"
+                          }
+                        ]
+                      },
+                      {
+                        "Text": "."
+                      }
+                    ]
+                  }
+                },
+                {
+                  "List": {
+                    "kind": {
+                      "Bullet": {
+                        "marker": 45
+                      }
+                    },
+                    "tight": false,
+                    "items": [
+                      {
+                        "blocks": [
+                          {
+                            "Paragraph": {
+                              "inlines": [
+                                {
+                                  "Text": "inner list item one"
+                                }
+                              ]
+                            }
+                          }
+                        ],
+                        "checked": null
+                      },
+                      {
+                        "blocks": [
+                          {
+                            "Paragraph": {
+                              "inlines": [
+                                {
+                                  "Text": "inner list item two"
+                                }
+                              ]
+                            }
+                          },
+                          {
+                            "List": {
+                              "kind": {
+                                "Bullet": {
+                                  "marker": 45
+                                }
+                              },
+                              "tight": true,
+                              "items": [
+                                {
+                                  "blocks": [
+                                    {
+                                      "Paragraph": {
+                                        "inlines": [
+                                          {
+                                            "Text": "deeply nested"
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  ],
+                                  "checked": null
+                                }
+                              ]
+                            }
+                          }
+                        ],
+                        "checked": null
+                      }
+                    ]
+                  }
+                },
+                {
+                  "Paragraph": {
+                    "inlines": [
+                      {
+                        "Text": "Trailing paragraph in inner quote."
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "Back to outer."
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Ordered": {
+            "start": 1,
+            "delimiter": 46
+          }
+        },
+        "tight": true,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "Ordered outer"
+                    }
+                  ]
+                }
+              },
+              {
+                "List": {
+                  "kind": {
+                    "Ordered": {
+                      "start": 1,
+                      "delimiter": 46
+                    }
+                  },
+                  "tight": true,
+                  "items": [
+                    {
+                      "blocks": [
+                        {
+                          "Paragraph": {
+                            "inlines": [
+                              {
+                                "Text": "Ordered inner"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "List": {
+                            "kind": {
+                              "Bullet": {
+                                "marker": 45
+                              }
+                            },
+                            "tight": true,
+                            "items": [
+                              {
+                                "blocks": [
+                                  {
+                                    "Paragraph": {
+                                      "inlines": [
+                                        {
+                                          "Text": "bullet leaf"
+                                        },
+                                        "SoftBreak",
+                                        {
+                                          "Text": "- [ ] task leaf"
+                                        },
+                                        "SoftBreak",
+                                        {
+                                          "Text": "2. Another inner"
+                                        },
+                                        "SoftBreak",
+                                        {
+                                          "Text": "> Quote inside a list item."
+                                        },
+                                        "SoftBreak",
+                                        {
+                                          "Text": "2. Outer second"
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ],
+                                "checked": null
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "checked": null
+                    }
+                  ]
+                }
+              },
+              {
+                "CodeBlock": {
+                  "kind": "Fenced",
+                  "info": "",
+                  "content": "code block inside list item\n"
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    },
+    {
+      "List": {
+        "kind": {
+          "Bullet": {
+            "marker": 45
+          }
+        },
+        "tight": true,
+        "items": [
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "Top bullet"
+                    }
+                  ]
+                }
+              },
+              {
+                "List": {
+                  "kind": {
+                    "Bullet": {
+                      "marker": 45
+                    }
+                  },
+                  "tight": true,
+                  "items": [
+                    {
+                      "blocks": [
+                        {
+                          "Paragraph": {
+                            "inlines": [
+                              {
+                                "Text": "Sub bullet"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "List": {
+                            "kind": {
+                              "Bullet": {
+                                "marker": 45
+                              }
+                            },
+                            "tight": true,
+                            "items": [
+                              {
+                                "blocks": [
+                                  {
+                                    "Paragraph": {
+                                      "inlines": [
+                                        {
+                                          "Text": "Sub-sub bullet"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "BlockQuote": {
+                                      "blocks": [
+                                        {
+                                          "Paragraph": {
+                                            "inlines": [
+                                              {
+                                                "Text": "Quote at depth 3."
+                                              }
+                                            ]
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ],
+                                "checked": null
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "checked": null
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          }
+        ]
+      }
+    }
+  ]
+}
