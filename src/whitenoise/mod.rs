@@ -1,7 +1,11 @@
 use std::ffi::OsStr;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 
 use ::rand::RngCore;
 use nostr_sdk::{PublicKey, RelayUrl};
@@ -274,6 +278,24 @@ pub struct Whitenoise {
 /// concurrent first-callers internally, replacing the previous
 /// `ENSURE_INITIALIZED_LOCK` mutex without losing the race-free guarantee.
 static GLOBAL_WHITENOISE: OnceCell<Arc<Whitenoise>> = OnceCell::const_new();
+
+async fn get_or_try_init_with_initializer_flag<T, E, Fut>(
+    cell: &OnceCell<T>,
+    init: impl FnOnce() -> Fut,
+) -> core::result::Result<(&T, bool), E>
+where
+    Fut: Future<Output = core::result::Result<T, E>>,
+{
+    let initialized_by_this_call = AtomicBool::new(false);
+    let value = cell
+        .get_or_try_init(|| async {
+            initialized_by_this_call.store(true, Ordering::Relaxed);
+            init().await
+        })
+        .await?;
+
+    Ok((value, initialized_by_this_call.load(Ordering::Relaxed)))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupSubscriptionMode {
@@ -1090,9 +1112,8 @@ impl Whitenoise {
     pub(crate) async fn ensure_initialized_for_background_notifications(
         config: WhitenoiseConfig,
     ) -> Result<(Arc<Self>, bool)> {
-        let cold_start = GLOBAL_WHITENOISE.get().is_none();
-        let arc = GLOBAL_WHITENOISE
-            .get_or_try_init(|| async {
+        let (arc, cold_start) =
+            get_or_try_init_with_initializer_flag(&GLOBAL_WHITENOISE, || async {
                 Self::new_with_startup_subscription_mode(
                     config,
                     background_notification_startup_subscription_mode(),
@@ -2071,6 +2092,29 @@ mod tests {
 
     struct CustomLegacyStoreCreationError;
 
+    #[tokio::test]
+    async fn get_or_try_init_with_initializer_flag_tracks_the_initializer_call() {
+        let cell = OnceCell::const_new();
+
+        let (value, initialized_by_first_call) =
+            get_or_try_init_with_initializer_flag(&cell, || async {
+                Ok::<_, WhitenoiseError>("initialized")
+            })
+            .await
+            .unwrap();
+        assert_eq!(*value, "initialized");
+        assert!(initialized_by_first_call);
+
+        let (value, initialized_by_second_call) =
+            get_or_try_init_with_initializer_flag(&cell, || async {
+                Ok::<_, WhitenoiseError>("not used")
+            })
+            .await
+            .unwrap();
+        assert_eq!(*value, "initialized");
+        assert!(!initialized_by_second_call);
+    }
+
     impl From<CustomLegacyStoreCreationError> for keyring_core::Error {
         fn from(_: CustomLegacyStoreCreationError) -> Self {
             keyring_core::Error::Invalid(
@@ -2224,6 +2268,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_migration_keyring_store_reads_legacy_when_primary_is_empty() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        legacy
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap()
+            .set_secret(b"legacy-db-key")
+            .unwrap();
+
+        let store = Whitenoise::create_legacy_migration_keyring_store(
+            primary,
+            Ok::<_, keyring_core::Error>(legacy),
+            "legacy Android",
+        );
+
+        assert_eq!(
+            store
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"legacy-db-key"
+        );
+    }
+
+    #[test]
     fn legacy_migration_keyring_store_falls_back_to_primary_when_custom_legacy_error_converts() {
         let primary = keyring_core::mock::Store::new().unwrap();
         primary
@@ -2249,6 +2319,22 @@ mod tests {
                 .unwrap(),
             b"primary-db-key"
         );
+    }
+
+    #[tokio::test]
+    async fn insert_test_group_creates_group_information_row() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[0xab, 0xcd, 0xef, 0x01]);
+
+        insert_test_group(&whitenoise.shared.database, &group_id).await;
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
+                .bind(group_id.as_slice())
+                .fetch_one(&whitenoise.shared.database.pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1);
     }
 
     // Configuration Tests
@@ -4616,6 +4702,34 @@ mod tests {
             );
 
             whitenoise.wait_for_pending_background_tasks().await;
+        }
+
+        #[tokio::test]
+        async fn test_wait_for_pending_background_tasks_handles_failed_tasks() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            whitenoise
+                .spawn_background(async {
+                    std::future::pending::<()>().await;
+                })
+                .await;
+            whitenoise
+                .spawn_background(async {
+                    panic!("intentional background task panic");
+                })
+                .await;
+
+            tokio::task::yield_now().await;
+            {
+                let handles = whitenoise.background_handles.lock().await;
+                handles[0].abort();
+            }
+
+            whitenoise.wait_for_pending_background_tasks().await;
+            assert!(
+                whitenoise.background_handles.lock().await.is_empty(),
+                "Registry must be empty after draining failed tasks"
+            );
         }
 
         #[tokio::test]
