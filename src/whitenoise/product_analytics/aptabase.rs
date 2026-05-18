@@ -91,6 +91,11 @@ fn parse_host(host: &str) -> Result<Url> {
     let url = Url::parse(host)
         .map_err(|e| WhitenoiseError::ProductAnalytics(format!("Aptabase host is invalid: {e}")))?;
 
+    if url.host_str().is_none() {
+        return Err(WhitenoiseError::ProductAnalytics(
+            "Aptabase host must include a host/authority".to_string(),
+        ));
+    }
     if url.username() != "" || url.password().is_some() {
         return Err(WhitenoiseError::ProductAnalytics(
             "Aptabase host must not contain credentials".to_string(),
@@ -291,5 +296,6 @@ mod tests {
         assert!(validate_host("https://analytics.example.com?debug=true").is_err());
         assert!(validate_host("https://analytics.example.com/#events").is_err());
         assert!(validate_host("http://analytics.example.com").is_err());
+        assert!(validate_host("https:///").is_err());
     }
 }

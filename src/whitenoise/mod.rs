@@ -767,6 +767,7 @@ impl Whitenoise {
 
         // Validate keyring_service_id is not empty or whitespace
         config.normalize_keyring_service_id();
+        config.validate_product_analytics_config()?;
         if config.keyring_service_id.is_empty() {
             return Err(WhitenoiseError::Configuration(
                 "keyring_service_id cannot be empty or whitespace".to_string(),
@@ -1096,6 +1097,10 @@ impl Whitenoise {
     pub async fn shutdown(&self) -> Result<()> {
         tracing::info!(target: "whitenoise::shutdown", "Initiating graceful shutdown");
 
+        self.shutdown_event_processing().await?;
+        self.shutdown_scheduled_tasks().await;
+        self.wait_for_pending_background_tasks().await;
+
         if let Err(e) = self.flush_product_analytics().await {
             tracing::warn!(
                 target: "whitenoise::shutdown",
@@ -1103,9 +1108,6 @@ impl Whitenoise {
                 "Failed to flush product analytics during shutdown"
             );
         }
-        self.shutdown_event_processing().await?;
-        self.shutdown_scheduled_tasks().await;
-        self.wait_for_pending_background_tasks().await;
 
         tracing::info!(target: "whitenoise::shutdown", "Graceful shutdown complete");
         Ok(())
@@ -5287,5 +5289,28 @@ mod tests {
                 "Fallback should not contain duplicates"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn new_rejects_invalid_product_analytics_config_before_creating_dirs() {
+        let (config, _data_temp, _logs_temp) = create_test_config();
+        let data_dir = config.data_dir.clone();
+        let logs_dir = config.logs_dir.clone();
+        let config =
+            config.with_product_analytics_config(product_analytics::ProductAnalyticsConfig {
+                backend: product_analytics::ProductAnalyticsBackend::Disabled,
+                app_version: "1.0.0".to_string(),
+                bundle_identifier: "not a bundle".to_string(),
+                device_class: product_analytics::ProductAnalyticsDeviceClass::Desktop,
+                os_name: "macOS".to_string(),
+                locale: "en-US".to_string(),
+                is_debug: true,
+            });
+
+        let err = Whitenoise::new(config).await.unwrap_err();
+
+        assert!(matches!(err, WhitenoiseError::ProductAnalytics(_)));
+        assert!(!data_dir.exists());
+        assert!(!logs_dir.exists());
     }
 }

@@ -158,12 +158,12 @@ Recommended storage:
 
 - Add a new single-row `product_analytics_settings` table.
 - Store it in the shared database, not a per-account database.
-- Add a global Rust migration in `src/whitenoise/database/rust_migrations/`; the next version in
-  this branch is `m0044`.
+- Add a global Rust migration in `src/whitenoise/database/rust_migrations/`; the migration for this
+  branch is `m0045_product_analytics_settings`.
 - Register the migration in `all_global_migrations()`.
 - Do not add a SQLx migration under `db_migrations/`; that directory no longer exists.
-- Fresh installs run the Rust migration timeline after the baseline schema, so `m0044` should
-  create the table for both existing and fresh databases.
+- Fresh installs run the Rust migration timeline after the baseline schema, so
+  `m0045_product_analytics_settings` should create the table for both existing and fresh databases.
 - Do not store app keys, hosts, session IDs, or event queues in SQLite.
 
 Why a separate table:
@@ -764,8 +764,9 @@ just precommit-quick
 
 - Add `ProductAnalyticsSettings`.
 - Add `src/whitenoise/database/product_analytics.rs`.
-- Add global Rust migration `m0044_product_analytics_settings`.
-- Register `m0044` in `src/whitenoise/database/rust_migrations/mod.rs`.
+- Add global Rust migration `m0045_product_analytics_settings`.
+- Register `m0045_product_analytics_settings` in
+  `src/whitenoise/database/rust_migrations/mod.rs`.
 - Add public settings methods on `Whitenoise`.
 - Re-export public types from `src/lib.rs`.
 - Add unit tests for default-off and setting updates.
