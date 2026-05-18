@@ -3,7 +3,6 @@ use thiserror::Error;
 
 use crate::whitenoise::database::DatabaseError;
 
-pub mod parser;
 pub mod utils;
 
 #[derive(Error, Debug)]

@@ -8,7 +8,6 @@ use std::collections::HashMap;
 
 use super::reaction_handler;
 use super::types::{AggregatorConfig, ChatMessage, ProcessingError};
-use crate::nostr_manager::parser::Parser;
 use crate::perf_span;
 use crate::whitenoise::media_files::MediaFile;
 use mdk_core::prelude::message_types::Message;
@@ -16,7 +15,6 @@ use mdk_core::prelude::message_types::Message;
 /// Process raw messages into aggregated chat messages
 pub async fn process_messages(
     messages: Vec<Message>,
-    parser: &dyn Parser,
     config: &AggregatorConfig,
     media_files: Vec<MediaFile>,
 ) -> Result<Vec<ChatMessage>, ProcessingError> {
@@ -54,9 +52,7 @@ pub async fn process_messages(
     for message in &sorted_messages {
         match message.kind {
             Kind::Custom(9) => {
-                if let Ok(chat_message) =
-                    process_regular_message(message, parser, &media_files_map).await
-                {
+                if let Ok(chat_message) = process_regular_message(message, &media_files_map).await {
                     processed_messages.insert(message.id.to_string(), chat_message);
                 } else if config.enable_debug_logging {
                     tracing::warn!("Failed to process regular message: {}", message.id);
@@ -125,7 +121,6 @@ pub async fn process_messages(
 /// Process a regular chat message (kind 9)
 pub(crate) async fn process_regular_message(
     message: &Message,
-    parser: &dyn Parser,
     media_files_map: &HashMap<String, MediaFile>,
 ) -> Result<ChatMessage, ProcessingError> {
     let _span = perf_span!("aggregator::process_regular_message");
@@ -134,20 +129,14 @@ pub(crate) async fn process_regular_message(
     let is_reply = reply_to_id.is_some();
 
     // NIP-C7: strip the leading nostr:nevent1... reference from reply content,
-    // then parse tokens from the final content so they always stay aligned.
+    // then parse markdown from the final content so the AST stays aligned.
     let content = if is_reply {
         strip_reply_event_reference(&message.content)
     } else {
         message.content.clone()
     };
 
-    let content_tokens = match parser.parse(&content) {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            tracing::warn!("Failed to parse message content: {}", e);
-            Vec::new()
-        }
-    };
+    let content_tokens = whitenoise_markdown::parse(&content);
 
     // Extract media attachments
     let media_attachments = extract_media_attachments(&message.tags, media_files_map);
@@ -331,7 +320,6 @@ mod tests {
     use mdk_core::prelude::message_types::{Message, MessageState};
 
     use super::*;
-    use crate::nostr_manager::parser::MockParser;
 
     // Test the pure logic functions that don't require complex Message structs
 
@@ -401,12 +389,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_messages() {
-        let parser = MockParser::new();
         let config = AggregatorConfig::default();
 
-        let result = process_messages(vec![], &parser, &config, vec![])
-            .await
-            .unwrap();
+        let result = process_messages(vec![], &config, vec![]).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -573,7 +558,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: Default::default(),
                 kind: 9,
                 media_attachments: vec![],

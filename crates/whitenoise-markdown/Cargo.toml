@@ -1,0 +1,20 @@
+[package]
+name = "whitenoise-markdown"
+version = "0.1.0"
+description = "CommonMark + nostr extensions Markdown AST for Whitenoise"
+authors = ["White Noise Authors"]
+edition = "2024"
+rust-version = "1.90.0"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+# `serde_json` is used **only** by the test suite to round-trip the AST
+# through JSON; it is not a library dependency. The zero-deps constraint
+# applies to `[dependencies]`.
+serde_json = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

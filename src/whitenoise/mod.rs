@@ -886,10 +886,12 @@ impl Whitenoise {
 
         init_timing::record("core_services");
 
-        // Create default relays in the database if they don't exist
-        // TODO: Make this batch fetch and insert all relays at once
-        for relay in Relay::defaults() {
-            let _ = whitenoise.find_or_create_relay_by_url(&relay.url).await?;
+        // Seed the relays table with the configured default-account relays so
+        // a private-relay deployment does not carry stale rows for relays it
+        // never uses. The discovery plane owns its own relay set elsewhere.
+        // TODO: Make this batch fetch and insert all relays at once.
+        for url in &whitenoise.config().default_account_relays {
+            let _ = whitenoise.find_or_create_relay_by_url(url).await?;
         }
 
         // Create default app settings in the database if they don't exist
@@ -2792,7 +2794,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -2807,7 +2809,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -2873,7 +2875,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -2928,7 +2930,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3333,7 +3335,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3424,7 +3426,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3483,7 +3485,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3538,7 +3540,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3742,7 +3744,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3757,7 +3759,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3974,7 +3976,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -4713,7 +4715,7 @@ mod tests {
                     is_reply: false,
                     reply_to_id: None,
                     is_deleted: false,
-                    content_tokens: vec![],
+                    content_tokens: whitenoise_markdown::Document::default(),
                     reactions: message_aggregator::ReactionSummary::default(),
                     kind: 9,
                     media_attachments: vec![],

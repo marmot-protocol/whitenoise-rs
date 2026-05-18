@@ -97,6 +97,23 @@ impl Relay {
         }
     }
 
+    /// Seed value for [`WhitenoiseConfig::default_account_relays`].
+    ///
+    /// This is intentionally a *compile-time* seed: in `debug_assertions`
+    /// builds it returns localhost relays so a developer running
+    /// `cargo run` against the local Docker stack works without
+    /// configuration; in release builds it returns the public bootstrap
+    /// set so first-time end users have somewhere to publish.
+    ///
+    /// **Do not** call this as a runtime fallback. The single source of
+    /// truth for fallback decisions is [`WhitenoiseConfig`] — read
+    /// `config().default_account_relays` (for account-published lists) or
+    /// `shared.fallback_relay_urls()` (for discovery-plane fallbacks).
+    /// Bypassing the config leaks public-relay traffic in private-relay
+    /// deployments. See `docs/` for the relay-configuration design.
+    ///
+    /// [`WhitenoiseConfig`]: crate::WhitenoiseConfig
+    /// [`WhitenoiseConfig::default_account_relays`]: crate::WhitenoiseConfig::default_account_relays
     pub fn defaults() -> Vec<Relay> {
         let urls: &[&str] = if cfg!(debug_assertions) {
             &["ws://localhost:8080", "ws://localhost:7777"]

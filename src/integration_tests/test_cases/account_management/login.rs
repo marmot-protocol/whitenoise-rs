@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::integration_tests::core::*;
 use crate::{RelayType, WhitenoiseError};
 use async_trait::async_trait;
@@ -7,25 +9,14 @@ pub struct LoginTestCase {
     account_name: String,
     metadata_name: Option<String>,
     metadata_about: Option<String>,
-    relays: Vec<&'static str>,
 }
 
 impl LoginTestCase {
     pub fn new(account_name: &str) -> Self {
-        let relays = if cfg!(debug_assertions) {
-            vec!["ws://localhost:8080"]
-        } else {
-            vec![
-                "wss://relay.damus.io",
-                "wss://relay.primal.net",
-                "wss://nos.lol",
-            ]
-        };
         Self {
             account_name: account_name.to_string(),
             metadata_name: None,
             metadata_about: None,
-            relays,
         }
     }
 
@@ -44,38 +35,34 @@ impl TestCase for LoginTestCase {
         let keys = Keys::generate();
         let expected_pubkey = keys.public_key();
 
-        // Publish test events first via external client
-        let test_client = create_test_client(&context.dev_relays, keys.clone()).await?;
+        // login_start reads from `default_account_relays`, so both the publish
+        // destination and the payload values come from that role.
+        let publish_relays = &context.default_account_relays;
+        let test_client = create_test_client(publish_relays, keys.clone()).await?;
 
-        // Publish metadata if specified
         if let (Some(name), Some(about)) = (&self.metadata_name, &self.metadata_about) {
             publish_test_metadata(&test_client, name, about).await?;
         }
 
-        // Publish relay list
-        let relay_urls: Vec<String> = self.relays.iter().map(|s| s.to_string()).collect();
-        publish_relay_lists(&test_client, relay_urls).await?;
+        publish_relay_lists(&test_client, publish_relays.clone()).await?;
 
         test_client.disconnect().await;
 
-        // Login with the keys
         let account = context
             .whitenoise
             .login(keys.secret_key().to_secret_hex())
             .await?;
 
         assert_eq!(account.pubkey, expected_pubkey);
-        let relays = account
+        let stored_relays = account
             .relays(RelayType::Nip65, &context.whitenoise.shared)
             .await?;
-        assert_eq!(relays.len(), self.relays.len());
-        for relay in relays {
-            assert!(
-                self.relays.contains(&relay.url.as_str()),
-                "Relay {} not found in expected relays",
-                relay.url
-            );
-        }
+        let expected: HashSet<String> = publish_relays.iter().cloned().collect();
+        let actual: HashSet<String> = stored_relays.iter().map(|r| r.url.to_string()).collect();
+        assert_eq!(
+            actual, expected,
+            "stored NIP-65 relay set should exactly match the published set"
+        );
         context.add_account(&self.account_name, account);
 
         tracing::info!("✓ Successfully logged in account: {}", self.account_name);

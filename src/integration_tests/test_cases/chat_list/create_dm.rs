@@ -52,7 +52,7 @@ impl TestCase for CreateDmTestCase {
                     None,
                     None,
                     None,
-                    context.test_relays(),
+                    context.default_account_relay_urls(),
                     vec![creator.pubkey, other.pubkey],
                     None,
                 ),

@@ -3,10 +3,7 @@ use nostr_sdk::prelude::*;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::{
-    nostr_manager::parser::SerializableToken, relay_control::SubscriptionContext,
-    whitenoise::error::WhitenoiseError,
-};
+use crate::{relay_control::SubscriptionContext, whitenoise::error::WhitenoiseError};
 
 /// Retry information for failed event processing
 #[derive(Debug, Clone)]
@@ -205,11 +202,13 @@ pub struct RelaySessionRelayStateSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageWithTokens {
     pub message: message_types::Message,
-    pub tokens: Vec<SerializableToken>,
+    /// Parsed Markdown AST (CommonMark + GFM + nostr extensions) of
+    /// `message.content`. Field name retained for FFI continuity.
+    pub tokens: whitenoise_markdown::Document,
 }
 
 impl MessageWithTokens {
-    pub fn new(message: message_types::Message, tokens: Vec<SerializableToken>) -> Self {
+    pub fn new(message: message_types::Message, tokens: whitenoise_markdown::Document) -> Self {
         Self { message, tokens }
     }
 }

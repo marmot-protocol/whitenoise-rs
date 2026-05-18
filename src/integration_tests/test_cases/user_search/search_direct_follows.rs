@@ -42,7 +42,7 @@ impl TestCase for SearchDirectFollowsTestCase {
         let followed_pubkey = followed_keys.public_key();
         let followed_name = "DirectFollow";
 
-        let client = create_test_client(&context.dev_relays, followed_keys).await?;
+        let client = create_test_client(&context.discovery_relays, followed_keys).await?;
         publish_test_metadata(&client, followed_name, "A directly followed user").await?;
         client.disconnect().await;
 
@@ -62,7 +62,8 @@ impl TestCase for SearchDirectFollowsTestCase {
         let unfollowed_keys = Keys::generate();
         let unfollowed_pubkey = unfollowed_keys.public_key();
 
-        let unfollowed_client = create_test_client(&context.dev_relays, unfollowed_keys).await?;
+        let unfollowed_client =
+            create_test_client(&context.discovery_relays, unfollowed_keys).await?;
         publish_test_metadata(
             &unfollowed_client,
             "DirectUnfollowed",

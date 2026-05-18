@@ -64,12 +64,8 @@ impl PublishSubscriptionUpdateTestCase {
         context: &ScenarioContext,
         keys: &Keys,
     ) -> Result<Client, WhitenoiseError> {
-        let test_client = create_test_client(&context.dev_relays, keys.clone()).await?;
-        let relay_urls: Vec<String> = context
-            .dev_relays
-            .iter()
-            .map(|url| url.to_string())
-            .collect();
+        let test_client = create_test_client(&context.discovery_relays, keys.clone()).await?;
+        let relay_urls = context.discovery_relays.clone();
         publish_relay_lists(&test_client, relay_urls).await?;
         tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
         Ok(test_client)
@@ -134,12 +130,8 @@ impl PublishSubscriptionUpdateTestCase {
     ) -> Result<(), WhitenoiseError> {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-        // Create complete relay list (dev relays + new relay)
-        let mut relay_urls: Vec<String> = context
-            .dev_relays
-            .iter()
-            .map(|url| url.to_string())
-            .collect();
+        // Create complete relay list (discovery relays + new relay)
+        let mut relay_urls = context.discovery_relays.clone();
         relay_urls.push(new_relay_url.to_string());
 
         let nip65_tags: Vec<Tag> = relay_urls
