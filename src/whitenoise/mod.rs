@@ -1495,7 +1495,13 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("whitenoise")]
     async fn wait_for_pending_background_tasks_for_delete(&self, deadline: Instant) {
+        // Same drain-loop shape as wait_for_pending_background_tasks: a task in
+        // the current batch may register another background task before it exits.
+        // The delete path keeps the shared deadline across generations and aborts
+        // handles once the deadline is exhausted, so nested spawns cannot extend
+        // the total grace window indefinitely.
         loop {
             let drained: Vec<JoinHandle<()>> = {
                 let mut handles = self.background_handles.lock().await;
@@ -1577,7 +1583,10 @@ impl Whitenoise {
 
 #[cfg(test)]
 pub mod test_utils {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
 
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
@@ -1586,6 +1595,20 @@ pub mod test_utils {
     use mdk_core::prelude::*;
     use nostr_sdk::{EventBuilder, EventId, Keys, PublicKey, RelayUrl, UnsignedEvent};
     use tempfile::TempDir;
+
+    pub struct DropFlag(Arc<AtomicBool>);
+
+    impl DropFlag {
+        pub fn new(dropped: Arc<AtomicBool>) -> Self {
+            Self(dropped)
+        }
+    }
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     // ── Shared raw-SQL fixture helpers ────────────────────────────────────────
 
@@ -2600,14 +2623,6 @@ mod tests {
 
         #[tokio::test]
         async fn test_delete_all_data_aborts_stuck_background_task() {
-            struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-            impl Drop for DropFlag {
-                fn drop(&mut self) {
-                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let database_path = whitenoise.shared.database.path.clone();
             let database_key_id = whitenoise.database_key_id().to_string();
@@ -2621,7 +2636,7 @@ mod tests {
             let dropped_in_task = dropped.clone();
             whitenoise
                 .spawn_background(async move {
-                    let _drop_flag = DropFlag(dropped_in_task);
+                    let _drop_flag = DropFlag::new(dropped_in_task);
                     std::future::pending::<()>().await;
                 })
                 .await;
@@ -4680,14 +4695,6 @@ mod tests {
     mod scheduler_lifecycle_tests {
         use super::*;
 
-        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-
         #[tokio::test]
         async fn test_scheduler_handles_stored_after_init() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -4775,7 +4782,7 @@ mod tests {
             let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let dropped_in_task = dropped.clone();
             let handle = tokio::spawn(async move {
-                let _drop_flag = DropFlag(dropped_in_task);
+                let _drop_flag = DropFlag::new(dropped_in_task);
                 std::future::pending::<()>().await;
             });
 
