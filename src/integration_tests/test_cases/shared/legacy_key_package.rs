@@ -68,7 +68,7 @@ pub(crate) async fn publish_legacy_capability_key_package(
     // Nostr-event capability tags below.
     let key_package_data = context
         .whitenoise
-        .encoded_key_package(account, relays)
+        .encoded_key_package(account, relays, None)
         .await?;
 
     // Pull the account's signer key via the public nsec export so we can

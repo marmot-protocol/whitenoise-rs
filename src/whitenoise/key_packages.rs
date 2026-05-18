@@ -256,6 +256,33 @@ pub(crate) fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey)
     Ok(())
 }
 
+/// Returns a strictly-monotonic `created_at` for the next kind:30443 publish.
+///
+/// NIP-01 specifies that when two replaceable events share a `created_at`,
+/// relays keep the one with the lowest event id. Reusing the d-tag alone
+/// does not guarantee that a fresh publish replaces the previous canonical
+/// event when both land in the same second — the new event might lose the
+/// id-comparison tiebreaker.
+///
+/// `prev_max` is the maximum `created_at` recorded in the
+/// `published_key_packages` table for the canonical kind. That value is the
+/// SQLite `unixepoch()` at INSERT time, which happens *after* the relay
+/// round-trip, so it is always ≥ the previous Nostr event's `created_at`.
+/// Setting the new event's `created_at` to `max(now, prev_max + 1)`
+/// therefore lands strictly above any prior canonical event and sidesteps
+/// the NIP-01 tie entirely.
+pub(crate) fn monotonic_canonical_created_at(prev_max: Option<i64>) -> Timestamp {
+    let now = Timestamp::now();
+    match prev_max {
+        Some(prev) if prev >= 0 => {
+            // `prev >= 0` guarantees the cast is value-preserving.
+            let floor = (prev as u64).saturating_add(1);
+            Timestamp::from_secs(floor.max(now.as_secs()))
+        }
+        _ => now,
+    }
+}
+
 /// Filters relay responses to key package events that match the expected kind and author.
 ///
 /// Returns `(valid_events, dropped_wrong_kind, dropped_wrong_author)`.
@@ -287,6 +314,13 @@ pub(crate) fn filter_key_package_events_for_account(
 impl Whitenoise {
     /// Helper method to create and encode a key package for the given account.
     ///
+    /// When `existing_d_tag` is `Some(d)`, MDK reuses that NIP-33
+    /// addressable-slot identifier instead of generating a fresh random
+    /// one — this is how consecutive publishes for the same account replace
+    /// the previous canonical event on relays per NIP-33 instead of
+    /// accumulating new distinct events. `None` lets MDK generate a fresh
+    /// slot (first publish for the account).
+    ///
     /// Returns a [`KeyPackageEventData`] containing the encoded content, tags
     /// for both event kinds, and the hash_ref for lifecycle tracking.
     #[perf_instrument("key_packages")]
@@ -294,12 +328,21 @@ impl Whitenoise {
         &self,
         account: &Account,
         key_package_relays: &[Relay],
+        existing_d_tag: Option<&str>,
     ) -> Result<KeyPackageEventData> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
+        let options = mdk_core::key_packages::KeyPackageOptions {
+            protected: false,
+            existing_d_tag: existing_d_tag.map(str::to_owned),
+        };
         let data = mdk
-            .create_key_package_for_event(&account.pubkey, key_package_relay_urls)
+            .create_key_package_for_event_with_options(
+                &account.pubkey,
+                key_package_relay_urls,
+                options,
+            )
             .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))?;
 
         Ok(data)
@@ -322,11 +365,20 @@ impl Whitenoise {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
-        let key_package_data = self.encoded_key_package(account, &relays).await?;
+        // Serialize concurrent rotations for this account so the
+        // prepare/publish/track sequence stays atomic. See
+        // `AccountSession::key_package_publish_lock`.
+        let session = self.require_session(&account.pubkey)?;
+        let _publish_guard = session.key_package_publish_lock.lock().await;
+
+        let (key_package_data, canonical_created_at) = self
+            .prepare_canonical_publish_inputs(account, &relays)
+            .await?;
         let relay_urls = Relay::urls(&relays);
         self.publish_key_package_pair_to_relays(
             account,
             &key_package_data,
+            canonical_created_at,
             &relay_urls,
             std::sync::Arc::new(signer),
         )
@@ -334,74 +386,177 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Like the session `create_and_publish()` flow, but the relay publish
-    /// Creates a key package, publishes it to the configured relays, and
-    /// records the published event in the database.
+    /// Creates and publishes a key package for a freshly-set-up account.
     ///
-    /// The MLS key material is always created synchronously (local, fast).
-    /// The relay broadcast + DB tracking run inline so that callers can rely
-    /// on the package being durably published (or surfaced as a warning) by
-    /// the time this function returns. Failures are non-fatal — the
-    /// `KeyPackageMaintenance` scheduler (10-min interval) retries any that
-    /// didn't land.
+    /// In production this spawns the publish so account-creation flows
+    /// don't block on relays; in tests it runs inline so assertions can
+    /// observe the published event deterministically. Either way, failures
+    /// only log a warning — the [`KeyPackageMaintenance`] scheduler retries
+    /// any publish that didn't land on its next tick (10 min).
+    ///
+    /// The full `lock → prepare → publish → track` sequence runs inside
+    /// the spawn/inline-await block: by the time this function returns,
+    /// `setup_subscriptions` has already wired up the giftwrap handler
+    /// (see `accounts/setup.rs`), so a welcome can arrive concurrently
+    /// with the spawn. Taking the per-account
+    /// [`key_package_publish_lock`] *inside* the spawned task is what
+    /// prevents the giftwrap-triggered `KeyPackageOps::publish` from
+    /// reading the same empty `published_key_packages` state and landing
+    /// in a *different* fresh NIP-33 slot — i.e. the slot-drift bug this
+    /// PR fixes.
+    ///
+    /// [`KeyPackageMaintenance`]: crate::whitenoise::scheduled_tasks::tasks::KeyPackageMaintenance
+    /// [`key_package_publish_lock`]: crate::whitenoise::session::AccountSession#structfield.key_package_publish_lock
     pub(crate) async fn create_key_package_and_background_publish(
         &self,
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
-        let key_package_data = self.encoded_key_package(account, relays).await?;
-        let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
+        let relays = relays.to_vec();
 
-        // In unit tests publish synchronously so assertions can observe the
-        // published event without awaiting a spawned task. In production the
-        // spawn path keeps account creation responsive while the scheduler
-        // retries any publish that didn't land.
         #[cfg(not(test))]
         if let Ok(wn) = self.arc() {
             let account = account.clone();
             tokio::spawn(async move {
-                if let Err(e) = wn
-                    .publish_key_package_pair_to_relays(
-                        &account,
-                        &key_package_data,
-                        &relay_urls,
-                        signer,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::key_packages",
-                        "Background key package publish failed, scheduler will retry: {}",
-                        e
-                    );
-                }
+                wn.locked_create_and_publish_canonical_pair(&account, &relays, signer)
+                    .await;
             });
             return Ok(());
         }
 
-        match self
-            .publish_key_package_pair_to_relays(account, &key_package_data, &relay_urls, signer)
-            .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::key_packages",
-                    "Key package publish failed, scheduler will retry: {}",
-                    e
-                );
-            }
-        }
-
+        self.locked_create_and_publish_canonical_pair(account, &relays, signer)
+            .await;
         Ok(())
     }
 
+    /// Acquires the per-account publish lock, then runs the full
+    /// `prepare → publish → track` sequence and swallows any failure as a
+    /// warning so callers always observe success.
+    ///
+    /// Used by the spawned and inline branches of
+    /// [`Self::create_key_package_and_background_publish`]. Holding the
+    /// lock across the entire sequence (rather than just publish) is what
+    /// prevents the slot-drift race documented on that function.
+    async fn locked_create_and_publish_canonical_pair(
+        &self,
+        account: &Account,
+        relays: &[Relay],
+        signer: std::sync::Arc<dyn NostrSigner>,
+    ) {
+        let session = match self.require_session(&account.pubkey) {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Key package publish skipped, session resolution failed: {}",
+                    e
+                );
+                return;
+            }
+        };
+        let _publish_guard = session.key_package_publish_lock.lock().await;
+
+        let (key_package_data, canonical_created_at) =
+            match self.prepare_canonical_publish_inputs(account, relays).await {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::key_packages",
+                        "Key package prepare failed, scheduler will retry: {}",
+                        e
+                    );
+                    return;
+                }
+            };
+        let relay_urls = Relay::urls(relays);
+
+        if let Err(e) = self
+            .publish_key_package_pair_to_relays(
+                account,
+                &key_package_data,
+                canonical_created_at,
+                &relay_urls,
+                signer,
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::key_packages",
+                "Key package publish failed, scheduler will retry: {}",
+                e
+            );
+        }
+    }
+
+    /// Resolves persisted canonical-slot state and generates the key package
+    /// in one step.
+    ///
+    /// Looks up the previously-recorded NIP-33 `d` tag and the maximum
+    /// `created_at` for kind:30443 publishes, then calls MDK with the stored
+    /// d-tag so the new event lands in the same addressable slot. Returns a
+    /// strictly-monotonic canonical `created_at` so a same-second publish
+    /// can't lose the NIP-01 lowest-event-id tiebreaker.
+    ///
+    /// Fail-fast on DB read errors: a soft-fail `None` fallback would publish
+    /// into a fresh NIP-33 slot (slot drift) and risk losing the timestamp
+    /// tiebreaker — defeating the whole reuse path. The scheduler retries
+    /// publishing on its next tick, so transient SQLite errors aren't fatal
+    /// for the system.
+    async fn prepare_canonical_publish_inputs(
+        &self,
+        account: &Account,
+        relays: &[Relay],
+    ) -> Result<(KeyPackageEventData, Timestamp)> {
+        let session = self.require_session(&account.pubkey)?;
+
+        // Single query: the d-tag and the insert timestamp both come from the
+        // most recent canonical row. Folding the two lookups avoids the
+        // implication that they could disagree.
+        let latest_canonical = session
+            .repos
+            .published_key_packages
+            .find_latest_by_kind(MLS_KEY_PACKAGE_KIND)
+            .await?;
+        let stored_d_tag = latest_canonical.as_ref().and_then(|r| r.d_tag.as_deref());
+        let prev_canonical_max = latest_canonical.as_ref().map(|r| r.created_at);
+
+        let key_package_data = self
+            .encoded_key_package(account, relays, stored_d_tag)
+            .await?;
+        let canonical_created_at = monotonic_canonical_created_at(prev_canonical_max);
+
+        Ok((key_package_data, canonical_created_at))
+    }
+
+    /// Publishes the canonical (kind:30443) and legacy (kind:443) key package
+    /// pair for an already-encoded `KeyPackageEventData`.
+    ///
+    /// Caller is responsible for resolving NIP-33 slot state via
+    /// [`Self::prepare_canonical_publish_inputs`] so the d-tag baked into
+    /// `key_package_data.tags_30443` by MDK is the persisted slot identifier
+    /// (not a fresh random one), and `canonical_created_at` is strictly
+    /// monotonic past the prior canonical insert. This function trusts those
+    /// inputs and just publishes + tracks.
+    ///
+    /// Why this still lives on `Whitenoise` rather than only on
+    /// [`KeyPackageOps`](crate::whitenoise::session::AccountSession#method.key_packages):
+    /// the external-signer login flow inserts the signer into
+    /// `Whitenoise.shared.external_signers` *before* `from_account` builds
+    /// the session, so `AccountSession::from_account` sees no local key and
+    /// leaves `session.signer = None`. Routing the initial external-signer
+    /// publish through `KeyPackageOps::publish_pair` would then trip
+    /// `require_signer() → SignerUnavailable`. Folding the two paths into
+    /// one means rewiring `from_account` (or `insert_account_session`) to
+    /// also consult the `external_signers` map — a session-signer-lifecycle
+    /// refactor that's out of scope for the d-tag-stability fix. See the
+    /// PR #835 review thread on this function for the discussion.
     #[perf_instrument("key_packages")]
     async fn publish_key_package_pair_to_relays(
         &self,
         account: &Account,
         key_package_data: &KeyPackageEventData,
+        canonical_created_at: Timestamp,
         relay_urls: &[RelayUrl],
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<()> {
@@ -419,18 +574,21 @@ impl Whitenoise {
                 &key_package_data.content,
                 relay_urls,
                 &key_package_data.tags_30443,
+                Some(canonical_created_at),
                 signer.clone(),
             )
             .await?;
 
-        Self::track_published_key_package(
+        // Propagate canonical tracking failures: the d-tag reuse and
+        // monotonic-timestamp invariants both read this row on the next
+        // publish; silent loss would re-introduce slot drift.
+        Self::track_published_key_package_canonical(
             &session,
             &key_package_data.hash_ref,
             &canonical_event_id,
-            MLS_KEY_PACKAGE_KIND,
-            Some(&key_package_data.d_tag),
+            &key_package_data.d_tag,
         )
-        .await;
+        .await?;
 
         match self
             .publish_key_package_to_relays(
@@ -438,17 +596,19 @@ impl Whitenoise {
                 &key_package_data.content,
                 relay_urls,
                 &key_package_data.tags_443,
+                None,
                 signer,
             )
             .await
         {
             Ok(legacy_event_id) => {
-                Self::track_published_key_package(
+                // Legacy tracking is best-effort: kind:443 is regular
+                // (not addressable) per NIP-01, so a missed row only
+                // affects audit-trail completeness.
+                Self::track_published_key_package_legacy(
                     &session,
                     &key_package_data.hash_ref,
                     &legacy_event_id,
-                    MLS_KEY_PACKAGE_KIND_LEGACY,
-                    None,
                 )
                 .await;
             }
@@ -478,12 +638,20 @@ impl Whitenoise {
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
+        custom_created_at: Option<Timestamp>,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<EventId> {
         let result = self
             .shared
             .relay_control
-            .publish_key_package_with_signer(kind, encoded_key_package, relay_urls, tags, signer)
+            .publish_key_package_with_signer(
+                kind,
+                encoded_key_package,
+                relay_urls,
+                tags,
+                custom_created_at,
+                signer,
+            )
             .await?;
 
         if result.success.is_empty() {
@@ -502,27 +670,56 @@ impl Whitenoise {
         Ok(*result.id())
     }
 
-    /// Records a successfully published key package in the lifecycle tracking table.
+    /// Records a successful canonical (kind:30443) publish.
     ///
-    /// Caller resolves the session beforehand so this can't lose a tracking
-    /// record because the session went away between publish and track.
+    /// Errors propagate to the caller because the d-tag reuse and
+    /// monotonic-timestamp logic both read from this row on the next
+    /// publish; silent loss would re-introduce slot drift. Caller resolves
+    /// the session beforehand so this can't lose a tracking record because
+    /// the session went away between publish and track.
     #[perf_instrument("key_packages")]
-    async fn track_published_key_package(
+    async fn track_published_key_package_canonical(
         session: &std::sync::Arc<crate::whitenoise::session::AccountSession>,
         hash_ref: &[u8],
         event_id: &EventId,
-        kind: Kind,
-        d_tag: Option<&str>,
+        d_tag: &str,
+    ) -> Result<()> {
+        session
+            .repos
+            .published_key_packages
+            .create(
+                hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(d_tag),
+            )
+            .await
+    }
+
+    /// Records a successful legacy (kind:443) publish — best-effort.
+    ///
+    /// kind:443 is regular per NIP-01 (not addressable), so a missed row
+    /// only affects audit-trail completeness.
+    #[perf_instrument("key_packages")]
+    async fn track_published_key_package_legacy(
+        session: &std::sync::Arc<crate::whitenoise::session::AccountSession>,
+        hash_ref: &[u8],
+        event_id: &EventId,
     ) {
         if let Err(e) = session
             .repos
             .published_key_packages
-            .create(hash_ref, &event_id.to_hex(), kind, d_tag)
+            .create(
+                hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
             .await
         {
             tracing::warn!(
                 target: "whitenoise::key_packages",
-                "Published key package but failed to track it: {}",
+                "Published legacy key package but failed to track it: {}",
                 e
             );
         }
@@ -1977,6 +2174,133 @@ mod tests {
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
+    #[test]
+    fn test_monotonic_canonical_created_at_uses_now_when_no_prior() {
+        let now_secs = Timestamp::now().as_secs();
+        let ts = monotonic_canonical_created_at(None);
+        assert!(
+            ts.as_secs() >= now_secs,
+            "with no prior publish the new timestamp must be at least the wall clock"
+        );
+    }
+
+    #[test]
+    fn test_monotonic_canonical_created_at_steps_past_future_prior() {
+        // Pin prior strictly in the future so we can prove the bump.
+        let now_secs = Timestamp::now().as_secs();
+        let prior = i64::try_from(now_secs + 3600).unwrap();
+        let ts = monotonic_canonical_created_at(Some(prior));
+        assert_eq!(
+            ts.as_secs(),
+            u64::try_from(prior).unwrap() + 1,
+            "must produce prev+1 when the wall clock is below the prior publish"
+        );
+    }
+
+    #[test]
+    fn test_monotonic_canonical_created_at_uses_now_when_prior_is_past() {
+        let now_secs = Timestamp::now().as_secs();
+        let prior = i64::try_from(now_secs.saturating_sub(3600)).unwrap();
+        let ts = monotonic_canonical_created_at(Some(prior));
+        assert!(
+            ts.as_secs() >= now_secs,
+            "wall clock wins when the prior publish is in the past"
+        );
+    }
+
+    #[test]
+    fn test_monotonic_canonical_created_at_ignores_negative_prior() {
+        // Defensive: a corrupt DB row shouldn't crash the publish path.
+        let now_secs = Timestamp::now().as_secs();
+        let ts = monotonic_canonical_created_at(Some(-5));
+        assert!(ts.as_secs() >= now_secs);
+    }
+
+    #[tokio::test]
+    async fn test_publish_key_package_pair_reuses_d_tag_across_publishes() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // First publish lands during account creation.
+        let account = whitenoise.create_identity().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let initial_d_tag = session
+            .repos
+            .published_key_packages
+            .find_latest_by_kind(MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap()
+            .and_then(|row| row.d_tag)
+            .expect("initial publish must record a d_tag for kind:30443");
+
+        let initial_fetch = session.key_packages().fetch_all().await.unwrap();
+        let initial_canonical = initial_fetch
+            .iter()
+            .find(|e| e.kind == MLS_KEY_PACKAGE_KIND)
+            .expect("relay must hold a canonical event after the first publish")
+            .clone();
+
+        // Trigger a second publish through the same code path *in the same
+        // wall-clock second* — the monotonic-created_at logic must keep the
+        // new event id from losing a NIP-01 tiebreaker.
+        let keys = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+        whitenoise
+            .publish_key_package_for_account_with_signer(&account, keys)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // DB invariant: every canonical row reuses the original slot.
+        let canonical_rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT d_tag FROM published_key_packages
+             WHERE kind = ? AND d_tag IS NOT NULL",
+        )
+        .bind(i64::from(MLS_KEY_PACKAGE_KIND.as_u16()))
+        .fetch_all(&session.account_db.inner.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            canonical_rows.len() >= 2,
+            "expected at least two kind:30443 publish rows, got {}",
+            canonical_rows.len()
+        );
+        for (d_tag,) in &canonical_rows {
+            assert_eq!(
+                d_tag, &initial_d_tag,
+                "every kind:30443 publish must reuse the original d_tag slot"
+            );
+        }
+
+        // Relay invariant: the relay surfaces exactly one canonical event for
+        // the (kind, pubkey, d) slot, and it is the NEW one — not the original.
+        let after_fetch = session.key_packages().fetch_all().await.unwrap();
+        let canonical_events: Vec<_> = after_fetch
+            .iter()
+            .filter(|e| e.kind == MLS_KEY_PACKAGE_KIND)
+            .collect();
+        assert_eq!(
+            canonical_events.len(),
+            1,
+            "NIP-33 must collapse kind:30443 events sharing the same d-tag to a single row \
+             after replacement; got {} canonical event(s)",
+            canonical_events.len()
+        );
+        assert_ne!(
+            canonical_events[0].id, initial_canonical.id,
+            "the new canonical event must replace the original on the relay"
+        );
+        assert!(
+            canonical_events[0].created_at >= initial_canonical.created_at,
+            "the replacement event must not be older than the one it replaces"
+        );
+    }
+
     #[tokio::test]
     async fn test_publish_key_package_with_signer_fails_with_unreachable_relay() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2082,7 +2406,7 @@ mod tests {
             .await
             .unwrap();
         let key_package_data = whitenoise
-            .encoded_key_package(&account, &relays)
+            .encoded_key_package(&account, &relays, None)
             .await
             .unwrap();
 

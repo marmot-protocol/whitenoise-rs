@@ -305,7 +305,7 @@ async fn publish_backdated_key_package(
     // Get the encoded key package and tags
     let key_package_data = context
         .whitenoise
-        .encoded_key_package(account, relays)
+        .encoded_key_package(account, relays, None)
         .await?;
 
     // Get the account's secret key via public API

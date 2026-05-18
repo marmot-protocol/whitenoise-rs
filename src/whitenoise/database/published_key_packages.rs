@@ -107,6 +107,43 @@ impl PublishedKeyPackage {
         Ok(row)
     }
 
+    /// Returns the most recently inserted row for a given event kind, if any.
+    ///
+    /// Single query that covers both NIP-33 canonical-slot needs:
+    /// - `d_tag` — reuse the previously-published addressable-slot
+    ///   identifier so the next publish replaces the prior canonical event
+    ///   on relays instead of landing in a fresh slot. MDK generates a
+    ///   fresh random `d` tag every call to `create_key_package_for_event`
+    ///   and the MDK docs say "Callers SHOULD store and reuse this value
+    ///   when rotating the KeyPackage."
+    /// - `created_at` (the row's SQLite `unixepoch()` insert timestamp,
+    ///   not the Nostr event's `created_at`) — use as a lower bound when
+    ///   computing a strictly-monotonic event `created_at` for the next
+    ///   publish. NIP-01 says relays keep the lowest-id event on a tie,
+    ///   so reusing the d-tag alone isn't enough under same-second
+    ///   publishes. The row insert timestamp is always ≥ the event's
+    ///   `created_at` (INSERT runs after the publish round-trip), which
+    ///   makes it a sound upper bound for the prior event time.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn find_latest_by_kind(
+        db: &AccountDatabase,
+        kind: Kind,
+    ) -> Result<Option<Self>, DatabaseError> {
+        let row = sqlx::query_as::<_, Self>(
+            "SELECT id, key_package_hash_ref, event_id, kind, d_tag,
+                    consumed_at, key_material_deleted, created_at
+             FROM published_key_packages
+             WHERE kind = ?
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(i64::from(kind.as_u16()))
+        .fetch_optional(&db.inner.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     /// Looks up all published key packages sharing the same hash reference.
     #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn find_by_hash_ref(
@@ -491,6 +528,77 @@ mod tests {
             eligible.is_empty(),
             "rows with key_material_deleted = 1 must not be returned"
         );
+    }
+
+    #[tokio::test]
+    async fn test_find_latest_by_kind_returns_none_when_empty() {
+        let (db, _dir) = setup().await;
+
+        let result = PublishedKeyPackage::find_latest_by_kind(&db, MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_latest_by_kind_returns_most_recent_row_per_kind() {
+        let (db, _dir) = setup().await;
+
+        PublishedKeyPackage::create(
+            &db,
+            &[1, 1, 1],
+            "older",
+            MLS_KEY_PACKAGE_KIND,
+            Some("d-old"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE published_key_packages SET created_at = 100 WHERE event_id = ?")
+            .bind("older")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+
+        PublishedKeyPackage::create(
+            &db,
+            &[2, 2, 2],
+            "newer",
+            MLS_KEY_PACKAGE_KIND,
+            Some("d-new"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE published_key_packages SET created_at = 200 WHERE event_id = ?")
+            .bind("newer")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+
+        // A legacy row inserted later must not bleed into the canonical lookup.
+        PublishedKeyPackage::create(&db, &[3, 3, 3], "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE published_key_packages SET created_at = 999 WHERE event_id = ?")
+            .bind("legacy")
+            .execute(&db.inner.pool)
+            .await
+            .unwrap();
+
+        let canonical = PublishedKeyPackage::find_latest_by_kind(&db, MLS_KEY_PACKAGE_KIND)
+            .await
+            .unwrap()
+            .expect("canonical row must exist");
+        assert_eq!(canonical.event_id, "newer");
+        assert_eq!(canonical.d_tag.as_deref(), Some("d-new"));
+        assert_eq!(canonical.created_at, 200);
+
+        let legacy = PublishedKeyPackage::find_latest_by_kind(&db, MLS_KEY_PACKAGE_KIND_LEGACY)
+            .await
+            .unwrap()
+            .expect("legacy row must exist");
+        assert_eq!(legacy.event_id, "legacy");
+        assert_eq!(legacy.created_at, 999);
+        assert!(legacy.d_tag.is_none());
     }
 
     #[tokio::test]
