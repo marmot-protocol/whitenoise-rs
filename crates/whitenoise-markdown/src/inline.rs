@@ -19,9 +19,14 @@ use crate::scanner;
 /// ASCII bytes that have a dedicated arm in `tokenize`'s dispatch match.
 /// Keep in sync with the explicit match arms — used as the exit condition
 /// for the plain-byte fast-scan in the `_` wildcard arm.
+///
+/// `h`, `m`, `t`, `w` are tripwires for bare-URL schemes (`http(s)://`,
+/// `mailto:`, `tel:`, `whitenoise:`); the bulk-scan rescue below keeps the
+/// fast path for the overwhelmingly common case of ordinary prose containing
+/// those letters.
 const INLINE_SPECIAL: [bool; 128] = {
     let mut t = [false; 128];
-    let chars = b"\\`$&[!*_~]<@n\n";
+    let chars = b"\\`$&[!*_~]<@nhmtw\n";
     let mut k = 0;
     while k < chars.len() {
         t[chars[k] as usize] = true;
@@ -290,6 +295,19 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     i += 1;
                 }
             }
+            b'h' | b'm' | b't' | b'w' => {
+                if let Some((url, end)) = try_bare_url(bytes, i) {
+                    flush_text(&mut out, &mut buf, &delims);
+                    out.push(Inline::Autolink {
+                        url,
+                        kind: AutolinkKind::Uri,
+                    });
+                    i = end;
+                } else {
+                    buf.push(c as char);
+                    i += 1;
+                }
+            }
             b'\n' => {
                 let trailing = trailing_space_count(&buf);
                 let hard = trailing >= 2;
@@ -338,6 +356,15 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                             if cc == b'n'
                                 && bytes.get(i + 1..i + 6) != Some(b"ostr:")
                                 && bytes.get(i + 1..i + 5) != Some(b"pub1")
+                            {
+                                i += 1;
+                                continue;
+                            }
+                            // Same rescue for `h`/`m`/`t`/`w` — they're
+                            // tripwires for bare-URL schemes and most occur
+                            // mid-word in prose.
+                            if matches!(cc, b'h' | b'm' | b't' | b'w')
+                                && !looks_like_bare_url_start(bytes, i)
                             {
                                 i += 1;
                                 continue;
@@ -712,6 +739,103 @@ fn absorb_link(
 // ---------------------------------------------------------------------------
 // Autolinks + raw HTML
 // ---------------------------------------------------------------------------
+
+/// Schemes recognized as bare (unbracketed) URLs.
+///
+/// **Order matters:** `whitenoise-staging://` must come before `whitenoise://`
+/// because the `find(..)` lookup is first-match-wins, and the latter is a
+/// strict prefix of the former. With them in the wrong order
+/// `whitenoise-staging://x` would parse as `whitenoise:` + literal
+/// `-staging://x`.
+const BARE_URL_SCHEMES: &[&[u8]] = &[
+    b"https://",
+    b"http://",
+    b"mailto:",
+    b"tel:",
+    b"whitenoise-staging://",
+    b"whitenoise://",
+];
+
+/// True if the bytes starting at `i` begin with one of the recognized bare-URL
+/// scheme prefixes. Used by the bulk-scan tripwire to keep ordinary text
+/// (every `h`/`m`/`t`/`w` byte in prose) on the fast path.
+fn looks_like_bare_url_start(bytes: &[u8], i: usize) -> bool {
+    BARE_URL_SCHEMES
+        .iter()
+        .any(|s| bytes.get(i..i + s.len()) == Some(s))
+}
+
+/// Try to consume a bare URL (no surrounding `<>`) starting at `i`. Matches
+/// `https://`, `http://`, `mailto:`, `tel:`, or `whitenoise:` followed by a
+/// non-empty run of non-whitespace, non-`<` bytes. Trailing punctuation is
+/// stripped per the GFM extended-autolink rules (`.,;:!?*_~` always; `)` only
+/// when it would unbalance the URL body).
+fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
+    if !nostr::left_boundary_ok(prev) {
+        return None;
+    }
+    // If the previous byte is `<`, the angle-bracket autolink form was tried
+    // and rejected (e.g. body contained a space). Per existing convention,
+    // the whole `<…>` token stays literal — don't rescue part of it as a
+    // bare URL.
+    if prev == Some(b'<') {
+        return None;
+    }
+    let scheme = BARE_URL_SCHEMES
+        .iter()
+        .find(|s| bytes.get(i..i + s.len()) == Some(**s))?;
+    let body_start = i + scheme.len();
+    let mut j = body_start;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if c == b' '
+            || c == b'\t'
+            || c == b'\n'
+            || c == b'\r'
+            || c == b'<'
+            || c == b'>'
+            || c < 0x20
+            || c == 0x7f
+        {
+            break;
+        }
+        j += 1;
+    }
+    if j == body_start {
+        return None;
+    }
+    j = trim_trailing_punct(bytes, body_start, j);
+    if j == body_start {
+        return None;
+    }
+    let url = std::str::from_utf8(&bytes[i..j]).ok()?.to_string();
+    Some((url, j))
+}
+
+/// Trim trailing punctuation from a bare-URL body per GFM:
+/// - Always strip `.`, `,`, `;`, `:`, `!`, `?`, `*`, `_`, `~`.
+/// - Strip `)` only when the body has more `)` than `(` (so balanced parens
+///   inside the URL — e.g. Wikipedia disambiguation links — are kept).
+fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
+    while end > start {
+        let c = bytes[end - 1];
+        match c {
+            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'*' | b'_' | b'~' => end -= 1,
+            b')' => {
+                let opens = bytes[start..end].iter().filter(|&&b| b == b'(').count();
+                let closes = bytes[start..end].iter().filter(|&&b| b == b')').count();
+                if closes > opens {
+                    end -= 1;
+                } else {
+                    return end;
+                }
+            }
+            _ => return end,
+        }
+    }
+    end
+}
 
 /// `<scheme:body>` — scheme is `[A-Za-z][A-Za-z0-9+.-]{1,31}`, body has no
 /// `<`, `>`, control chars, or whitespace. Returns the URL (without the

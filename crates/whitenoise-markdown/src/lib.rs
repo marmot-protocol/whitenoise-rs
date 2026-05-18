@@ -68,12 +68,19 @@ pub use ast::{
 /// - GFM tables (`| h | k |\n| - | - |\n| 1 | 2 |`).
 /// - GFM strikethrough (`~~foo~~`).
 /// - GFM task-list items (`- [ ]`, `- [x]`).
+/// - Bare URLs (GFM-style extended autolinks) for the schemes `http://`,
+///   `https://`, `mailto:`, `tel:`, `whitenoise://`, and
+///   `whitenoise-staging://`. Recognized at word boundaries; trailing
+///   punctuation (`.,;:!?*_~` and unbalanced `)`) is excluded from the
+///   matched URL. The opaque form `whitenoise:foo` (no `//`) stays literal.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).
 /// - Nostr bare mentions (`@npub1…`) and URIs (`nostr:<hrp>1…`) for the
 ///   whitelisted HRPs `npub`, `note`, `nevent`, `nprofile`, `naddr`,
 ///   `nrelay`. `nsec` is deliberately rejected — we never render private
-///   keys as ergonomic anchors.
+///   keys as ergonomic anchors. Bare `nostr:` URIs whose body isn't valid
+///   bech32 stay as literal text (they are *not* downgraded to a generic
+///   bare-URL autolink).
 ///
 /// Bech32 strings are validated for *shape* only (no checksum).
 pub fn parse(input: &str) -> Document {

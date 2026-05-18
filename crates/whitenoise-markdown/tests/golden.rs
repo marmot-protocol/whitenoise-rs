@@ -108,3 +108,8 @@ fn tables_and_math() {
 fn nested_containers() {
     assert_golden("nested_containers");
 }
+
+#[test]
+fn bare_urls() {
+    assert_golden("bare_urls");
+}
