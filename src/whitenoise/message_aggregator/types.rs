@@ -52,8 +52,7 @@ pub struct ChatMessage {
     pub is_deleted: bool,
 
     /// Parsed Markdown AST (CommonMark + GFM + nostr extensions) of the message
-    /// content. Empty `Document` when content is empty. Derived from `content`
-    /// at aggregation time and on read from the database — never persisted.
+    /// content. Empty `Document` when content is empty.
     pub content_tokens: whitenoise_markdown::Document,
 
     /// Aggregated reactions on this message
