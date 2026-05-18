@@ -1405,6 +1405,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("whitenoise")]
     async fn shutdown_scheduled_tasks_for_delete(&self, deadline: Instant) {
         tracing::info!(
             target: "whitenoise::scheduler",
