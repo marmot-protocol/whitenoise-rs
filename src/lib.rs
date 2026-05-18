@@ -76,8 +76,9 @@ pub use whitenoise::message_aggregator::{
     ChatMessage, DeliveryStatus, EmojiReaction, ReactionSummary, UserReaction,
 };
 
-// Nostr integration
-pub use nostr_manager::parser::SerializableToken;
+// Markdown AST (CommonMark + GFM + nostr extensions) — produced during message
+// aggregation and exposed on `ChatMessage::content_tokens`.
+pub mod markdown;
 
 // Group message streaming
 pub use whitenoise::message_streaming::{GroupMessageSubscription, MessageUpdate, UpdateTrigger};
@@ -98,9 +99,9 @@ pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
 };
 
-// Background notification collection (iOS silent push). The async function
-// is re-exported alongside the result types so Rust callers can drive
-// collection directly without going through the FFI layer.
+// Background notification collection. The async function is re-exported
+// alongside the result types so Rust callers can drive collection directly
+// without going through the FFI layer.
 pub use whitenoise::background_notifications::{
     BackgroundNotificationResult, BackgroundNotificationStatus, NotificationDto,
     NotificationUserDto, collect_notifications_after_push,

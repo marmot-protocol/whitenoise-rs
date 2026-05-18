@@ -40,10 +40,10 @@ fn parse_seed_events() -> Vec<Event> {
 }
 
 /// Publishes the shared user-search seed events to the given relays.
-pub async fn publish_user_search_seed_events(relays: &[&str]) -> Result<(), WhitenoiseError> {
+pub async fn publish_user_search_seed_events(relays: &[String]) -> Result<(), WhitenoiseError> {
     let client = Client::default();
     for relay in relays {
-        client.add_relay(*relay).await?;
+        client.add_relay(relay.as_str()).await?;
     }
     client.connect().await;
 

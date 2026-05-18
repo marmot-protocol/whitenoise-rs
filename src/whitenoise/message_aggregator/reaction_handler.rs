@@ -178,7 +178,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
-            content_tokens: vec![],
+            content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9, // Default to MLS group chat
             media_attachments: vec![],

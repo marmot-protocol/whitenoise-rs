@@ -26,10 +26,11 @@ impl TestCase for LoginStartHappyPathTestCase {
         let keys = Keys::generate();
         let expected_pubkey = keys.public_key();
 
-        // Publish relay lists via an external client so they exist on the network.
-        let test_client = create_test_client(&context.dev_relays, keys.clone()).await?;
-        let relay_urls: Vec<String> = context.dev_relays.iter().map(|s| s.to_string()).collect();
-        publish_relay_lists(&test_client, relay_urls).await?;
+        // Publish relay lists via an external client so login_start finds them
+        // on the same relays it queries (the configured default-account set).
+        let publish_relays = &context.default_account_relays;
+        let test_client = create_test_client(publish_relays, keys.clone()).await?;
+        publish_relay_lists(&test_client, publish_relays.clone()).await?;
         test_client.disconnect().await;
 
         // login_start should find the relay lists and return Complete.

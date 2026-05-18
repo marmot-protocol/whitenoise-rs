@@ -1,0 +1,238 @@
+{
+  "blocks": [
+    {
+      "Heading": {
+        "level": 1,
+        "inlines": [
+          {
+            "Text": "Tables and Math"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "A table with every alignment marker:"
+          }
+        ]
+      }
+    },
+    {
+      "Table": {
+        "alignments": [
+          "Left",
+          "Center",
+          "Right",
+          "None"
+        ],
+        "header": [
+          {
+            "inlines": [
+              {
+                "Text": "left"
+              }
+            ]
+          },
+          {
+            "inlines": [
+              {
+                "Text": "center"
+              }
+            ]
+          },
+          {
+            "inlines": [
+              {
+                "Text": "right"
+              }
+            ]
+          },
+          {
+            "inlines": [
+              {
+                "Text": "default"
+              }
+            ]
+          }
+        ],
+        "rows": [
+          [
+            {
+              "inlines": [
+                {
+                  "Code": "a"
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Emph": [
+                    {
+                      "Text": "b"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Strong": [
+                    {
+                      "Text": "c"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Text": "d"
+                }
+              ]
+            }
+          ],
+          [
+            {
+              "inlines": [
+                {
+                  "Text": "1"
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Text": "2"
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Text": "3"
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Text": "4"
+                }
+              ]
+            }
+          ],
+          [
+            {
+              "inlines": [
+                {
+                  "Strikethrough": [
+                    {
+                      "Text": "x"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Link": {
+                    "dest": "/",
+                    "title": null,
+                    "children": [
+                      {
+                        "Text": "y"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "NostrUri": {
+                    "hrp": "Npub",
+                    "bech32": "npub1xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9"
+                  }
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "Text": "end"
+                }
+              ]
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Inline math: "
+          },
+          {
+            "Math": "E = mc^2"
+          },
+          {
+            "Text": " and a "
+          },
+          {
+            "Math": "\\sum_{i=0}^{n} i"
+          },
+          {
+            "Text": " sum."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Block math:"
+          }
+        ]
+      }
+    },
+    {
+      "MathBlock": {
+        "content": "\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}\n"
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Trailing paragraph with "
+          },
+          {
+            "Code": "code"
+          },
+          {
+            "Text": " and "
+          },
+          {
+            "Emph": [
+              {
+                "Text": "em"
+              }
+            ]
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    }
+  ]
+}

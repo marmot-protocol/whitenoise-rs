@@ -1,10 +1,10 @@
 use crate::WhitenoiseError;
 use nostr_sdk::prelude::*;
 
-pub async fn create_test_client(relays: &[&str], keys: Keys) -> Result<Client, WhitenoiseError> {
+pub async fn create_test_client(relays: &[String], keys: Keys) -> Result<Client, WhitenoiseError> {
     let client = Client::default();
     for relay in relays {
-        client.add_relay(*relay).await?;
+        client.add_relay(relay.as_str()).await?;
     }
 
     client.connect().await;

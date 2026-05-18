@@ -141,7 +141,7 @@ fn ffi_runtime() -> Option<&'static tokio::runtime::Runtime> {
 pub type WnJsonCallback =
     extern "C" fn(json_ptr: *const u8, json_len: usize, user_data: *mut c_void);
 
-/// Collect notification updates after an iOS silent push wake.
+/// Collect notification updates after an iOS notification wake.
 ///
 /// Initializes Whitenoise if needed, refreshes relay subscriptions, and
 /// collects any notification updates that arrive within the time window.

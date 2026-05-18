@@ -27,6 +27,10 @@ impl Daemon {
                 "--discovery-relays",
                 "ws://localhost:8080,ws://localhost:7777",
             ])
+            .args([
+                "--default-account-relays",
+                "ws://localhost:8080,ws://localhost:7777",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

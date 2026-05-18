@@ -1,13 +1,18 @@
 [workspace]
-members = [".", "crates/whitenoise-macros", "crates/whitenoise-cli"]
+members = [
+    ".",
+    "crates/whitenoise-macros",
+    "crates/whitenoise-cli",
+    "crates/whitenoise-markdown",
+]
 
 [workspace.dependencies]
-mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "28ee7badf24195343f452246ce5f4dad4a99ddf2", features = [
+mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "65d02043744c2f5ebbebb2cba0ca21a8273ec442", features = [
     "mip04",
     "mip05",
 ] }
-mdk-sqlite-storage = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "28ee7badf24195343f452246ce5f4dad4a99ddf2" }
-mdk-storage-traits = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "28ee7badf24195343f452246ce5f4dad4a99ddf2" }
+mdk-sqlite-storage = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "65d02043744c2f5ebbebb2cba0ca21a8273ec442" }
+mdk-storage-traits = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "65d02043744c2f5ebbebb2cba0ca21a8273ec442" }
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44", "nip47", "nip59"] }
 tokio = { version = "1.44", features = ["full"] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -17,6 +22,7 @@ chrono = { version = "0.4.40", features = ["serde"] }
 hex = "0.4"
 tracing = "0.1"
 tempfile = "3.19.1"
+whitenoise-markdown = { path = "crates/whitenoise-markdown" }
 
 [package]
 name = "whitenoise"
@@ -99,6 +105,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64ct = "=1.7.3"
 whitenoise-macros = { path = "crates/whitenoise-macros" }
+whitenoise-markdown = { workspace = true }
 tempfile = { workspace = true }
 indicatif = { version = "0.18.3", optional = true }
 

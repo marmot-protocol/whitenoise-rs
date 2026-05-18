@@ -48,6 +48,7 @@ mod m0040_drop_shared_message_delivery_status;
 mod m0041_drop_shared_aggregated_messages;
 mod m0042_move_mute_list;
 mod m0043_drop_shared_mute_list;
+mod m0044_reparse_content_tokens;
 
 /// All global migrations, in version order. Lifted from individual modules
 /// so the test suite can build a globals-only `Migrator` for narrow tests.
@@ -103,6 +104,7 @@ pub fn all_local_migrations() -> Vec<Box<dyn LocalMigration>> {
         Box::new(m0038_move_aggregated_messages::Migration),
         Box::new(m0039_move_message_delivery_status::Migration),
         Box::new(m0042_move_mute_list::Migration),
+        Box::new(m0044_reparse_content_tokens::Migration),
     ]
 }
 

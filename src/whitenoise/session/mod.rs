@@ -105,6 +105,15 @@ pub struct AccountSession {
     inbox: RwLock<Option<AccountInboxState>>,
     /// Serializes concurrent activate/deactivate operations.
     activation_lock: Mutex<()>,
+    /// Serializes concurrent kind:30443 rotations so the
+    /// read-d_tag/read-max/encode/publish/track sequence is atomic per
+    /// account. Two concurrent rotations would otherwise read the same
+    /// `find_latest_d_tag` / `find_max_created_at` values, generate two
+    /// different MLS key packages with the same `d` and the same
+    /// `created_at`, and let the relay's NIP-01 lowest-event-id tiebreaker
+    /// pick the winner — defeating the d-tag-reuse + monotonic-timestamp
+    /// invariants this module establishes.
+    pub(crate) key_package_publish_lock: Mutex<()>,
     /// In-memory coordination for delayed MIP-05 token-list responses.
     pub(crate) pending_push_token_responses: Arc<DashMap<(GroupId, EventId), ()>>,
     /// Bounds concurrently-active delayed MIP-05 token-list response tasks.
@@ -153,6 +162,7 @@ impl AccountSession {
             group_handle,
             inbox: RwLock::new(None),
             activation_lock: Mutex::new(()),
+            key_package_publish_lock: Mutex::new(()),
             pending_push_token_responses: Arc::new(DashMap::new()),
             token_response_semaphore: Arc::new(Semaphore::new(
                 crate::whitenoise::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,

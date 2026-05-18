@@ -1,7 +1,11 @@
 use std::ffi::OsStr;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use ::rand::RngCore;
@@ -265,7 +269,7 @@ pub struct Whitenoise {
 }
 
 /// Process-lifetime cache used exclusively by [`Whitenoise::ensure_initialized`]
-/// to support iOS silent-push handlers that may fire concurrently across
+/// to support iOS notification handlers that may fire concurrently across
 /// process wake-ups. Holds a clone of the `Arc<Whitenoise>` produced by the
 /// first successful initialization so subsequent callers observe the same
 /// instance instead of double-initializing.
@@ -277,6 +281,34 @@ pub struct Whitenoise {
 /// `ENSURE_INITIALIZED_LOCK` mutex without losing the race-free guarantee.
 static GLOBAL_WHITENOISE: OnceCell<Arc<Whitenoise>> = OnceCell::const_new();
 const DELETE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+async fn get_or_try_init_with_initializer_flag<T, E, Fut>(
+    cell: &OnceCell<T>,
+    init: impl FnOnce() -> Fut,
+) -> core::result::Result<(&T, bool), E>
+where
+    Fut: Future<Output = core::result::Result<T, E>>,
+{
+    let initialized_by_this_call = AtomicBool::new(false);
+    let value = cell
+        .get_or_try_init(|| async {
+            initialized_by_this_call.store(true, Ordering::Relaxed);
+            init().await
+        })
+        .await?;
+
+    Ok((value, initialized_by_this_call.load(Ordering::Relaxed)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupSubscriptionMode {
+    Run,
+    Defer,
+}
+
+fn background_notification_startup_subscription_mode() -> StartupSubscriptionMode {
+    StartupSubscriptionMode::Defer
+}
 
 /// Marker carried in [`WhitenoiseComponents`] to defer construction of the
 /// standard [`WhitenoiseEventTracker`] until inside `Arc::new_cyclic`, where
@@ -748,7 +780,14 @@ impl Whitenoise {
     /// registered with the background-task pool, so [`Self::shutdown`] waits
     /// for them to complete before returning.
     #[perf_instrument("whitenoise")]
-    pub async fn new(mut config: WhitenoiseConfig) -> Result<Arc<Self>> {
+    pub async fn new(config: WhitenoiseConfig) -> Result<Arc<Self>> {
+        Self::new_with_startup_subscription_mode(config, StartupSubscriptionMode::Run).await
+    }
+
+    async fn new_with_startup_subscription_mode(
+        mut config: WhitenoiseConfig,
+        startup_subscription_mode: StartupSubscriptionMode,
+    ) -> Result<Arc<Self>> {
         init_timing::start();
 
         // Validate keyring_service_id is not empty or whitespace
@@ -872,10 +911,12 @@ impl Whitenoise {
 
         init_timing::record("core_services");
 
-        // Create default relays in the database if they don't exist
-        // TODO: Make this batch fetch and insert all relays at once
-        for relay in Relay::defaults() {
-            let _ = whitenoise.find_or_create_relay_by_url(&relay.url).await?;
+        // Seed the relays table with the configured default-account relays so
+        // a private-relay deployment does not carry stale rows for relays it
+        // never uses. The discovery plane owns its own relay set elsewhere.
+        // TODO: Make this batch fetch and insert all relays at once.
+        for url in &whitenoise.config().default_account_relays {
+            let _ = whitenoise.find_or_create_relay_by_url(url).await?;
         }
 
         // Create default app settings in the database if they don't exist
@@ -999,7 +1040,12 @@ impl Whitenoise {
         // and skips accounts whose subscriptions were already set up by a
         // concurrent `login` / `create_identity`, so this composes safely with
         // any account-creation work that runs after `Whitenoise::new` returns.
-        {
+        //
+        // Background notification collection defers this until after it has a
+        // notification receiver, otherwise a cold notification-service-extension
+        // launch can fetch/process new messages before anything is listening for
+        // notification updates.
+        if startup_subscription_mode == StartupSubscriptionMode::Run {
             let wn = Arc::clone(&whitenoise);
             whitenoise
                 .spawn_background(async move {
@@ -1011,6 +1057,11 @@ impl Whitenoise {
                     }
                 })
                 .await;
+        } else {
+            tracing::info!(
+                target: "whitenoise::new",
+                "Deferring startup subscription setup"
+            );
         }
 
         init_timing::record("subscription_setup_spawned");
@@ -1047,18 +1098,33 @@ impl Whitenoise {
     /// so that exactly one caller drives [`Whitenoise::new`] on cold start;
     /// all others wait on the same future and observe the populated cell.
     /// This guarantees the documented "never start duplicate event processors
-    /// or background tasks" contract even when multiple iOS silent-push
+    /// or background tasks" contract even when multiple iOS notification
     /// handlers run concurrently on different threads.
     ///
     /// Note: this does not protect against a caller invoking [`Whitenoise::new`]
     /// directly in parallel with `ensure_initialized`. Outside of this
-    /// background push path, init is expected to be serialized by the caller
+    /// background notification path, init is expected to be serialized by the caller
     /// (e.g. a single Flutter cold-start path).
     pub async fn ensure_initialized(config: WhitenoiseConfig) -> Result<Arc<Self>> {
         let arc = GLOBAL_WHITENOISE
             .get_or_try_init(|| async { Self::new(config).await })
             .await?;
         Ok(Arc::clone(arc))
+    }
+
+    pub(crate) async fn ensure_initialized_for_background_notifications(
+        config: WhitenoiseConfig,
+    ) -> Result<(Arc<Self>, bool)> {
+        let (arc, cold_start) =
+            get_or_try_init_with_initializer_flag(&GLOBAL_WHITENOISE, || async {
+                Self::new_with_startup_subscription_mode(
+                    config,
+                    background_notification_startup_subscription_mode(),
+                )
+                .await
+            })
+            .await?;
+        Ok((Arc::clone(arc), cold_start))
     }
 
     /// Gracefully shuts down all background tasks without deleting data.
@@ -2196,6 +2262,29 @@ mod tests {
 
     struct CustomLegacyStoreCreationError;
 
+    #[tokio::test]
+    async fn get_or_try_init_with_initializer_flag_tracks_the_initializer_call() {
+        let cell = OnceCell::const_new();
+
+        let (value, initialized_by_first_call) =
+            get_or_try_init_with_initializer_flag(&cell, || async {
+                Ok::<_, WhitenoiseError>("initialized")
+            })
+            .await
+            .unwrap();
+        assert_eq!(*value, "initialized");
+        assert!(initialized_by_first_call);
+
+        let (value, initialized_by_second_call) =
+            get_or_try_init_with_initializer_flag(&cell, || async {
+                Ok::<_, WhitenoiseError>("not used")
+            })
+            .await
+            .unwrap();
+        assert_eq!(*value, "initialized");
+        assert!(!initialized_by_second_call);
+    }
+
     impl From<CustomLegacyStoreCreationError> for keyring_core::Error {
         fn from(_: CustomLegacyStoreCreationError) -> Self {
             keyring_core::Error::Invalid(
@@ -2349,6 +2438,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_migration_keyring_store_reads_legacy_when_primary_is_empty() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        legacy
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap()
+            .set_secret(b"legacy-db-key")
+            .unwrap();
+
+        let store = Whitenoise::create_legacy_migration_keyring_store(
+            primary,
+            Ok::<_, keyring_core::Error>(legacy),
+            "legacy Android",
+        );
+
+        assert_eq!(
+            store
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"legacy-db-key"
+        );
+    }
+
+    #[test]
     fn legacy_migration_keyring_store_falls_back_to_primary_when_custom_legacy_error_converts() {
         let primary = keyring_core::mock::Store::new().unwrap();
         primary
@@ -2374,6 +2489,22 @@ mod tests {
                 .unwrap(),
             b"primary-db-key"
         );
+    }
+
+    #[tokio::test]
+    async fn insert_test_group_creates_group_information_row() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[0xab, 0xcd, 0xef, 0x01]);
+
+        insert_test_group(&whitenoise.shared.database, &group_id).await;
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
+                .bind(group_id.as_slice())
+                .fetch_one(&whitenoise.shared.database.pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1);
     }
 
     // Configuration Tests
@@ -2718,6 +2849,15 @@ mod tests {
             assert_eq!(whitenoise.keyring_service_id(), "padded");
         }
 
+        #[test]
+        fn test_background_notification_initialization_defers_startup_subscriptions() {
+            assert_eq!(
+                background_notification_startup_subscription_mode(),
+                StartupSubscriptionMode::Defer,
+                "background notification cold-start must subscribe before fetching subscriptions"
+            );
+        }
+
         #[tokio::test]
         async fn test_delete_all_data_removes_mdk_database_keys() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2984,7 +3124,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -2999,7 +3139,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3065,7 +3205,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3120,7 +3260,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3525,7 +3665,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3616,7 +3756,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3675,7 +3815,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3730,7 +3870,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3934,7 +4074,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -3949,7 +4089,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -4166,7 +4306,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
-                content_tokens: vec![],
+                content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
@@ -4808,6 +4948,34 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_wait_for_pending_background_tasks_handles_failed_tasks() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            whitenoise
+                .spawn_background(async {
+                    std::future::pending::<()>().await;
+                })
+                .await;
+            whitenoise
+                .spawn_background(async {
+                    panic!("intentional background task panic");
+                })
+                .await;
+
+            tokio::task::yield_now().await;
+            {
+                let handles = whitenoise.background_handles.lock().await;
+                handles[0].abort();
+            }
+
+            whitenoise.wait_for_pending_background_tasks().await;
+            assert!(
+                whitenoise.background_handles.lock().await.is_empty(),
+                "Registry must be empty after draining failed tasks"
+            );
+        }
+
+        #[tokio::test]
         async fn test_shutdown_returns_ok() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
@@ -4931,7 +5099,7 @@ mod tests {
                     is_reply: false,
                     reply_to_id: None,
                     is_deleted: false,
-                    content_tokens: vec![],
+                    content_tokens: whitenoise_markdown::Document::default(),
                     reactions: message_aggregator::ReactionSummary::default(),
                     kind: 9,
                     media_attachments: vec![],

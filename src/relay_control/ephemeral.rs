@@ -346,9 +346,13 @@ impl EphemeralPlane {
         encoded_key_package: &str,
         relays: &[RelayUrl],
         tags: &[Tag],
+        custom_created_at: Option<Timestamp>,
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let event_builder = EventBuilder::new(kind, encoded_key_package).tags(tags.to_vec());
+        let mut event_builder = EventBuilder::new(kind, encoded_key_package).tags(tags.to_vec());
+        if let Some(ts) = custom_created_at {
+            event_builder = event_builder.custom_created_at(ts);
+        }
 
         self.publish_event_builder_with_signer(event_builder, relays, signer)
             .await
