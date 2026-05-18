@@ -1,4 +1,5 @@
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Url;
@@ -9,6 +10,11 @@ use super::client::ProductAnalyticsClient;
 use super::worker::PreparedProductAnalyticsEvent;
 use crate::whitenoise::Result;
 use crate::whitenoise::error::WhitenoiseError;
+
+#[cfg(not(test))]
+const APTABASE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const APTABASE_HTTP_TIMEOUT: Duration = Duration::from_millis(200);
 
 static ANALYTICS_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -22,6 +28,7 @@ static ANALYTICS_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
     reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
+        .timeout(APTABASE_HTTP_TIMEOUT)
         .build()
         .expect("Failed to build analytics HTTP client")
 });
@@ -144,6 +151,7 @@ mod tests {
                 sdk_version: "whitenoise-rs@test".to_string(),
             },
             props,
+            consent_generation: 0,
         }
     }
 
@@ -241,6 +249,37 @@ mod tests {
         });
 
         assert!(client.send_events(&[event()]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_events_times_out_when_endpoint_stalls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            if let Ok((_stream, _addr)) = listener.accept() {
+                let _ = release_receiver.recv_timeout(std::time::Duration::from_secs(2));
+            }
+        });
+        let client = AptabaseProductAnalyticsClient::new(&AptabaseAnalyticsConfig {
+            app_key: "A-TEST".to_string(),
+            host,
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.send_events(&[event()]),
+        )
+        .await;
+        let _ = release_sender.send(());
+        handle.join().unwrap();
+
+        assert!(
+            result
+                .expect("Aptabase client should enforce its own timeout")
+                .is_err(),
+            "stalled Aptabase endpoint should produce a transport error"
+        );
     }
 
     #[test]

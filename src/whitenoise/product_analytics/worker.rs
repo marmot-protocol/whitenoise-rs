@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use super::aptabase::AptabaseProductAnalyticsClient;
 use super::client::ProductAnalyticsClient;
@@ -26,17 +27,21 @@ pub(crate) struct ProductAnalytics {
     config: Option<ProductAnalyticsConfig>,
     command_sender: Option<mpsc::Sender<WorkerCommand>>,
     session_id: Arc<Mutex<String>>,
+    consent_generation: Arc<AtomicU64>,
+    consent_generation_sender: watch::Sender<u64>,
 }
 
 impl ProductAnalytics {
     pub(crate) fn new(config: Option<ProductAnalyticsConfig>) -> Self {
+        let consent_generation = Arc::new(AtomicU64::new(0));
+        let (consent_generation_sender, consent_generation_receiver) = watch::channel(0);
         let command_sender = match &config {
             Some(ProductAnalyticsConfig {
                 backend: ProductAnalyticsBackend::Aptabase(aptabase_config),
                 ..
             }) => {
                 let client = Arc::new(AptabaseProductAnalyticsClient::new(aptabase_config));
-                Some(spawn_worker(client))
+                Some(spawn_worker(client, consent_generation_receiver))
             }
             Some(ProductAnalyticsConfig {
                 backend: ProductAnalyticsBackend::Disabled,
@@ -49,6 +54,8 @@ impl ProductAnalytics {
             config,
             command_sender,
             session_id: Arc::new(Mutex::new(generate_session_id())),
+            consent_generation,
+            consent_generation_sender,
         }
     }
 
@@ -57,10 +64,14 @@ impl ProductAnalytics {
         config: ProductAnalyticsConfig,
         client: Arc<dyn ProductAnalyticsClient>,
     ) -> Self {
+        let consent_generation = Arc::new(AtomicU64::new(0));
+        let (consent_generation_sender, consent_generation_receiver) = watch::channel(0);
         Self {
             config: Some(config),
-            command_sender: Some(spawn_worker(client)),
+            command_sender: Some(spawn_worker(client, consent_generation_receiver)),
             session_id: Arc::new(Mutex::new(generate_session_id())),
+            consent_generation,
+            consent_generation_sender,
         }
     }
 
@@ -103,7 +114,8 @@ impl ProductAnalytics {
                 );
             }
         } else {
-            self.purge_pending_events().await;
+            let revoked_generation = self.revoke_delivery_generation();
+            self.purge_pending_events(revoked_generation).await;
         }
 
         Ok(settings)
@@ -132,6 +144,7 @@ impl ProductAnalytics {
             event_name: event.name.as_str().to_string(),
             system_props: config.system_props(),
             props: event.validated_props()?,
+            consent_generation: self.consent_generation.load(Ordering::SeqCst),
         };
 
         match command_sender.try_send(WorkerCommand::Track(Box::new(prepared))) {
@@ -184,9 +197,12 @@ impl ProductAnalytics {
         }
     }
 
-    async fn purge_pending_events(&self) {
+    async fn purge_pending_events(&self, revoked_generation: u64) {
         if let Some(command_sender) = &self.command_sender
-            && command_sender.send(WorkerCommand::Purge).await.is_err()
+            && command_sender
+                .send(WorkerCommand::Purge { revoked_generation })
+                .await
+                .is_err()
         {
             tracing::debug!(
                 target: "whitenoise::product_analytics",
@@ -198,6 +214,12 @@ impl ProductAnalytics {
     async fn rotate_session(&self) {
         *self.session_id.lock().await = generate_session_id();
     }
+
+    fn revoke_delivery_generation(&self) -> u64 {
+        let revoked_generation = self.consent_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.consent_generation_sender.send(revoked_generation);
+        revoked_generation
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +230,8 @@ pub(crate) struct PreparedProductAnalyticsEvent {
     pub event_name: String,
     pub system_props: SystemProps,
     pub props: Map<String, Value>,
+    #[serde(skip)]
+    pub(crate) consent_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,18 +249,26 @@ pub(crate) struct SystemProps {
 enum WorkerCommand {
     Track(Box<PreparedProductAnalyticsEvent>),
     Flush(oneshot::Sender<ProductAnalyticsFlushStatus>),
-    Purge,
+    Purge { revoked_generation: u64 },
 }
 
-fn spawn_worker(client: Arc<dyn ProductAnalyticsClient>) -> mpsc::Sender<WorkerCommand> {
+fn spawn_worker(
+    client: Arc<dyn ProductAnalyticsClient>,
+    consent_generation_receiver: watch::Receiver<u64>,
+) -> mpsc::Sender<WorkerCommand> {
     let (command_sender, command_receiver) = mpsc::channel(WORKER_QUEUE_SIZE);
-    tokio::spawn(run_worker(command_receiver, client));
+    tokio::spawn(run_worker(
+        command_receiver,
+        client,
+        consent_generation_receiver,
+    ));
     command_sender
 }
 
 async fn run_worker(
     mut command_receiver: mpsc::Receiver<WorkerCommand>,
     client: Arc<dyn ProductAnalyticsClient>,
+    mut consent_generation_receiver: watch::Receiver<u64>,
 ) {
     let mut queue = VecDeque::new();
     while let Some(command) = command_receiver.recv().await {
@@ -244,16 +276,22 @@ async fn run_worker(
             WorkerCommand::Track(event) => {
                 queue.push_back(*event);
                 let pending_flushes = drain_ready_commands(&mut command_receiver, &mut queue);
-                let status = send_queued_batches(&mut queue, &client).await;
+                let status =
+                    send_queued_batches(&mut queue, &client, &mut consent_generation_receiver)
+                        .await;
                 for reply_sender in pending_flushes {
                     let _ = reply_sender.send(status);
                 }
             }
             WorkerCommand::Flush(reply_sender) => {
-                let status = send_queued_batches(&mut queue, &client).await;
+                let status =
+                    send_queued_batches(&mut queue, &client, &mut consent_generation_receiver)
+                        .await;
                 let _ = reply_sender.send(status);
             }
-            WorkerCommand::Purge => queue.clear(),
+            WorkerCommand::Purge { revoked_generation } => {
+                drop_revoked_events(&mut queue, revoked_generation);
+            }
         }
     }
 }
@@ -267,7 +305,9 @@ fn drain_ready_commands(
         match command_receiver.try_recv() {
             Ok(WorkerCommand::Track(event)) => queue.push_back(*event),
             Ok(WorkerCommand::Flush(reply_sender)) => pending_flushes.push(reply_sender),
-            Ok(WorkerCommand::Purge) => queue.clear(),
+            Ok(WorkerCommand::Purge { revoked_generation }) => {
+                drop_revoked_events(queue, revoked_generation);
+            }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
@@ -275,24 +315,59 @@ fn drain_ready_commands(
     pending_flushes
 }
 
+fn drop_revoked_events(queue: &mut VecDeque<PreparedProductAnalyticsEvent>, generation: u64) {
+    queue.retain(|event| event.consent_generation >= generation);
+}
+
 async fn send_queued_batches(
     queue: &mut VecDeque<PreparedProductAnalyticsEvent>,
     client: &Arc<dyn ProductAnalyticsClient>,
+    consent_generation_receiver: &mut watch::Receiver<u64>,
 ) -> ProductAnalyticsFlushStatus {
+    let current_generation = *consent_generation_receiver.borrow();
+    drop_revoked_events(queue, current_generation);
     if queue.is_empty() {
         return ProductAnalyticsFlushStatus::NothingToFlush;
     }
 
+    let mut sent_any = false;
     while !queue.is_empty() {
+        let current_generation = *consent_generation_receiver.borrow();
+        drop_revoked_events(queue, current_generation);
+
         let mut batch = Vec::with_capacity(PRODUCT_ANALYTICS_MAX_BATCH_SIZE);
         while batch.len() < PRODUCT_ANALYTICS_MAX_BATCH_SIZE {
             let Some(event) = queue.pop_front() else {
                 break;
             };
-            batch.push(event);
+            if event.consent_generation >= current_generation {
+                batch.push(event);
+            }
+        }
+        if batch.is_empty() {
+            continue;
         }
 
-        if let Err(e) = client.send_events(&batch).await {
+        let send_result = tokio::select! {
+            result = client.send_events(&batch) => result,
+            changed = consent_generation_receiver.changed() => {
+                match changed {
+                    Ok(()) => {
+                        let current_generation = *consent_generation_receiver.borrow();
+                        drop_revoked_events(queue, current_generation);
+                        return if sent_any {
+                            ProductAnalyticsFlushStatus::Flushed
+                        } else {
+                            ProductAnalyticsFlushStatus::NothingToFlush
+                        };
+                    }
+                    Err(_) => client.send_events(&batch).await,
+                }
+            }
+        };
+        sent_any = true;
+
+        if let Err(e) = send_result {
             tracing::warn!(
                 target: "whitenoise::product_analytics",
                 error = %e,
@@ -302,7 +377,11 @@ async fn send_queued_batches(
         }
     }
 
-    ProductAnalyticsFlushStatus::Flushed
+    if sent_any {
+        ProductAnalyticsFlushStatus::Flushed
+    } else {
+        ProductAnalyticsFlushStatus::NothingToFlush
+    }
 }
 
 fn generate_session_id() -> String {
@@ -338,6 +417,19 @@ mod tests {
         started: Notify,
     }
 
+    struct CancellationAwareBlockingClient {
+        started: Notify,
+        send_dropped: Arc<Notify>,
+    }
+
+    struct NotifyOnDrop(Arc<Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_waiters();
+        }
+    }
+
     #[async_trait]
     impl ProductAnalyticsClient for RecordingClient {
         async fn send_events(&self, events: &[PreparedProductAnalyticsEvent]) -> Result<()> {
@@ -354,6 +446,15 @@ mod tests {
     impl ProductAnalyticsClient for BlockingClient {
         async fn send_events(&self, _events: &[PreparedProductAnalyticsEvent]) -> Result<()> {
             self.started.notify_one();
+            future::pending::<Result<()>>().await
+        }
+    }
+
+    #[async_trait]
+    impl ProductAnalyticsClient for CancellationAwareBlockingClient {
+        async fn send_events(&self, _events: &[PreparedProductAnalyticsEvent]) -> Result<()> {
+            self.started.notify_one();
+            let _guard = NotifyOnDrop(self.send_dropped.clone());
             future::pending::<Result<()>>().await
         }
     }
@@ -382,14 +483,19 @@ mod tests {
             event_name: event_name.to_string(),
             system_props: test_config().system_props(),
             props,
+            consent_generation: 0,
         }
     }
 
     fn analytics_with_sender(command_sender: mpsc::Sender<WorkerCommand>) -> ProductAnalytics {
+        let consent_generation = Arc::new(AtomicU64::new(0));
+        let (consent_generation_sender, _consent_generation_receiver) = watch::channel(0);
         ProductAnalytics {
             config: Some(test_config()),
             command_sender: Some(command_sender),
             session_id: Arc::new(Mutex::new("171351624706652714".to_string())),
+            consent_generation,
+            consent_generation_sender,
         }
     }
 
@@ -633,6 +739,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabling_consent_cancels_active_batch_delivery() {
+        let (db, _dir) = test_db().await;
+        let send_dropped = Arc::new(Notify::new());
+        let client = Arc::new(CancellationAwareBlockingClient {
+            started: Notify::new(),
+            send_dropped: send_dropped.clone(),
+        });
+        let analytics = ProductAnalytics::with_client(test_config(), client.clone());
+        analytics
+            .set_enabled(&db, true, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+            .await
+            .unwrap();
+        client.started.notified().await;
+
+        analytics
+            .set_enabled(&db, false, PRODUCT_ANALYTICS_CONSENT_VERSION.to_string())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), send_dropped.notified())
+            .await
+            .expect("opt-out should cancel active analytics delivery");
+    }
+
+    #[tokio::test]
     async fn disabling_consent_waits_until_purge_is_delivered_when_queue_is_full() {
         let (db, _dir) = test_db().await;
         let (sender, mut receiver) = mpsc::channel(1);
@@ -664,7 +795,9 @@ mod tests {
         assert!(!settings.enabled);
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            WorkerCommand::Purge
+            WorkerCommand::Purge {
+                revoked_generation: 1
+            }
         ));
     }
 
@@ -757,10 +890,16 @@ mod tests {
     #[tokio::test]
     async fn run_worker_accepts_purge_as_primary_command() {
         let (sender, receiver) = mpsc::channel(1);
+        let (_generation_sender, generation_receiver) = watch::channel(0);
         let client = Arc::new(RecordingClient::default());
-        let handle = tokio::spawn(run_worker(receiver, client));
+        let handle = tokio::spawn(run_worker(receiver, client, generation_receiver));
 
-        sender.send(WorkerCommand::Purge).await.unwrap();
+        sender
+            .send(WorkerCommand::Purge {
+                revoked_generation: 1,
+            })
+            .await
+            .unwrap();
         drop(sender);
         handle.await.unwrap();
     }
@@ -805,8 +944,9 @@ mod tests {
             .store(1, Ordering::SeqCst);
         let client: Arc<dyn ProductAnalyticsClient> = recording_client.clone();
         let mut queue = VecDeque::from([prepared_event("app_started")]);
+        let (_generation_sender, mut generation_receiver) = watch::channel(0);
 
-        let status = send_queued_batches(&mut queue, &client).await;
+        let status = send_queued_batches(&mut queue, &client, &mut generation_receiver).await;
 
         assert_eq!(status, ProductAnalyticsFlushStatus::Flushed);
         assert!(queue.is_empty());
@@ -823,7 +963,11 @@ mod tests {
             ))))
             .unwrap();
         sender.try_send(WorkerCommand::Flush(reply_sender)).unwrap();
-        sender.try_send(WorkerCommand::Purge).unwrap();
+        sender
+            .try_send(WorkerCommand::Purge {
+                revoked_generation: 1,
+            })
+            .unwrap();
         drop(sender);
         let mut queue = VecDeque::from([prepared_event("login_started")]);
 
@@ -838,6 +982,7 @@ mod tests {
     #[tokio::test]
     async fn run_worker_replies_to_flush_drained_after_track() {
         let (sender, receiver) = mpsc::channel(4);
+        let (_generation_sender, generation_receiver) = watch::channel(0);
         let recording_client = Arc::new(RecordingClient::default());
         let client: Arc<dyn ProductAnalyticsClient> = recording_client.clone();
         let (reply_sender, reply_receiver) = oneshot::channel();
@@ -849,7 +994,7 @@ mod tests {
         sender.try_send(WorkerCommand::Flush(reply_sender)).unwrap();
         drop(sender);
 
-        run_worker(receiver, client).await;
+        run_worker(receiver, client, generation_receiver).await;
 
         assert_eq!(
             reply_receiver.await.unwrap(),
