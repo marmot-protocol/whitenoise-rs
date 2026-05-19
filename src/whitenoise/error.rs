@@ -86,6 +86,12 @@ pub enum WhitenoiseError {
     #[error("Signer unavailable for account {0} — external signer not yet registered")]
     SignerUnavailable(PublicKey),
 
+    #[error("Inbound gift-wrap dropped: per-account decryption budget exhausted")]
+    GiftwrapThrottled,
+
+    #[error("Inbound gift-wrap deferred: signer backend transiently unavailable")]
+    GiftwrapDeferred,
+
     #[error("MDK error: {0}")]
     MdkCoreError(#[from] mdk_core::Error),
 
