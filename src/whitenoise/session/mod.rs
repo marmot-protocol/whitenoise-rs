@@ -40,6 +40,7 @@ use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
 use crate::whitenoise::database::account::AccountRepositories;
 use crate::whitenoise::database::account_db::AccountDatabase;
 use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::event_processor::GiftwrapThrottle;
 
 /// Returns the per-account SQLite path under the given data directory.
 pub(crate) fn account_db_path(
@@ -118,6 +119,13 @@ pub struct AccountSession {
     pub(crate) pending_push_token_responses: Arc<DashMap<(GroupId, EventId), ()>>,
     /// Bounds concurrently-active delayed MIP-05 token-list response tasks.
     token_response_semaphore: Arc<Semaphore>,
+    /// Per-account budget for inbound gift-wrap (kind:1059) NIP-44 decryption.
+    /// Gates `extract_rumor` calls to bound CPU and battery spent on welcome
+    /// spam regardless of attacker fan-out. The KeyPackage reference that
+    /// could identify the inviter sits inside the encrypted rumor, so
+    /// pre-decrypt filtering is structurally impossible — a token bucket on
+    /// the outer gift-wrap is the only client-side defense.
+    pub(crate) giftwrap_throttle: Arc<GiftwrapThrottle>,
 }
 
 impl AccountSession {
@@ -167,6 +175,7 @@ impl AccountSession {
             token_response_semaphore: Arc::new(Semaphore::new(
                 crate::whitenoise::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,
             )),
+            giftwrap_throttle: Arc::new(GiftwrapThrottle::default_for_account()),
         })
     }
 

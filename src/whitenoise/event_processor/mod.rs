@@ -16,7 +16,10 @@ use crate::{
 
 mod account_event_processor;
 mod event_handlers;
+mod giftwrap_throttle;
 mod global_event_processor;
+
+pub(crate) use giftwrap_throttle::GiftwrapThrottle;
 
 impl Whitenoise {
     /// Start the event processing loop in a background task
