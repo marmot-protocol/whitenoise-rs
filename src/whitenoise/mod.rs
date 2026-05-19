@@ -64,6 +64,7 @@ pub mod message_streaming;
 pub mod messages;
 pub mod mute_list;
 pub mod notification_streaming;
+pub mod product_analytics;
 pub mod push_notifications;
 pub mod relays;
 pub mod scheduled_tasks;
@@ -156,6 +157,9 @@ pub struct WhitenoiseConfig {
     /// Configured discovery relays for the relay-control discovery plane.
     pub discovery_relays: Vec<RelayUrl>,
 
+    /// Opt-in product analytics configuration.
+    pub product_analytics_config: Option<product_analytics::ProductAnalyticsConfig>,
+
     /// Relay URLs adopted as a freshly-created account's NIP-65, Inbox, and
     /// KeyPackage lists when no existing relay-list events are found on the
     /// network. Seeded from [`Relay::defaults`]; override with
@@ -186,6 +190,7 @@ impl WhitenoiseConfig {
             #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
+            product_analytics_config: None,
             default_account_relays: Relay::urls(&Relay::defaults()),
         }
     }
@@ -213,12 +218,22 @@ impl WhitenoiseConfig {
             #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
+            product_analytics_config: None,
             default_account_relays: Relay::urls(&Relay::defaults()),
         }
     }
 
     pub fn with_discovery_relays(mut self, discovery_relays: Vec<RelayUrl>) -> Self {
         self.discovery_relays = discovery_relays;
+        self
+    }
+
+    /// Configure opt-in product analytics; validated when `Whitenoise` is initialized.
+    pub fn with_product_analytics_config(
+        mut self,
+        config: product_analytics::ProductAnalyticsConfig,
+    ) -> Self {
+        self.product_analytics_config = Some(config);
         self
     }
 
@@ -400,8 +415,9 @@ impl Whitenoise {
         mut config: WhitenoiseConfig,
         database: Arc<Database>,
         components: WhitenoiseComponents,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>> {
         config.normalize_keyring_service_id();
+        config.validate_product_analytics_config()?;
         let mut session_salt = [0u8; 16];
         ::rand::rng().fill_bytes(&mut session_salt);
         let discovery_relays = config.discovery_relays.clone();
@@ -418,7 +434,7 @@ impl Whitenoise {
 
         let config = Arc::new(config);
 
-        Arc::new_cyclic(move |weak: &Weak<Self>| {
+        let whitenoise = Arc::new_cyclic(move |weak: &Weak<Self>| {
             let UseWhitenoiseEventTracker = event_tracker;
             let event_tracker_arc: std::sync::Arc<dyn event_tracker::EventTracker> =
                 Arc::new(WhitenoiseEventTracker::new(database.clone(), weak.clone()));
@@ -451,7 +467,8 @@ impl Whitenoise {
                 this: weak.clone(),
                 background_handles: Mutex::new(Vec::new()),
             }
-        })
+        });
+        Ok(whitenoise)
     }
 
     /// Access the runtime configuration. The `WhitenoiseConfig` value is held
@@ -789,6 +806,7 @@ impl Whitenoise {
 
         // Validate keyring_service_id is not empty or whitespace
         config.normalize_keyring_service_id();
+        config.validate_product_analytics_config()?;
         if config.keyring_service_id.is_empty() {
             return Err(WhitenoiseError::Configuration(
                 "keyring_service_id cannot be empty or whitespace".to_string(),
@@ -899,7 +917,7 @@ impl Whitenoise {
                 shutdown_sender,
                 scheduler_shutdown,
             },
-        );
+        )?;
         whitenoise
             .shared
             .relay_control
@@ -1146,6 +1164,14 @@ impl Whitenoise {
         self.shutdown_event_processing().await?;
         self.shutdown_scheduled_tasks().await;
         self.wait_for_pending_background_tasks().await;
+
+        if let Err(e) = self.flush_product_analytics().await {
+            tracing::warn!(
+                target: "whitenoise::shutdown",
+                error = %e,
+                "Failed to flush product analytics during shutdown"
+            );
+        }
 
         tracing::info!(target: "whitenoise::shutdown", "Graceful shutdown complete");
         Ok(())
@@ -1653,7 +1679,8 @@ pub mod test_utils {
                 shutdown_sender,
                 scheduler_shutdown,
             },
-        );
+        )
+        .unwrap();
 
         (whitenoise, event_receiver, data_temp, logs_temp)
     }
@@ -5428,5 +5455,28 @@ mod tests {
                 "Fallback should not contain duplicates"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn new_rejects_invalid_product_analytics_config_before_creating_dirs() {
+        let (config, _data_temp, _logs_temp) = create_test_config();
+        let data_dir = config.data_dir.clone();
+        let logs_dir = config.logs_dir.clone();
+        let config =
+            config.with_product_analytics_config(product_analytics::ProductAnalyticsConfig {
+                backend: product_analytics::ProductAnalyticsBackend::Disabled,
+                app_version: "1.0.0".to_string(),
+                bundle_identifier: "not a bundle".to_string(),
+                device_class: product_analytics::ProductAnalyticsDeviceClass::Desktop,
+                os_name: "macOS".to_string(),
+                locale: "en-US".to_string(),
+                is_debug: true,
+            });
+
+        let err = Whitenoise::new(config).await.unwrap_err();
+
+        assert!(matches!(err, WhitenoiseError::ProductAnalytics(_)));
+        assert!(!data_dir.exists());
+        assert!(!logs_dir.exists());
     }
 }

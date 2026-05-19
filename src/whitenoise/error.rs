@@ -167,6 +167,9 @@ pub enum WhitenoiseError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("Product analytics error: {0}")]
+    ProductAnalytics(String),
+
     #[error("Invalid event kind: expected {expected}, got {got}")]
     InvalidEventKind { expected: String, got: String },
 

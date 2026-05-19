@@ -590,6 +590,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: macos-latest
+          cache-bin: false
 
       - name: Check
         run: cargo check --all-targets --all-features
@@ -612,6 +613,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: macos-14
+          cache-bin: false
 
       - name: Check
         run: cargo check --all-targets --all-features

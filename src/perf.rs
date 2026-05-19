@@ -202,3 +202,66 @@ macro_rules! perf_span {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_trace_id_is_monotonic() {
+        let first = next_trace_id();
+        let second = next_trace_id();
+
+        assert!(second > first);
+    }
+
+    #[tokio::test]
+    async fn current_trace_id_defaults_to_zero() {
+        assert_eq!(current_trace_id(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_trace_id_scopes_current_trace_id_across_awaits() {
+        let trace_id = with_trace_id(42, async {
+            tokio::task::yield_now().await;
+            current_trace_id()
+        })
+        .await;
+
+        assert_eq!(trace_id, 42);
+        assert_eq!(current_trace_id(), 0);
+    }
+
+    #[tokio::test]
+    async fn spawned_scope_can_reuse_current_trace_id() {
+        let trace_id = with_trace_id(7, async {
+            let current = current_trace_id();
+            tokio::spawn(with_trace_id(current, async move { current_trace_id() }))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert_eq!(trace_id, 7);
+    }
+
+    #[test]
+    fn perf_guard_captures_span_metadata() {
+        let guard = PerfGuard::new("tests::span");
+
+        assert_eq!(guard.name, "tests::span");
+        assert_eq!(guard.trace_id, 0);
+        assert!(guard.ts_begin_us > 0);
+    }
+
+    #[tokio::test]
+    async fn perf_guard_reads_scoped_trace_id() {
+        let trace_id = with_trace_id(99, async {
+            let guard = PerfGuard::new("tests::scoped_span");
+            guard.trace_id
+        })
+        .await;
+
+        assert_eq!(trace_id, 99);
+    }
+}
