@@ -197,7 +197,7 @@ impl PerfTracingLayer {
             .collect();
 
         // Hottest markers (most total time) first
-        breakdowns.sort_by(|a, b| b.total_ns.cmp(&a.total_ns));
+        breakdowns.sort_by_key(|breakdown| std::cmp::Reverse(breakdown.total_ns));
         breakdowns
     }
 

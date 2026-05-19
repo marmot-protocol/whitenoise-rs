@@ -12,6 +12,8 @@ use super::{Database, DatabaseError};
 use crate::perf_instrument;
 use crate::whitenoise::error::WhitenoiseError;
 
+const MAX_WAVEFORM_SAMPLES: usize = 16_384;
+
 /// Optional metadata for media files stored as JSONB
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct FileMetadata {
@@ -26,6 +28,12 @@ pub struct FileMetadata {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbhash: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<Vec<u8>>,
 }
 
 impl FileMetadata {
@@ -54,11 +62,41 @@ impl FileMetadata {
         self
     }
 
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    pub fn with_waveform(mut self, waveform: Vec<u8>) -> Self {
+        self.waveform = Self::is_valid_waveform(&waveform).then_some(waveform);
+        self
+    }
+
+    pub fn is_valid_waveform(waveform: &[u8]) -> bool {
+        !waveform.is_empty()
+            && waveform.len() <= MAX_WAVEFORM_SAMPLES
+            && waveform.iter().all(|sample| *sample <= 100)
+    }
+
+    pub(crate) fn sanitized_for_storage(&self) -> Self {
+        let mut sanitized = self.clone();
+        if sanitized
+            .waveform
+            .as_deref()
+            .is_some_and(|waveform| !Self::is_valid_waveform(waveform))
+        {
+            sanitized.waveform = None;
+        }
+        sanitized
+    }
+
     pub fn is_empty(&self) -> bool {
         self.original_filename.is_none()
             && self.dimensions.is_none()
             && self.blurhash.is_none()
             && self.thumbhash.is_none()
+            && self.duration_ms.is_none()
+            && self.waveform.is_none()
     }
 }
 
@@ -339,7 +377,11 @@ impl MediaFile {
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;
 
-        let file_metadata_json = params.file_metadata.filter(|m| !m.is_empty()).map(Json);
+        let file_metadata_json = params
+            .file_metadata
+            .map(FileMetadata::sanitized_for_storage)
+            .filter(|m| !m.is_empty())
+            .map(Json);
 
         // Upsert blob on shared DB.
         sqlx::query(
@@ -1856,6 +1898,45 @@ mod tests {
         );
         assert_eq!(retrieved.original_filename, Some("photo.jpg".to_string()));
         assert_eq!(retrieved.dimensions, Some("800x600".to_string()));
+    }
+
+    #[test]
+    fn test_file_metadata_audio_fields_serde_roundtrip() {
+        let metadata = FileMetadata::new()
+            .with_filename("voice.mp3".to_string())
+            .with_duration_ms(12_345)
+            .with_waveform(vec![0, 8, 42, 100]);
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("\"duration_ms\":12345"));
+        assert!(json.contains("\"waveform\":[0,8,42,100]"));
+
+        let decoded: FileMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.duration_ms, Some(12_345));
+        assert_eq!(decoded.waveform, Some(vec![0, 8, 42, 100]));
+        assert_eq!(decoded.original_filename, Some("voice.mp3".to_string()));
+    }
+
+    #[test]
+    fn test_file_metadata_skips_absent_audio_fields() {
+        let metadata = FileMetadata::new().with_filename("photo.jpg".to_string());
+
+        let json = serde_json::to_string(&metadata).unwrap();
+
+        assert!(!json.contains("duration_ms"));
+        assert!(!json.contains("waveform"));
+    }
+
+    #[test]
+    fn test_file_metadata_invalid_waveform_is_omitted() {
+        let metadata = FileMetadata::new()
+            .with_filename("voice.mp3".to_string())
+            .with_waveform(vec![0, 101]);
+
+        assert!(metadata.waveform.is_none());
+
+        let oversized = FileMetadata::new().with_waveform(vec![50; MAX_WAVEFORM_SAMPLES + 1]);
+        assert!(oversized.waveform.is_none());
     }
 
     #[tokio::test]

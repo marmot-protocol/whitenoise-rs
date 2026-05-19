@@ -26,7 +26,7 @@ use crate::whitenoise::database::media_files::{FileMetadata, MediaFile};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::groups::blossom_error::BlossomError;
 use crate::whitenoise::groups::media::{is_debug_local_blossom_url, require_https};
-use crate::whitenoise::media_files::MediaFileUpload;
+use crate::whitenoise::media_files::{AudioMetadata, MediaFileUpload};
 use crate::whitenoise::session::AccountSession;
 
 /// Shared HTTP client for Blossom blob downloads.
@@ -279,6 +279,26 @@ impl<'a> MediaOps<'a> {
         blossom_server_url: Option<Url>,
         options: Option<MediaProcessingOptions>,
     ) -> Result<MediaFile> {
+        self.upload_chat_media_with_audio_metadata(
+            group_id,
+            file_path,
+            blossom_server_url,
+            options,
+            None,
+        )
+        .await
+    }
+
+    /// Uploads a chat media file and persists caller-supplied audio display metadata.
+    #[perf_instrument("groups")]
+    pub async fn upload_chat_media_with_audio_metadata(
+        &self,
+        group_id: &GroupId,
+        file_path: &str,
+        blossom_server_url: Option<Url>,
+        options: Option<MediaProcessingOptions>,
+        audio_metadata: Option<AudioMetadata>,
+    ) -> Result<MediaFile> {
         let file_data = tokio::fs::read(file_path).await?;
         let media_detection = crate::types::detect_media_type(&file_data)?;
 
@@ -287,7 +307,7 @@ impl<'a> MediaOps<'a> {
             .and_then(|n| n.to_str())
             .ok_or_else(|| WhitenoiseError::Internal("Invalid file path".to_string()))?;
 
-        let prepared = {
+        let mut prepared = {
             let media_manager = self.session.mdk.media_manager(group_id.clone());
 
             media_manager.encrypt_for_upload_with_options(
@@ -297,6 +317,10 @@ impl<'a> MediaOps<'a> {
                 &options.unwrap_or_default(),
             )?
         };
+        if let Some(metadata) = audio_metadata {
+            prepared.duration_ms = metadata.duration_ms;
+            prepared.waveform = metadata.waveform;
+        }
 
         let blossom_server_url = blossom_server_url.unwrap_or_else(Self::default_blossom_url);
         let upload_keys = nostr_sdk::Keys::generate();
@@ -332,6 +356,8 @@ impl<'a> MediaOps<'a> {
             dimensions: prepared.dimensions.map(|(w, h)| format!("{}x{}", w, h)),
             blurhash: prepared.blurhash.clone(),
             thumbhash: prepared.thumbhash.clone(),
+            duration_ms: prepared.duration_ms,
+            waveform: prepared.waveform.clone(),
         });
 
         let upload = MediaFileUpload {
@@ -790,6 +816,8 @@ impl<'a> MediaOps<'a> {
             mime_type: media_file.mime_type.clone(),
             filename: filename.to_string(),
             dimensions: None,
+            duration_ms: None,
+            waveform: None,
             scheme_version,
             nonce,
         };

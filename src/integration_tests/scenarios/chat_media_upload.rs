@@ -4,6 +4,7 @@ use crate::integration_tests::{
     core::*,
     test_cases::{chat_media_upload::*, shared::*},
 };
+use crate::whitenoise::media_files::AudioMetadata;
 use crate::{Whitenoise, WhitenoiseError};
 use async_trait::async_trait;
 
@@ -75,6 +76,18 @@ impl Scenario for ChatMediaUploadScenario {
         UploadAudioTestCase::new("media_uploader", "media_upload_test_group")
             .execute(&mut self.context)
             .await?;
+
+        // Test receiving an audio imeta with display metadata.
+        ReceiveMessageWithMediaTestCase::new(
+            "media_uploader",
+            "media_member",
+            "media_upload_test_group",
+        )
+        .with_media_file("uploaded_audio_media")
+        .with_message_content("Listen to this")
+        .with_audio_metadata(AudioMetadata::new(Some(12_345), Some(vec![0, 8, 42, 100]))?)
+        .execute(&mut self.context)
+        .await?;
 
         // Test PDF document upload
         UploadPdfTestCase::new("media_uploader", "media_upload_test_group")

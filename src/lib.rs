@@ -67,6 +67,7 @@ pub use whitenoise::drafts::Draft;
 // Media files
 pub use whitenoise::database::aggregated_messages::PaginationOptions;
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
+pub use whitenoise::media_files::{AudioMetadata, build_chat_media_imeta_tag};
 
 // Mute list
 pub use whitenoise::database::mute_list::MuteListEntry;

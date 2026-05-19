@@ -154,7 +154,7 @@ pub(crate) fn add_reaction_to_message(
     target_message
         .reactions
         .user_reactions
-        .sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        .sort_by_key(|reaction| reaction.created_at);
 }
 
 #[cfg(test)]
