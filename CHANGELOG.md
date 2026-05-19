@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Thumbhash support for media previews alongside existing blurhash, allowing clients to migrate over time ([#714] [@erskingardner])
+- Audio chat media metadata is now first-class in media records, including optional duration, waveform, and an imeta tag helper for app bindings ([#833] [@erskingardner])
 - CLI message reactions (react/unreact) ([#564] [@jgmontoya])
 - CLI message delete, retry, and reply commands ([#565] [@jgmontoya])
 - CLI media commands for uploading files and images ([#566] [@jgmontoya])
@@ -289,6 +290,7 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 [#580]: https://github.com/marmot-protocol/whitenoise-rs/pull/580
 [#591]: https://github.com/marmot-protocol/whitenoise-rs/pull/591
 [#714]: https://github.com/marmot-protocol/whitenoise-rs/pull/714
+[#833]: https://github.com/marmot-protocol/whitenoise-rs/pull/833
 
 
 <!-- Tags -->

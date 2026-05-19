@@ -22,18 +22,169 @@ use crate::{
     },
 };
 
+/// Display metadata for audio chat media.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default)]
+pub struct AudioMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<Vec<u8>>,
+}
+
+impl AudioMetadata {
+    pub fn new(duration_ms: Option<u64>, waveform: Option<Vec<u8>>) -> Result<Self> {
+        if let Some(samples) = waveform.as_deref()
+            && !FileMetadata::is_valid_waveform(samples)
+        {
+            return Err(WhitenoiseError::InvalidInput(
+                "waveform samples must be integers in the inclusive range 0..100 and at most 16384 samples".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            duration_ms,
+            waveform,
+        })
+    }
+
+    fn from_file_metadata(metadata: &FileMetadata) -> Self {
+        Self {
+            duration_ms: metadata.duration_ms,
+            waveform: metadata.waveform.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.duration_ms.is_none() && self.waveform.is_none()
+    }
+}
+
+/// Builds a MIP-04 `imeta` tag for encrypted chat media.
+///
+/// Required decryption fields (`url`, `m`, `filename`, `x`, `n`, `v`) are
+/// strict. Optional display fields are included when present and valid.
+pub fn build_chat_media_imeta_tag(
+    media_file: &MediaFile,
+    audio_metadata: Option<&AudioMetadata>,
+) -> Result<Tag> {
+    let blossom_url = media_file.blossom_url.as_deref().ok_or_else(|| {
+        WhitenoiseError::InvalidInput("chat media is missing blossom_url".to_string())
+    })?;
+    let filename = media_file
+        .file_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.original_filename.as_deref())
+        .ok_or_else(|| {
+            WhitenoiseError::InvalidInput("chat media is missing filename metadata".to_string())
+        })?;
+    let original_file_hash = media_file.original_file_hash.as_deref().ok_or_else(|| {
+        WhitenoiseError::InvalidInput("chat media is missing original_file_hash".to_string())
+    })?;
+    if original_file_hash.len() != 32 {
+        return Err(WhitenoiseError::InvalidInput(format!(
+            "chat media original_file_hash must be 32 bytes, got {}",
+            original_file_hash.len()
+        )));
+    }
+    let nonce = media_file
+        .nonce
+        .as_deref()
+        .ok_or_else(|| WhitenoiseError::InvalidInput("chat media is missing nonce".to_string()))?;
+    let scheme_version = media_file.scheme_version.as_deref().ok_or_else(|| {
+        WhitenoiseError::InvalidInput("chat media is missing scheme_version".to_string())
+    })?;
+
+    let mut tag_values = vec![
+        format!("url {}", blossom_url),
+        format!("m {}", media_file.mime_type),
+        format!("filename {}", filename),
+    ];
+
+    if let Some(metadata) = media_file.file_metadata.as_ref() {
+        if let Some(dimensions) = metadata.dimensions.as_ref() {
+            tag_values.push(format!("dim {}", dimensions));
+        }
+        if let Some(blurhash) = metadata.blurhash.as_ref() {
+            tag_values.push(format!("blurhash {}", blurhash));
+        }
+        if let Some(thumbhash) = metadata.thumbhash.as_ref() {
+            tag_values.push(format!("thumbhash {}", thumbhash));
+        }
+    }
+
+    tag_values.push(format!("x {}", hex::encode(original_file_hash)));
+    tag_values.push(format!("n {}", nonce));
+    tag_values.push(format!("v {}", scheme_version));
+
+    let file_audio_metadata = media_file
+        .file_metadata
+        .as_ref()
+        .map(AudioMetadata::from_file_metadata)
+        .filter(|metadata| !metadata.is_empty());
+    let effective_audio_metadata = audio_metadata.or(file_audio_metadata.as_ref());
+    if let Some(metadata) = effective_audio_metadata {
+        if let Some(duration) = metadata.duration_ms.and_then(format_duration_seconds) {
+            tag_values.push(format!("duration {}", duration));
+        }
+        if let Some(samples) = metadata.waveform.as_deref().and_then(format_waveform) {
+            tag_values.push(format!("waveform {}", samples));
+        }
+    }
+
+    Ok(Tag::custom(TagKind::Custom("imeta".into()), tag_values))
+}
+
+fn format_duration_seconds(duration_ms: u64) -> Option<String> {
+    if duration_ms == 0 {
+        return None;
+    }
+
+    let seconds = duration_ms / 1000;
+    let millis = duration_ms % 1000;
+    if millis == 0 {
+        return Some(seconds.to_string());
+    }
+
+    let mut fractional = format!("{:03}", millis);
+    while fractional.ends_with('0') {
+        fractional.pop();
+    }
+    Some(format!("{}.{}", seconds, fractional))
+}
+
+fn format_waveform(waveform: &[u8]) -> Option<String> {
+    if !FileMetadata::is_valid_waveform(waveform) {
+        return None;
+    }
+
+    Some(
+        waveform
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// Parsed media reference with additional fields not in MDK's MediaReference
 ///
-/// Wraps MDK's MediaReference and adds fields we need that MDK doesn't parse
+/// Wraps MDK's MediaReference and adds fields we need that MDK doesn't parse.
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedMediaReference {
-    /// MDK's parsed reference (url, original_hash, mime_type, filename, dimensions)
+    /// MDK's parsed reference (url, original_hash, mime_type, filename, dimensions, audio metadata)
     reference: MediaReference,
     /// Encrypted hash extracted from Blossom URL (needed for our DB schema)
     encrypted_hash: [u8; 32],
     /// Blurhash for image preview (optional, not parsed by MDK)
     blurhash: Option<String>,
     /// Thumbhash for image preview (optional, not parsed by MDK)
+    thumbhash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedDisplayMetadata {
+    blurhash: Option<String>,
     thumbhash: Option<String>,
 }
 
@@ -266,10 +417,11 @@ impl<'a> MediaFiles<'a> {
     /// - MIME type canonicalization
     /// - Filename validation
     /// - Version compatibility
+    /// - Optional audio display metadata (duration, waveform) as best-effort fields
     ///
     /// Additionally extracts fields that MDK doesn't parse:
     /// - encrypted_hash (from Blossom URL)
-    /// - blurhash (optional field for image previews)
+    /// - blurhash/thumbhash (optional fields for image previews)
     ///
     /// # Arguments
     /// * `inner_event` - The decrypted inner event containing imeta tags
@@ -321,48 +473,56 @@ impl<'a> MediaFiles<'a> {
                 }
             };
 
-            // Extract blurhash and thumbhash (optional fields that MDK doesn't parse)
-            let (blurhash, thumbhash) = Self::extract_hashes_from_tag(tag);
+            // Extract optional preview hashes not exposed by MDK's MediaReference.
+            let display_metadata = Self::extract_display_metadata_from_tag(tag);
 
             parsed.push(ParsedMediaReference {
                 reference,
                 encrypted_hash: encrypted_file_hash,
-                blurhash,
-                thumbhash,
+                blurhash: display_metadata.blurhash,
+                thumbhash: display_metadata.thumbhash,
             });
         }
 
         Ok(parsed)
     }
 
-    /// Extracts blurhash and thumbhash from an imeta tag in a single pass.
+    /// Extracts optional preview hashes from an imeta tag in a single pass.
     ///
-    /// MDK's parser doesn't extract these fields, so we do it ourselves.
-    /// Formats: "blurhash <string>", "thumbhash <string>"
-    fn extract_hashes_from_tag(tag: &Tag) -> (Option<String>, Option<String>) {
+    /// MDK's parser handles required MIP-04 fields and audio display metadata,
+    /// but it does not expose preview hashes on `MediaReference`.
+    fn extract_display_metadata_from_tag(tag: &Tag) -> ParsedDisplayMetadata {
         let tag_vec = tag.clone().to_vec();
-        let mut blurhash = None;
-        let mut thumbhash = None;
+        let mut metadata = ParsedDisplayMetadata::default();
 
         for value in tag_vec.iter().skip(1) {
-            if blurhash.is_none()
-                && let Some(blur) = value.strip_prefix("blurhash ")
-                && !blur.is_empty()
-            {
-                blurhash = Some(blur.to_string());
+            let Some((key, raw_value)) = value.split_once(' ') else {
+                continue;
+            };
+            match key {
+                "blurhash" if metadata.blurhash.is_none() && !raw_value.is_empty() => {
+                    metadata.blurhash = Some(raw_value.to_string());
+                }
+                "thumbhash" if metadata.thumbhash.is_none() && !raw_value.is_empty() => {
+                    metadata.thumbhash = Some(raw_value.to_string());
+                }
+                _ => {}
             }
-            if thumbhash.is_none()
-                && let Some(thumb) = value.strip_prefix("thumbhash ")
-                && !thumb.is_empty()
-            {
-                thumbhash = Some(thumb.to_string());
-            }
-            if blurhash.is_some() && thumbhash.is_some() {
+            if metadata.blurhash.is_some() && metadata.thumbhash.is_some() {
                 break;
             }
         }
 
-        (blurhash, thumbhash)
+        metadata
+    }
+
+    /// Extracts blurhash and thumbhash from an imeta tag in a single pass.
+    ///
+    /// Kept as a small compatibility wrapper for existing unit tests.
+    #[cfg(test)]
+    fn extract_hashes_from_tag(tag: &Tag) -> (Option<String>, Option<String>) {
+        let metadata = Self::extract_display_metadata_from_tag(tag);
+        (metadata.blurhash, metadata.thumbhash)
     }
 
     /// Deletes media files from disk that have no database references.
@@ -473,6 +633,8 @@ impl<'a> MediaFiles<'a> {
                 dimensions,
                 blurhash: parsed.blurhash,
                 thumbhash: parsed.thumbhash,
+                duration_ms: reference.duration_ms,
+                waveform: reference.waveform.clone(),
             });
 
             // Create MediaFile record (without file yet - empty path until downloaded)
@@ -577,6 +739,42 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+    }
+
+    fn audio_imeta_tag(
+        encrypted_hash: [u8; 32],
+        original_hash: [u8; 32],
+        nonce: [u8; 12],
+        extra_fields: impl IntoIterator<Item = &'static str>,
+    ) -> Tag {
+        let mut tag_values = vec![
+            format!(
+                "url https://blossom.example.com/{}",
+                hex::encode(encrypted_hash)
+            ),
+            "m audio/mpeg".to_string(),
+            "filename voice.mp3".to_string(),
+        ];
+        tag_values.extend(extra_fields.into_iter().map(str::to_string));
+        tag_values.extend([
+            format!("x {}", hex::encode(original_hash)),
+            format!("n {}", hex::encode(nonce)),
+            "v mip04-v2".to_string(),
+        ]);
+
+        Tag::custom(TagKind::Custom("imeta".into()), tag_values)
+    }
+
+    fn event_with_tag(pubkey: PublicKey, tag: Tag) -> UnsignedEvent {
+        let mut event = UnsignedEvent::new(
+            pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![tag],
+            String::new(),
+        );
+        event.ensure_id();
+        event
     }
 
     #[tokio::test]
@@ -814,6 +1012,197 @@ mod tests {
         let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
         assert!(blurhash.is_none());
         assert!(thumbhash.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_and_store_imeta_persists_mdk_audio_metadata() {
+        let t = setup().await;
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
+        let group_id = GroupId::from_slice(&[7u8; 8]);
+        let original_hash = [9u8; 32];
+        let encrypted_hash = [10u8; 32];
+        let nonce = [11u8; 12];
+        let tag = audio_imeta_tag(
+            encrypted_hash,
+            original_hash,
+            nonce,
+            ["duration 12.345", "waveform 0 8 42 100"],
+        );
+        let event = event_with_tag(t.pubkey, tag);
+        let mdk = crate::whitenoise::accounts::test_utils::create_mdk(t.pubkey);
+        let media_manager = mdk.media_manager(group_id.clone());
+        let parsed_references = media_files
+            .parse_imeta_tags_from_event(&event, &media_manager)
+            .unwrap();
+
+        assert_eq!(parsed_references.len(), 1);
+        assert_eq!(parsed_references[0].reference.duration_ms, Some(12_345));
+        assert_eq!(
+            parsed_references[0].reference.waveform,
+            Some(vec![0, 8, 42, 100])
+        );
+
+        media_files
+            .store_parsed_media_references(&group_id, &t.pubkey, parsed_references)
+            .await
+            .unwrap();
+
+        let stored = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.pubkey,
+            &original_hash,
+            &group_id,
+        )
+        .await
+        .unwrap()
+        .expect("media reference should be stored");
+        let metadata = stored
+            .file_metadata
+            .expect("file metadata should be stored");
+        assert_eq!(metadata.original_filename, Some("voice.mp3".to_string()));
+        assert_eq!(metadata.duration_ms, Some(12_345));
+        assert_eq!(metadata.waveform, Some(vec![0, 8, 42, 100]));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_audio_metadata_is_omitted_without_dropping_reference() {
+        let t = setup().await;
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
+        let group_id = GroupId::from_slice(&[8u8; 8]);
+        let original_hash = [12u8; 32];
+        let encrypted_hash = [13u8; 32];
+        let nonce = [14u8; 12];
+        let tag = audio_imeta_tag(
+            encrypted_hash,
+            original_hash,
+            nonce,
+            ["duration not-a-number", "waveform 0 101", "thumbhash thumb"],
+        );
+        let event = event_with_tag(t.pubkey, tag);
+        let mdk = crate::whitenoise::accounts::test_utils::create_mdk(t.pubkey);
+        let media_manager = mdk.media_manager(group_id.clone());
+        let parsed_references = media_files
+            .parse_imeta_tags_from_event(&event, &media_manager)
+            .unwrap();
+
+        assert_eq!(parsed_references.len(), 1);
+        assert_eq!(parsed_references[0].thumbhash, Some("thumb".to_string()));
+        assert!(parsed_references[0].reference.duration_ms.is_none());
+        assert!(parsed_references[0].reference.waveform.is_none());
+
+        media_files
+            .store_parsed_media_references(&group_id, &t.pubkey, parsed_references)
+            .await
+            .unwrap();
+
+        let stored = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.pubkey,
+            &original_hash,
+            &group_id,
+        )
+        .await
+        .unwrap()
+        .expect("media reference should still be stored");
+        let metadata = stored
+            .file_metadata
+            .expect("file metadata should be stored");
+        assert_eq!(metadata.original_filename, Some("voice.mp3".to_string()));
+        assert_eq!(metadata.thumbhash, Some("thumb".to_string()));
+        assert!(metadata.duration_ms.is_none());
+        assert!(metadata.waveform.is_none());
+    }
+
+    #[test]
+    fn test_build_chat_media_imeta_tag_includes_audio_metadata() {
+        let original_hash = [9u8; 32];
+        let encrypted_hash = [10u8; 32];
+        let metadata = FileMetadata::new()
+            .with_filename("voice.mp3".to_string())
+            .with_duration_ms(12_345)
+            .with_waveform(vec![0, 8, 42, 100]);
+        let media_file = MediaFile {
+            id: Some(1),
+            mls_group_id: GroupId::from_slice(&[1u8; 8]),
+            account_pubkey: PublicKey::from_slice(&[2u8; 32]).unwrap(),
+            file_path: PathBuf::from("/tmp/voice.mp3"),
+            original_file_hash: Some(original_hash.to_vec()),
+            encrypted_file_hash: encrypted_hash.to_vec(),
+            mime_type: "audio/mpeg".to_string(),
+            media_type: "chat_media".to_string(),
+            blossom_url: Some(format!(
+                "https://blossom.example.com/{}",
+                hex::encode(encrypted_hash)
+            )),
+            nostr_key: None,
+            file_metadata: Some(metadata),
+            nonce: Some("0102030405060708090a0b0c".to_string()),
+            scheme_version: Some("mip04-v2".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+
+        let tag = build_chat_media_imeta_tag(&media_file, None).unwrap();
+        let tag_values = tag.clone().to_vec();
+
+        assert!(tag_values.contains(&format!("x {}", hex::encode(original_hash))));
+        assert!(tag_values.contains(&"duration 12.345".to_string()));
+        assert!(tag_values.contains(&"waveform 0 8 42 100".to_string()));
+        assert!(tag_values.contains(&"v mip04-v2".to_string()));
+
+        let mdk = crate::whitenoise::accounts::test_utils::create_mdk(media_file.account_pubkey);
+        let media_manager = mdk.media_manager(media_file.mls_group_id.clone());
+        let parsed = media_manager.parse_imeta_tag(&tag).unwrap();
+        assert_eq!(parsed.duration_ms, Some(12_345));
+        assert_eq!(parsed.waveform, Some(vec![0, 8, 42, 100]));
+    }
+
+    #[test]
+    fn test_build_chat_media_imeta_tag_omits_invalid_optional_audio_metadata() {
+        let original_hash = [9u8; 32];
+        let encrypted_hash = [10u8; 32];
+        let media_file = MediaFile {
+            id: Some(1),
+            mls_group_id: GroupId::from_slice(&[1u8; 8]),
+            account_pubkey: PublicKey::from_slice(&[2u8; 32]).unwrap(),
+            file_path: PathBuf::from("/tmp/voice.mp3"),
+            original_file_hash: Some(original_hash.to_vec()),
+            encrypted_file_hash: encrypted_hash.to_vec(),
+            mime_type: "audio/mpeg".to_string(),
+            media_type: "chat_media".to_string(),
+            blossom_url: Some(format!(
+                "https://blossom.example.com/{}",
+                hex::encode(encrypted_hash)
+            )),
+            nostr_key: None,
+            file_metadata: Some(FileMetadata {
+                original_filename: Some("voice.mp3".to_string()),
+                dimensions: None,
+                blurhash: None,
+                thumbhash: None,
+                duration_ms: Some(0),
+                waveform: Some(vec![0, 101]),
+            }),
+            nonce: Some("0102030405060708090a0b0c".to_string()),
+            scheme_version: Some("mip04-v2".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+
+        let tag = build_chat_media_imeta_tag(&media_file, None).unwrap();
+        let tag_values = tag.to_vec();
+
+        assert!(
+            !tag_values
+                .iter()
+                .any(|value| value.starts_with("duration "))
+        );
+        assert!(
+            !tag_values
+                .iter()
+                .any(|value| value.starts_with("waveform "))
+        );
+        assert!(tag_values.contains(&format!("x {}", hex::encode(original_hash))));
     }
 
     #[tokio::test]

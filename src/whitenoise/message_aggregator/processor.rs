@@ -39,7 +39,7 @@ pub async fn process_messages(
     let mut orphaned_messages = Vec::new();
 
     let mut sorted_messages = messages;
-    sorted_messages.sort_unstable_by_key(|message| message.created_at);
+    sorted_messages.sort_by_key(|message| message.created_at);
 
     if config.enable_debug_logging {
         tracing::debug!(

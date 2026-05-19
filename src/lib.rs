@@ -74,6 +74,7 @@ pub use whitenoise::drafts::Draft;
 // Media files
 pub use whitenoise::database::aggregated_messages::PaginationOptions;
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
+pub use whitenoise::media_files::{AudioMetadata, build_chat_media_imeta_tag};
 
 // Mute list
 pub use whitenoise::database::mute_list::MuteListEntry;
@@ -106,9 +107,9 @@ pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
 };
 
-// Background notification collection (iOS silent push). The async function
-// is re-exported alongside the result types so Rust callers can drive
-// collection directly without going through the FFI layer.
+// Background notification collection. The async function is re-exported
+// alongside the result types so Rust callers can drive collection directly
+// without going through the FFI layer.
 pub use whitenoise::background_notifications::{
     BackgroundNotificationResult, BackgroundNotificationStatus, NotificationDto,
     NotificationUserDto, collect_notifications_after_push,
