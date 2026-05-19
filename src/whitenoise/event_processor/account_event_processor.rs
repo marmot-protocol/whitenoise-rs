@@ -790,10 +790,6 @@ mod tests {
     async fn test_external_signer_decrypt_failure_is_deferred_not_terminal() {
         use std::pin::Pin;
 
-        use nostr::SignerBackend;
-        use nostr::signer::SignerError;
-        use nostr::util::BoxedFuture;
-
         // Minimal mock NostrSigner whose backend is `Custom` (non-Keys)
         // and whose `nip44_decrypt` always returns an error. Other
         // methods are unreachable for this test path because
@@ -802,16 +798,16 @@ mod tests {
         struct FailingExternalSigner;
 
         impl NostrSigner for FailingExternalSigner {
-            fn backend(&self) -> SignerBackend {
+            fn backend(&self) -> SignerBackend<'_> {
                 SignerBackend::Custom(std::borrow::Cow::Borrowed("test-failing-signer"))
             }
-            fn get_public_key(&self) -> BoxedFuture<Result<PublicKey, SignerError>> {
+            fn get_public_key(&self) -> BoxedFuture<'_, Result<PublicKey, SignerError>> {
                 Box::pin(async { Err(SignerError::from("not implemented in test")) })
             }
             fn sign_event(
                 &self,
                 _unsigned: UnsignedEvent,
-            ) -> BoxedFuture<Result<Event, SignerError>> {
+            ) -> BoxedFuture<'_, Result<Event, SignerError>> {
                 Box::pin(async { Err(SignerError::from("not implemented in test")) })
             }
             fn nip04_encrypt<'a>(

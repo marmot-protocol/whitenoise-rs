@@ -73,7 +73,7 @@ impl Whitenoise {
         // identically as `nip59::Error::Signer(SignerError(String))` —
         // the only way to distinguish them is by what kind of signer
         // produced the error.
-        let signer_backend_is_keys = matches!(signer.backend(), nostr::SignerBackend::Keys);
+        let signer_backend_is_keys = matches!(signer.backend(), SignerBackend::Keys);
 
         let _decrypt_span = perf_span!("event_handlers::giftwrap_decrypt");
         let unwrapped = match extract_rumor(&signer, &event).await {
@@ -88,7 +88,7 @@ impl Whitenoise {
             // reachable. Skipping the retry queue here also prevents an
             // attacker able to disturb the signer transport from
             // amplifying token consumption.
-            Err(nostr::nips::nip59::Error::Signer(e)) if !signer_backend_is_keys => {
+            Err(nip59::Error::Signer(e)) if !signer_backend_is_keys => {
                 tracing::warn!(
                     target: "whitenoise::event_handlers::handle_giftwrap",
                     account = %account.pubkey.to_hex(),
