@@ -143,57 +143,25 @@ impl Whitenoise {
                             );
                         }
                     }
-                    Kind::GiftWrap => {
-                        // Use rumor timestamp for advancement per NIP-59
-                        match self
-                            .extract_rumor_timestamp_for_advancement(&event, &session)
-                            .await
-                        {
-                            Ok(Some(rumor_timestamp)) => {
-                                let safe_timestamp = cap_timestamp_to_now(rumor_timestamp);
-                                let created_ms = (safe_timestamp.as_secs() as i64) * 1000;
-
-                                if let Err(e) = Account::update_last_synced_max(
-                                    &account.pubkey,
-                                    created_ms,
-                                    &self.shared.database,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        target: "whitenoise::event_processor::process_account_event",
-                                        "Failed to advance last_synced_at with rumor timestamp for {}: {}",
-                                        account.pubkey.to_hex(),
-                                        e
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        target: "whitenoise::event_processor::process_account_event",
-                                        "Updated last_synced_at (if older) for {} with rumor timestamp {} (ms) [capped from original {}]",
-                                        account.pubkey.to_hex(),
-                                        created_ms,
-                                        rumor_timestamp.as_secs() * 1000
-                                    );
-                                }
-                            }
-                            Ok(None) => {
-                                tracing::debug!(
-                                    target: "whitenoise::event_processor::process_account_event",
-                                    "Skipping timestamp advancement for giftwrap with failed rumor extraction"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "whitenoise::event_processor::process_account_event",
-                                    "Failed to extract rumor timestamp for {}: {}",
-                                    account.pubkey.to_hex(),
-                                    e
-                                );
-                            }
-                        }
-                    }
+                    // GiftWrap watermark advancement is handled inside
+                    // handle_giftwrap so a single decrypt serves both
+                    // Welcome processing and sync advancement.
                     _ => {}
                 }
+            }
+            Err(WhitenoiseError::GiftwrapThrottled | WhitenoiseError::GiftwrapDeferred) => {
+                // Deliberate defer (throttle budget exhausted or signer
+                // backend transiently unavailable), not a failure. Do
+                // NOT record as processed (relay replay must redeliver
+                // once the bucket refills or the signer recovers) and
+                // do NOT schedule a retry (in-process retry would hit
+                // the same condition with no new information).
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_account_event",
+                    account = %account.pubkey.to_hex(),
+                    event_id = %event.id.to_hex(),
+                    "Gift-wrap deferred; awaiting relay redelivery"
+                );
             }
             Err(e) => {
                 // Handle retry logic for actual processing errors
@@ -360,27 +328,6 @@ impl Whitenoise {
                 );
                 Ok(()) // Unhandled events are not errors
             }
-        }
-    }
-
-    /// Extract rumor timestamp from giftwrap event for sync advancement.
-    ///
-    /// Only called after `handle_giftwrap` succeeds. A missing signer here
-    /// is surfaced as `SignerUnavailable` so it is distinguishable from an
-    /// actual rumor-extraction failure in the caller's logs.
-    #[perf_instrument("event_processor")]
-    async fn extract_rumor_timestamp_for_advancement(
-        &self,
-        event: &Event,
-        session: &Arc<AccountSession>,
-    ) -> Result<Option<Timestamp>> {
-        let signer = session
-            .get_signer()
-            .ok_or(WhitenoiseError::SignerUnavailable(session.account_pubkey))?;
-
-        match extract_rumor(&signer, event).await {
-            Ok(unwrapped) => Ok(Some(unwrapped.rumor.created_at)),
-            Err(_) => Ok(None), // Don't advance on extraction failure
         }
     }
 }
@@ -697,6 +644,267 @@ mod tests {
                 .await
                 .unwrap(),
             "Event should not be tracked when session is missing"
+        );
+    }
+
+    /// When the per-account gift-wrap throttle is exhausted, a validly-
+    /// targeted kind:1059 event must NOT be recorded as processed.
+    ///
+    /// If it were, relay replay deduplication
+    /// (`already_processed_account_event`) would silently drop the same
+    /// event id on its next redelivery — defeating the throttle's deferral
+    /// semantics and permanently losing legitimate Welcomes that arrived
+    /// in the same burst as the spam.
+    ///
+    /// This test locks the contract in place: a future refactor that
+    /// collapses `GiftwrapThrottled` back into the generic `Ok(())` /
+    /// `Err(_)` paths will fail here.
+    #[tokio::test]
+    async fn test_throttled_giftwrap_is_not_recorded_as_processed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let victim_account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&victim_account.pubkey).unwrap();
+
+        // Drain the bucket so the next handle_giftwrap returns GiftwrapThrottled.
+        while session.giftwrap_throttle.try_acquire() {}
+
+        // Build a kind:1059 event whose `p` tag points at the victim. The
+        // content is irrelevant — the throttle fires before decryption is
+        // attempted, so any bytes are fine.
+        let attacker_keys = Keys::generate();
+        let event = EventBuilder::new(Kind::GiftWrap, "ciphertext")
+            .tag(Tag::public_key(victim_account.pubkey))
+            .sign(&attacker_keys)
+            .await
+            .unwrap();
+
+        let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
+        whitenoise
+            .process_account_event(
+                event.clone(),
+                EventSource::RelaySubscription(SubscriptionContext {
+                    plane: RelayPlane::AccountInbox,
+                    account_pubkey: Some(victim_account.pubkey),
+                    relay_url,
+                    stream: SubscriptionStream::AccountInboxGiftwraps,
+                    group_ids: Vec::new(),
+                }),
+                Default::default(),
+            )
+            .await;
+
+        assert!(
+            !whitenoise
+                .shared
+                .event_tracker
+                .already_processed_account_event(&event.id, &victim_account.pubkey)
+                .await
+                .unwrap(),
+            "throttled gift-wrap must not be recorded as processed; \
+             relay replay must be free to redeliver it after the bucket refills"
+        );
+    }
+
+    /// An undecryptable gift-wrap MUST be marked processed and MUST consume
+    /// exactly one throttle token — not eleven.
+    ///
+    /// Bogus or mis-targeted NIP-44 ciphertext will never decrypt no matter
+    /// how many times we retry. Routing such failures through the generic
+    /// `schedule_retry` path (max 10 attempts) would re-enqueue the same
+    /// event and re-acquire a token on each attempt — letting a small burst
+    /// of garbage gift-wraps drain the per-account decrypt budget many
+    /// times over and starve legitimate Welcomes.
+    ///
+    /// This test pins the contract: a single bogus event consumes exactly
+    /// one token and is recorded as processed so any subsequent redelivery
+    /// is deduped.
+    #[tokio::test]
+    async fn test_undecryptable_giftwrap_is_terminal_not_retried() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let victim_account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&victim_account.pubkey).unwrap();
+        let tokens_before = session.giftwrap_throttle.tokens();
+
+        // Build a kind:1059 event targeted at the victim, but with garbage
+        // bytes that NIP-44 will fail to decrypt. The `p` tag is required
+        // so the event clears `validate_giftwrap_target`.
+        let attacker_keys = Keys::generate();
+        let event = EventBuilder::new(Kind::GiftWrap, "not-a-valid-nip44-payload")
+            .tag(Tag::public_key(victim_account.pubkey))
+            .sign(&attacker_keys)
+            .await
+            .unwrap();
+
+        let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
+        whitenoise
+            .process_account_event(
+                event.clone(),
+                EventSource::RelaySubscription(SubscriptionContext {
+                    plane: RelayPlane::AccountInbox,
+                    account_pubkey: Some(victim_account.pubkey),
+                    relay_url,
+                    stream: SubscriptionStream::AccountInboxGiftwraps,
+                    group_ids: Vec::new(),
+                }),
+                Default::default(),
+            )
+            .await;
+
+        assert!(
+            whitenoise
+                .shared
+                .event_tracker
+                .already_processed_account_event(&event.id, &victim_account.pubkey)
+                .await
+                .unwrap(),
+            "undecryptable gift-wrap must be marked processed so subsequent \
+             redeliveries (relay replay or in-process retry) are deduped"
+        );
+
+        // Refill during the processing window is bounded by wallclock and
+        // capped at capacity, so the delta is essentially exactly 1.
+        // Tolerance of ±0.2 absorbs scheduler jitter without admitting an
+        // 11-token retry storm (which would show a delta of ~11).
+        let tokens_after = session.giftwrap_throttle.tokens();
+        let consumed = tokens_before - tokens_after;
+        assert!(
+            (0.8..=1.2).contains(&consumed),
+            "decrypt-failed event should consume exactly one throttle token, \
+             consumed {consumed} (before {tokens_before} → after {tokens_after}). \
+             A value near 11 indicates the retry loop was reintroduced."
+        );
+    }
+
+    /// External-signer transport failure during gift-wrap decryption MUST
+    /// defer (not track, not retry) so relay replay can redeliver once the
+    /// signer is reachable again.
+    ///
+    /// The library wraps deterministic local-crypto errors and transient
+    /// external-signer transport errors identically as
+    /// `nip59::Error::Signer(SignerError)`. The only way to distinguish
+    /// them is by the signer's backend. This test exercises a non-Keys
+    /// signer whose `nip44_decrypt` always fails and asserts that the
+    /// event is deferred — neither recorded as processed nor scheduled
+    /// for retry.
+    #[tokio::test]
+    async fn test_external_signer_decrypt_failure_is_deferred_not_terminal() {
+        use std::pin::Pin;
+
+        use nostr::SignerBackend;
+        use nostr::signer::SignerError;
+        use nostr::util::BoxedFuture;
+
+        // Minimal mock NostrSigner whose backend is `Custom` (non-Keys)
+        // and whose `nip44_decrypt` always returns an error. Other
+        // methods are unreachable for this test path because
+        // `extract_rumor` only ever calls `nip44_decrypt`.
+        #[derive(Debug)]
+        struct FailingExternalSigner;
+
+        impl NostrSigner for FailingExternalSigner {
+            fn backend(&self) -> SignerBackend {
+                SignerBackend::Custom(std::borrow::Cow::Borrowed("test-failing-signer"))
+            }
+            fn get_public_key(&self) -> BoxedFuture<Result<PublicKey, SignerError>> {
+                Box::pin(async { Err(SignerError::from("not implemented in test")) })
+            }
+            fn sign_event(
+                &self,
+                _unsigned: UnsignedEvent,
+            ) -> BoxedFuture<Result<Event, SignerError>> {
+                Box::pin(async { Err(SignerError::from("not implemented in test")) })
+            }
+            fn nip04_encrypt<'a>(
+                &'a self,
+                _public_key: &'a PublicKey,
+                _content: &'a str,
+            ) -> BoxedFuture<'a, Result<String, SignerError>> {
+                Box::pin(async { Err(SignerError::from("not implemented in test")) })
+            }
+            fn nip04_decrypt<'a>(
+                &'a self,
+                _public_key: &'a PublicKey,
+                _encrypted_content: &'a str,
+            ) -> BoxedFuture<'a, Result<String, SignerError>> {
+                Box::pin(async { Err(SignerError::from("not implemented in test")) })
+            }
+            fn nip44_encrypt<'a>(
+                &'a self,
+                _public_key: &'a PublicKey,
+                _content: &'a str,
+            ) -> BoxedFuture<'a, Result<String, SignerError>> {
+                Box::pin(async { Err(SignerError::from("not implemented in test")) })
+            }
+            fn nip44_decrypt<'a>(
+                &'a self,
+                _public_key: &'a PublicKey,
+                _payload: &'a str,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<String, SignerError>> + Send + 'a>>
+            {
+                Box::pin(async { Err(SignerError::from("signer transport unavailable")) })
+            }
+        }
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let victim_account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&victim_account.pubkey).unwrap();
+
+        // Swap the session's signer for our failing external-style mock.
+        session
+            .set_signer(std::sync::Arc::new(FailingExternalSigner))
+            .await;
+
+        let tokens_before = session.giftwrap_throttle.tokens();
+
+        // Build a kind:1059 event targeted at the victim. The content
+        // doesn't matter — our mock signer fails on every nip44_decrypt.
+        let attacker_keys = Keys::generate();
+        let event = EventBuilder::new(Kind::GiftWrap, "any-ciphertext")
+            .tag(Tag::public_key(victim_account.pubkey))
+            .sign(&attacker_keys)
+            .await
+            .unwrap();
+
+        let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
+        whitenoise
+            .process_account_event(
+                event.clone(),
+                EventSource::RelaySubscription(SubscriptionContext {
+                    plane: RelayPlane::AccountInbox,
+                    account_pubkey: Some(victim_account.pubkey),
+                    relay_url,
+                    stream: SubscriptionStream::AccountInboxGiftwraps,
+                    group_ids: Vec::new(),
+                }),
+                Default::default(),
+            )
+            .await;
+
+        // External-signer decrypt failure must NOT be recorded as
+        // processed: relay replay needs to redeliver the event after
+        // the signer recovers. Without this contract a transient
+        // signer outage would permanently lose welcomes that landed
+        // during the outage window.
+        assert!(
+            !whitenoise
+                .shared
+                .event_tracker
+                .already_processed_account_event(&event.id, &victim_account.pubkey)
+                .await
+                .unwrap(),
+            "external-signer transport failure must defer, not mark processed"
+        );
+
+        // One token consumed by the attempt — but not eleven. A value
+        // near 11 would indicate the retry loop fired on this error
+        // class, which would let a signer-disturbance attack amplify
+        // bucket consumption.
+        let tokens_after = session.giftwrap_throttle.tokens();
+        let consumed = tokens_before - tokens_after;
+        assert!(
+            (0.8..=1.2).contains(&consumed),
+            "deferred external-signer failure should consume exactly one token, \
+             consumed {consumed} (before {tokens_before} → after {tokens_after})"
         );
     }
 }

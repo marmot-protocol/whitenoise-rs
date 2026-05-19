@@ -5,6 +5,7 @@ use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
 
 use crate::{
+    nostr_manager::utils::cap_timestamp_to_now,
     perf_instrument, perf_span,
     whitenoise::{
         Whitenoise,
@@ -35,16 +36,108 @@ impl Whitenoise {
         // that hasn't re-registered after restart). The event stays
         // unprocessed and relay replay will deliver it again once the
         // signer slot is filled via register_external_signer().
-        let _decrypt_span = perf_span!("event_handlers::giftwrap_decrypt");
         let signer = session
             .get_signer()
             .ok_or(WhitenoiseError::SignerUnavailable(account.pubkey))?;
 
-        let unwrapped = extract_rumor(&signer, &event).await.map_err(|e| {
-            WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
-        })?;
+        // Bound per-account NIP-44 decryption budget on inbound gift-wraps.
+        // Kind:1059 events are addressed to a public pubkey with no sender
+        // authentication, and the KeyPackage reference that would identify
+        // the inviter sits inside the encrypted rumor — there is no way to
+        // pre-filter at the transport layer. Without this gate, anyone who
+        // knows the recipient's pubkey can force unbounded ECDH+decrypt work
+        // on the recipient's device.
+        //
+        // The token is acquired AFTER the signer check so accounts whose
+        // signer is temporarily unavailable do not drain their budget on
+        // events that never reach decryption.
+        //
+        // On exhaustion, return `GiftwrapThrottled` rather than `Ok(())` so
+        // the outer processor skips the "processed" tracking step. Relay
+        // replay on the next subscription resume will redeliver the event
+        // once the bucket has refilled.
+        if !session.giftwrap_throttle.try_acquire() {
+            tracing::warn!(
+                target: "whitenoise::event_handlers::handle_giftwrap",
+                account = %account.pubkey.to_hex(),
+                event_id = %event.id.to_hex(),
+                tokens_remaining = session.giftwrap_throttle.tokens(),
+                "Dropping inbound gift-wrap: per-account decrypt budget exhausted"
+            );
+            return Err(WhitenoiseError::GiftwrapThrottled);
+        }
+
+        // Capture the signer backend so we can classify any subsequent
+        // decrypt failure. The library wraps both deterministic local
+        // crypto errors and transient external-signer transport errors
+        // identically as `nip59::Error::Signer(SignerError(String))` —
+        // the only way to distinguish them is by what kind of signer
+        // produced the error.
+        let signer_backend_is_keys = matches!(signer.backend(), nostr::SignerBackend::Keys);
+
+        let _decrypt_span = perf_span!("event_handlers::giftwrap_decrypt");
+        let unwrapped = match extract_rumor(&signer, &event).await {
+            Ok(u) => u,
+            // External-signer-backend decrypt failure. May be transient
+            // (signer disconnected, timed out, user dismissed the
+            // prompt) rather than a deterministic crypto failure — and
+            // the library does not expose enough information to tell
+            // them apart. Be conservative: defer rather than mark
+            // processed. Relay replay will redeliver the event on the
+            // next subscription resume; by then the signer may be
+            // reachable. Skipping the retry queue here also prevents an
+            // attacker able to disturb the signer transport from
+            // amplifying token consumption.
+            Err(nostr::nips::nip59::Error::Signer(e)) if !signer_backend_is_keys => {
+                tracing::warn!(
+                    target: "whitenoise::event_handlers::handle_giftwrap",
+                    account = %account.pubkey.to_hex(),
+                    event_id = %event.id.to_hex(),
+                    error = %e,
+                    "Deferring gift-wrap: external signer decrypt failed; awaiting redelivery"
+                );
+                return Err(WhitenoiseError::GiftwrapDeferred);
+            }
+            // Any other decrypt/parse failure is terminal. This covers
+            // local `Keys` signer decrypt failures (deterministic
+            // crypto) and structural errors like wrong event kind, JSON
+            // parse failure, or sender/seal pubkey mismatch — none of
+            // which can succeed on a later attempt. Routing them
+            // through the retry path would let a small burst of garbage
+            // drain the throttle bucket many times over (one bogus
+            // event = up to 11 token consumptions = 1 initial + 10
+            // retries). Marking processed dedupes future redelivery.
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::event_handlers::handle_giftwrap",
+                    account = %account.pubkey.to_hex(),
+                    event_id = %event.id.to_hex(),
+                    error = %e,
+                    "Dropping undecryptable gift-wrap as terminal; recorded as processed to prevent retry storm"
+                );
+                return Ok(());
+            }
+        };
 
         drop(_decrypt_span);
+
+        // Advance the account sync watermark using the inner rumor timestamp.
+        // A single NIP-44 decrypt now serves both Welcome processing and sync
+        // advancement; the previous design decrypted each gift-wrap twice,
+        // doubling the work the recipient performed on every event.
+        let safe_timestamp = cap_timestamp_to_now(unwrapped.rumor.created_at);
+        let created_ms = (safe_timestamp.as_secs() as i64) * 1000;
+        if let Err(e) =
+            Account::update_last_synced_max(&account.pubkey, created_ms, &self.shared.database)
+                .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_handlers::handle_giftwrap",
+                "Failed to advance last_synced_at with rumor timestamp for {}: {}",
+                account.pubkey.to_hex(),
+                e
+            );
+        }
 
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {
