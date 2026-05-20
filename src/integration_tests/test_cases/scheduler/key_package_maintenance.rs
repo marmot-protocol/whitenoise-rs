@@ -308,12 +308,22 @@ fn assert_contains_key_package_pair(packages: &[Event], description: &str) {
 }
 
 fn has_key_package_pair(packages: &[Event]) -> bool {
-    packages
-        .iter()
-        .any(|event| event.kind == MLS_KEY_PACKAGE_KIND)
-        && packages
-            .iter()
-            .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY)
+    let mut has_canonical = false;
+    let mut has_legacy = false;
+
+    for event in packages {
+        if event.kind == MLS_KEY_PACKAGE_KIND {
+            has_canonical = true;
+        } else if event.kind == MLS_KEY_PACKAGE_KIND_LEGACY {
+            has_legacy = true;
+        }
+
+        if has_canonical && has_legacy {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.
