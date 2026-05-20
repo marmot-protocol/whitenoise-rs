@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
-use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY;
+use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::scheduled_tasks::{KeyPackageMaintenance, Task};
 use async_trait::async_trait;
@@ -183,6 +183,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             "✓ Key package maintenance published {} key package(s)",
             after_publish.len()
         );
+        assert_contains_key_package_pair(&after_publish, "maintenance publish from empty relays");
 
         // Delete current key packages and publish an expired one.
         delete_all_relay_key_packages_for_test_setup(context, &account, true).await?;
@@ -245,6 +246,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             !expired_still_exists,
             "Expired key package should have been deleted"
         );
+        assert_contains_key_package_pair(&after_rotate, "maintenance rotation replacement");
 
         tracing::info!(
             "✓ Rotation complete: expired package deleted, {} fresh package(s) exist",
@@ -293,6 +295,21 @@ where
         description,
     )
     .await
+}
+
+fn assert_contains_key_package_pair(packages: &[Event], description: &str) {
+    assert!(
+        packages
+            .iter()
+            .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
+        "{description} should include a canonical kind:30443 key package"
+    );
+    assert!(
+        packages
+            .iter()
+            .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+        "{description} should include a legacy kind:443 key package"
+    );
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.

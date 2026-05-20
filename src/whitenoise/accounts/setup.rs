@@ -9,6 +9,7 @@ use crate::RelayType;
 use crate::perf_instrument;
 use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::whitenoise::error::Result;
+use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::session::AccountSession;
 use crate::whitenoise::users::User;
@@ -176,7 +177,9 @@ impl Whitenoise {
                 .fetch_user_key_package(account.pubkey, &relays_urls)
                 .await?
             {
-                if self.is_own_key_package(&account.pubkey, &event.id).await {
+                if event.kind == MLS_KEY_PACKAGE_KIND
+                    && self.is_own_key_package(&account.pubkey, &event.id).await
+                {
                     tracing::debug!(
                         target: "whitenoise::accounts",
                         "Found existing key package with live key material, skipping publish"
@@ -185,7 +188,7 @@ impl Whitenoise {
                 } else {
                     tracing::debug!(
                         target: "whitenoise::accounts",
-                        "Key package on relay was not published by this client or key material is gone, publishing new one"
+                        "Key package on relay is not a live canonical package published by this client, publishing new one"
                     );
                 }
             }
@@ -225,7 +228,7 @@ impl Whitenoise {
             .find_by_event_id(&event_id.to_hex())
             .await
         {
-            Ok(Some(pkg)) => !pkg.key_material_deleted,
+            Ok(Some(pkg)) => !pkg.key_material_deleted && pkg.consumed_at.is_none(),
             Ok(None) => false,
             Err(e) => {
                 tracing::warn!(
@@ -1495,6 +1498,79 @@ mod tests {
 
         let event_id = EventId::all_zeros();
         assert!(!whitenoise.is_own_key_package(&pubkey, &event_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_setup_key_package_republishes_when_only_legacy_twin_remains() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let relays = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
+
+        let before = session.key_packages().fetch_all().await.unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
+            "precondition: account should start with a canonical key package"
+        );
+        assert!(
+            before
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+            "precondition: account should start with a legacy key package"
+        );
+
+        let canonical = before
+            .into_iter()
+            .find(|event| event.kind == MLS_KEY_PACKAGE_KIND)
+            .expect("canonical event exists");
+        assert!(
+            session
+                .key_packages()
+                .delete(&canonical.id, false)
+                .await
+                .unwrap(),
+            "test setup should delete the canonical key package from relays"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let legacy_only = session.key_packages().fetch_all().await.unwrap();
+        assert!(
+            legacy_only
+                .iter()
+                .all(|event| event.kind != MLS_KEY_PACKAGE_KIND),
+            "precondition: canonical key package should be missing from relays"
+        );
+        assert!(
+            legacy_only
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+            "precondition: legacy key package should still be present on relays"
+        );
+
+        whitenoise
+            .setup_key_package(&account, false, &relays)
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let after = session.key_packages().fetch_all().await.unwrap();
+        assert!(
+            after.iter().any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
+            "setup must not treat legacy-only relay state as healthy"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+            "setup should preserve pair publishing semantics"
+        );
     }
 
     #[test]

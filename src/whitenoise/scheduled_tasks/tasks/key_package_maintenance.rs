@@ -12,7 +12,7 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::key_packages::{
-    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_strict,
+    MLS_KEY_PACKAGE_KIND, REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_strict,
 };
 use crate::whitenoise::scheduled_tasks::Task;
 
@@ -191,6 +191,15 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
     let our_expired_packages = find_expired_packages(&our_packages);
 
     if our_expired_packages.is_empty() {
+        if !has_live_canonical_key_package(&our_packages) {
+            tracing::info!(
+                target: "whitenoise::scheduler::key_package_maintenance",
+                "Account {} has live legacy key package state but no live canonical kind:30443 event, publishing new pair",
+                account.pubkey.to_hex()
+            );
+            return publish_new_key_package(whitenoise, account).await;
+        }
+
         tracing::debug!(
             target: "whitenoise::scheduler::key_package_maintenance",
             "Account {} has {} live compatible tracked key package(s), none expired",
@@ -200,14 +209,17 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
         return MaintenanceResult::Fresh;
     }
 
-    // Delete expired packages, only republishing if all our packages are
-    // expired (so we'd have zero left after deletion).
+    // Delete expired packages, publishing a replacement first if the state
+    // left after deletion would not include a live canonical kind:30443.
     let total_package_group_count = count_key_package_hash_groups(&our_packages);
+    let non_expired_packages = find_non_expired_packages(&our_packages, &our_expired_packages);
+    let needs_replacement_before_delete = !has_live_canonical_key_package(&non_expired_packages);
     rotate_expired_packages(
         whitenoise,
         account,
         our_expired_packages,
         total_package_group_count,
+        needs_replacement_before_delete,
     )
     .await
 }
@@ -270,6 +282,28 @@ fn count_key_package_hash_groups(packages: &[LivePublishedKeyPackage]) -> usize 
         .len()
 }
 
+fn has_live_canonical_key_package(packages: &[LivePublishedKeyPackage]) -> bool {
+    packages
+        .iter()
+        .any(|package| package.event.kind == MLS_KEY_PACKAGE_KIND)
+}
+
+fn find_non_expired_packages(
+    packages: &[LivePublishedKeyPackage],
+    expired_packages: &[LivePublishedKeyPackage],
+) -> Vec<LivePublishedKeyPackage> {
+    let expired_hash_refs: HashSet<&Vec<u8>> = expired_packages
+        .iter()
+        .map(|package| &package.key_package_hash_ref)
+        .collect();
+
+    packages
+        .iter()
+        .filter(|package| !expired_hash_refs.contains(&package.key_package_hash_ref))
+        .cloned()
+        .collect()
+}
+
 /// Returns relay key packages that this device published and still has usable local state for.
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn find_live_published_key_packages(
@@ -328,15 +362,16 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
 
 /// Deletes expired key packages, only publishing a replacement if needed.
 ///
-/// If the account would be left with zero key packages after deletion, a new one is
-/// published first to avoid a gap. Otherwise, only the expired packages are deleted
-/// without republishing, since the account already has a valid package.
+/// If the account would be left without a live canonical kind:30443 package after deletion, a new
+/// pair is published first to avoid a gap. Otherwise, only the expired packages are deleted without
+/// republishing, since the account already has a valid canonical package.
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn rotate_expired_packages(
     whitenoise: &Whitenoise,
     account: &Account,
     expired_packages: Vec<LivePublishedKeyPackage>,
     total_package_group_count: usize,
+    needs_replacement_before_delete: bool,
 ) -> MaintenanceResult {
     let expired_group_count = count_key_package_hash_groups(&expired_packages);
     let non_expired_group_count = total_package_group_count.saturating_sub(expired_group_count);
@@ -358,8 +393,11 @@ async fn rotate_expired_packages(
         return MaintenanceResult::Skipped;
     };
 
-    // Only publish a new key package if deleting the expired ones would leave zero packages
-    if non_expired_group_count == 0 {
+    // Publish a new pair if deleting the expired groups would leave no live
+    // canonical key package behind. The usual case is "all groups expired",
+    // but this also repairs legacy-only non-expired leftovers before deleting
+    // an expired canonical group.
+    if needs_replacement_before_delete {
         if let Err(e) = session.key_packages().publish().await {
             match e {
                 WhitenoiseError::AccountMissingKeyPackageRelays => {
@@ -398,9 +436,7 @@ async fn rotate_expired_packages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::key_packages::{
-        MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, MLS_PROPOSALS_TAG_KEY,
-    };
+    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND_LEGACY, MLS_PROPOSALS_TAG_KEY};
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
     use nostr_sdk::prelude::*;
@@ -536,6 +572,86 @@ mod tests {
         assert!(
             !live_after.is_empty(),
             "Maintenance should publish a fresh key package when relay packages no longer match live local state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_republishes_when_only_legacy_twin_has_live_tracking() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let before = session.key_packages().fetch_all().await.unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "Should start with the canonical and legacy key package twins"
+        );
+
+        let canonical = before
+            .into_iter()
+            .find(|event| event.kind == MLS_KEY_PACKAGE_KIND)
+            .expect("canonical event exists");
+        assert!(
+            session
+                .key_packages()
+                .delete(&canonical.id, false)
+                .await
+                .unwrap(),
+            "test setup should delete the canonical key package from relays"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let legacy_only = session.key_packages().fetch_all().await.unwrap();
+        assert!(
+            legacy_only
+                .iter()
+                .all(|event| event.kind != MLS_KEY_PACKAGE_KIND),
+            "precondition: relay should have no canonical key package"
+        );
+        assert!(
+            legacy_only
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+            "precondition: relay should still have a legacy key package"
+        );
+
+        let live_before =
+            find_live_published_key_packages(&whitenoise, &account, legacy_only.clone())
+                .await
+                .unwrap();
+        assert!(
+            !live_before.is_empty(),
+            "precondition: legacy key package should still have live local tracking"
+        );
+        assert!(
+            live_before
+                .iter()
+                .all(|package| package.event.kind != MLS_KEY_PACKAGE_KIND),
+            "precondition: live relay state should be legacy-only"
+        );
+
+        let task = KeyPackageMaintenance;
+        task.execute(whitenoise.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let after = session.key_packages().fetch_all().await.unwrap();
+        let live_after = find_live_published_key_packages(&whitenoise, &account, after)
+            .await
+            .unwrap();
+        assert!(
+            live_after
+                .iter()
+                .any(|package| package.event.kind == MLS_KEY_PACKAGE_KIND),
+            "Maintenance should not report legacy-only live state as fresh"
+        );
+        assert!(
+            live_after
+                .iter()
+                .any(|package| package.event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+            "Maintenance republish should preserve the legacy twin"
         );
     }
 
