@@ -69,6 +69,10 @@ mod tests {
                 .unwrap(),
         );
 
+        // Matches the project-wide account-DB test pattern: stamp the schema
+        // directly because `AccountDatabase::new` uses `open_without_migrations`.
+        // Keep this definition in sync with `fresh_account_schema.sql` until a
+        // shared `setup_account_db_with_migrations` helper exists.
         sqlx::query("DROP TABLE IF EXISTS account_maintenance_tasks")
             .execute(&db.inner.pool)
             .await

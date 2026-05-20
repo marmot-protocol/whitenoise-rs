@@ -33,6 +33,10 @@ pub(crate) const KEY_PACKAGE_RELAY_CLEANUP_TASK: &str = "key_package_relay_clean
 /// Quiet period used before the one-time relay cleanup runs after foreground catch-up.
 pub(crate) const KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS: u64 = 30;
 
+/// Quiet period after a key package is consumed before relay cleanup may start.
+pub(crate) const KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS: u64 =
+    KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS;
+
 const KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS: u64 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,7 +327,6 @@ impl<'a> KeyPackageOps<'a> {
                 break;
             }
 
-            let batch_size = key_package_events.len();
             let deleted = self
                 .delete_batch_from_relay_urls(key_package_events, false, 1, &cleanup_relay_urls)
                 .await?;
@@ -334,11 +337,10 @@ impl<'a> KeyPackageOps<'a> {
                     .fetch_all_from_reachable_cleanup_relays(&cleanup_relay_urls)
                     .await?;
                 return Err(WhitenoiseError::KeyPackagePublishFailed(format!(
-                    "one-time key package cleanup could not delete {} remaining relay event(s) \
-                     after round {} found {} event(s)",
+                    "one-time key package cleanup could not delete relay event(s): {} still \
+                     present after round {}",
                     remaining.len(),
-                    round + 1,
-                    batch_size
+                    round + 1
                 )));
             }
         }
@@ -382,10 +384,6 @@ impl<'a> KeyPackageOps<'a> {
             )));
         }
 
-        if self.has_recent_consumed_key_package().await? {
-            return Ok(KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage);
-        }
-
         self.session
             .repos
             .maintenance_tasks
@@ -410,10 +408,10 @@ impl<'a> KeyPackageOps<'a> {
         &self,
         relay_urls: &[RelayUrl],
     ) -> Result<Vec<Event>> {
-        // Keep this as one multi-relay request so the ephemeral relay plane can
-        // use its existing partial-connect behavior. Cleanup should operate on
-        // relays that are reachable now; one disconnected relay should not
-        // block cleanup of the rest.
+        // This naming wrapper keeps cleanup call sites explicit. Partial-connect
+        // handling lives inside the ephemeral fetch path; cleanup should operate
+        // on relays that are reachable now without one disconnected relay
+        // blocking the rest.
         self.fetch_all_from_relay_urls(relay_urls).await
     }
 
@@ -804,7 +802,7 @@ impl<'a> KeyPackageOps<'a> {
         self.session
             .repos
             .published_key_packages
-            .has_consumed_since(KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS as i64)
+            .has_consumed_since(KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS as i64)
             .await
     }
 
@@ -978,7 +976,6 @@ where
         push_unique_relay_url(&mut relay_urls, &mut seen, relay_url);
     }
 
-    relay_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     relay_urls
 }
 
@@ -1004,10 +1001,10 @@ mod tests {
     use nostr_sdk::{EventBuilder, EventId, Keys, Kind, RelayUrl, Tag};
 
     use super::{
-        KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, KEY_PACKAGE_RELAY_CLEANUP_TASK,
-        KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS, KeyPackageRelayCleanupOutcome,
-        MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, has_exact_key_package_pair,
-        merge_cleanup_relay_urls,
+        KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS,
+        KEY_PACKAGE_RELAY_CLEANUP_TASK, KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS,
+        KeyPackageRelayCleanupOutcome, MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY,
+        has_exact_key_package_pair, merge_cleanup_relay_urls,
     };
     use crate::RelayType;
     use crate::whitenoise::error::WhitenoiseError;
@@ -1396,6 +1393,7 @@ mod tests {
             "key_package_relay_cleanup_v1"
         );
         assert_eq!(KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, 30);
+        assert_eq!(KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS, 30);
         assert_eq!(KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS, 500);
         let outcomes = [
             KeyPackageRelayCleanupOutcome::AlreadyCompleted,
@@ -1412,15 +1410,15 @@ mod tests {
         let default = RelayUrl::parse("wss://default.example").unwrap();
 
         let merged = merge_cleanup_relay_urls(
-            [kp.clone(), default.clone()],
+            [kp.clone()],
             [nip65.clone(), kp.clone()],
-            [default.clone()],
+            [default.clone(), nip65.clone()],
         );
 
         assert_eq!(
             merged,
-            vec![default, kp, nip65],
-            "cleanup scope should include all three sources and deduplicate"
+            vec![kp, nip65, default],
+            "cleanup scope should include all three sources, deduplicate, and preserve source order"
         );
     }
 
