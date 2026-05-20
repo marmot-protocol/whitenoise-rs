@@ -312,10 +312,10 @@ fn has_key_package_pair(packages: &[Event]) -> bool {
     let mut has_legacy = false;
 
     for event in packages {
-        if event.kind == MLS_KEY_PACKAGE_KIND {
-            has_canonical = true;
-        } else if event.kind == MLS_KEY_PACKAGE_KIND_LEGACY {
-            has_legacy = true;
+        match event.kind {
+            kind if kind == MLS_KEY_PACKAGE_KIND => has_canonical = true,
+            kind if kind == MLS_KEY_PACKAGE_KIND_LEGACY => has_legacy = true,
+            _ => {}
         }
 
         if has_canonical && has_legacy {
