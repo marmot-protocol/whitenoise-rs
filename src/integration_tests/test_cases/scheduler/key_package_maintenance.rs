@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
-use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY;
+use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::scheduled_tasks::{KeyPackageMaintenance, Task};
 use async_trait::async_trait;
@@ -176,13 +176,14 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             context,
             &account,
             "maintenance to publish a replacement key package",
-            |packages| !packages.is_empty(),
+            has_key_package_pair,
         )
         .await?;
         tracing::info!(
             "✓ Key package maintenance published {} key package(s)",
             after_publish.len()
         );
+        assert_contains_key_package_pair(&after_publish, "maintenance publish from empty relays");
 
         // Delete current key packages and publish an expired one.
         delete_all_relay_key_packages_for_test_setup(context, &account, true).await?;
@@ -229,7 +230,10 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             context,
             &account,
             "expired key package rotation to complete",
-            |packages| !packages.is_empty() && packages.iter().all(|e| e.id != expired_event_id),
+            |packages| {
+                has_key_package_pair(packages)
+                    && packages.iter().all(|event| event.id != expired_event_id)
+            },
         )
         .await?;
 
@@ -245,6 +249,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             !expired_still_exists,
             "Expired key package should have been deleted"
         );
+        assert_contains_key_package_pair(&after_rotate, "maintenance rotation replacement");
 
         tracing::info!(
             "✓ Rotation complete: expired package deleted, {} fresh package(s) exist",
@@ -293,6 +298,32 @@ where
         description,
     )
     .await
+}
+
+fn assert_contains_key_package_pair(packages: &[Event], description: &str) {
+    assert!(
+        has_key_package_pair(packages),
+        "{description} should include canonical kind:30443 and legacy kind:443 key packages"
+    );
+}
+
+fn has_key_package_pair(packages: &[Event]) -> bool {
+    let mut has_canonical = false;
+    let mut has_legacy = false;
+
+    for event in packages {
+        match event.kind {
+            kind if kind == MLS_KEY_PACKAGE_KIND => has_canonical = true,
+            kind if kind == MLS_KEY_PACKAGE_KIND_LEGACY => has_legacy = true,
+            _ => {}
+        }
+
+        if has_canonical && has_legacy {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.
