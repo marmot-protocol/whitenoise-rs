@@ -68,6 +68,14 @@ where
             .map(|sender| sender.receiver_count() > 0)
             .unwrap_or(false)
     }
+
+    pub(crate) fn subscriber_keys(&self) -> Vec<K> {
+        self.streams
+            .iter()
+            .filter(|entry| entry.receiver_count() > 0)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +200,20 @@ mod tests {
         drop(rx);
 
         assert!(!h.has_subscribers(&1));
+    }
+
+    #[test]
+    fn subscriber_keys_returns_only_keys_with_live_receivers() {
+        let h = hub();
+
+        let _rx1 = h.subscribe(&1);
+        let rx2 = h.subscribe(&2);
+        let _rx3 = h.subscribe(&3);
+        drop(rx2);
+
+        let mut keys = h.subscriber_keys();
+        keys.sort_unstable();
+
+        assert_eq!(keys, vec![1, 3]);
     }
 }

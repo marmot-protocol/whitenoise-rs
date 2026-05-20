@@ -37,6 +37,7 @@ pub mod error;
 mod event_processor;
 pub mod event_tracker;
 pub mod follows;
+mod foreground_catchup;
 pub mod group_information;
 pub mod group_state_streaming;
 pub mod groups;

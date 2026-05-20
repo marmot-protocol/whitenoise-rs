@@ -73,7 +73,20 @@ impl GroupPlane {
         let normalized_groups = Self::normalize_group_specs(group_specs);
         let subscriptions = Self::build_relay_set_subscriptions(&normalized_groups);
 
-        if let Some(previous_state) = self.accounts.read().await.get(&pubkey).cloned() {
+        let previous_state = self.accounts.read().await.get(&pubkey).cloned();
+        // Foreground replay may need to refresh identical subscriptions with a
+        // `since` anchor. Keep the old subscription state live if that replay
+        // resubscribe fails, rather than degrading a healthy account.
+        let replace_same_specs_in_place = previous_state
+            .as_ref()
+            .map(|state| {
+                since.is_some()
+                    && state.groups == normalized_groups
+                    && state.subscriptions == subscriptions
+            })
+            .unwrap_or(false);
+
+        if let Some(previous_state) = previous_state {
             if since.is_none()
                 && previous_state.groups == normalized_groups
                 && previous_state.subscriptions == subscriptions
@@ -81,10 +94,14 @@ impl GroupPlane {
                 return Ok(());
             }
 
-            for subscription in previous_state.subscriptions {
-                self.session
-                    .unsubscribe(&self.subscription_id(&pubkey, subscription.subscription_index))
-                    .await;
+            if !replace_same_specs_in_place {
+                for subscription in previous_state.subscriptions {
+                    self.session
+                        .unsubscribe(
+                            &self.subscription_id(&pubkey, subscription.subscription_index),
+                        )
+                        .await;
+                }
             }
         }
 
@@ -115,9 +132,11 @@ impl GroupPlane {
                 .ensure_relays_connected(&subscription.relays)
                 .await
             {
-                self.unsubscribe_indices(&pubkey, &installed_subscription_indices)
-                    .await;
-                self.accounts.write().await.remove(&pubkey);
+                if !replace_same_specs_in_place {
+                    self.unsubscribe_indices(&pubkey, &installed_subscription_indices)
+                        .await;
+                    self.accounts.write().await.remove(&pubkey);
+                }
                 return Err(e);
             }
             let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
@@ -139,9 +158,11 @@ impl GroupPlane {
                 )
                 .await
             {
-                self.unsubscribe_indices(&pubkey, &installed_subscription_indices)
-                    .await;
-                self.accounts.write().await.remove(&pubkey);
+                if !replace_same_specs_in_place {
+                    self.unsubscribe_indices(&pubkey, &installed_subscription_indices)
+                        .await;
+                    self.accounts.write().await.remove(&pubkey);
+                }
                 return Err(e);
             }
             installed_subscription_indices.push(subscription.subscription_index);
@@ -650,6 +671,13 @@ mod tests {
         assert!(
             !matches!(result, Ok(Ok(()))),
             "same-spec catch-up update with since must attempt a subscription refresh"
+        );
+
+        let accounts = plane.accounts.read().await;
+        let state = accounts.get(&pubkey).unwrap();
+        assert_eq!(
+            state.groups, groups,
+            "failed same-spec replay refresh must preserve the previous account state"
         );
     }
 

@@ -26,6 +26,10 @@ impl ChatListStreamManager {
     pub fn has_subscribers(&self, account_pubkey: &PublicKey) -> bool {
         self.0.has_subscribers(account_pubkey)
     }
+
+    pub(crate) fn subscriber_pubkeys(&self) -> Vec<PublicKey> {
+        self.0.subscriber_keys()
+    }
 }
 
 impl Default for ChatListStreamManager {
