@@ -208,9 +208,12 @@ mod tests {
 
         let _rx1 = h.subscribe(&1);
         let rx2 = h.subscribe(&2);
+        let _rx3 = h.subscribe(&3);
         drop(rx2);
-        h.emit(&3, "ignored".to_string());
 
-        assert_eq!(h.subscriber_keys(), vec![1]);
+        let mut keys = h.subscriber_keys();
+        keys.sort_unstable();
+
+        assert_eq!(keys, vec![1, 3]);
     }
 }

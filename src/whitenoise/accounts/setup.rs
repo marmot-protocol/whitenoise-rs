@@ -1004,6 +1004,48 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Catch up an account's inbox and group subscriptions without first
+    /// deactivating the currently-live planes.
+    ///
+    /// Foreground resume uses this instead of [`Self::refresh_account_subscriptions`]
+    /// so a transient replay subscription failure does not turn a healthy
+    /// account into an unsubscribed account. The underlying activation path
+    /// replaces the inbox plane only after the new inbox subscription succeeds;
+    /// for same-spec group updates with a `since` replay anchor, the group plane
+    /// resubscribes in place and preserves the old account state on failure.
+    #[perf_instrument("accounts")]
+    pub(crate) async fn catch_up_account_subscriptions(&self, account: &Account) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::accounts",
+            "Catching up account subscriptions for account: {:?}",
+            account.pubkey
+        );
+
+        let inbox_relays: Vec<RelayUrl> =
+            Relay::urls(&account.effective_inbox_relays(&self.shared).await?);
+        let group_specs = self.extract_group_subscription_specs(account).await?;
+        let since = Self::group_resubscribe_since(account);
+        let signer = self.get_signer_for_account(account)?;
+
+        let Some(session) = self.session(&account.pubkey) else {
+            return Err(WhitenoiseError::AccountNotFound);
+        };
+
+        let (activation_result, _) = tokio::join!(
+            session.activate_subscriptions(
+                &self.shared.relay_control,
+                &inbox_relays,
+                &group_specs,
+                since,
+                signer,
+            ),
+            self.warm_ephemeral_account_relays(account),
+        );
+        activation_result.map_err(WhitenoiseError::from)?;
+
+        Ok(())
+    }
+
     #[perf_instrument("accounts")]
     async fn warm_ephemeral_account_relays(&self, account: &Account) -> Result<()> {
         let warm_relays = match self.account_ephemeral_warm_relay_urls(account).await {

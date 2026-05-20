@@ -123,5 +123,8 @@ mod tests {
 
         let debug_str = format!("{:?}", ChatListUpdateTrigger::UserBlockChanged);
         assert!(debug_str.contains("UserBlockChanged"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::SnapshotRefresh);
+        assert!(debug_str.contains("SnapshotRefresh"));
     }
 }

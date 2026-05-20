@@ -1,18 +1,12 @@
 use std::collections::HashSet;
 
-use mdk_core::prelude::GroupId;
-
 use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
-    database::aggregated_messages::PaginationOptions,
     error::{Result, WhitenoiseError},
-    message_streaming::{MessageUpdate, UpdateTrigger},
 };
-
-const FOREGROUND_MESSAGE_SNAPSHOT_LIMIT: u32 = 200;
 
 impl Whitenoise {
     /// Catch the main app process up after foreground resume or notification tap.
@@ -29,18 +23,20 @@ impl Whitenoise {
     ///   existing bounded `since` semantics.
     /// - One account's transient relay/signer/subscription failure is logged and
     ///   does not stop the remaining accounts from catching up.
-    /// - Active chat-list and message streams in this process receive a replay
-    ///   of the current DB snapshot where the existing stream types can carry it.
+    /// - Active chat-list streams in this process receive a replay of the
+    ///   current DB snapshot where the existing stream type can carry it.
     ///
     /// What this does not guarantee:
     /// - Broadcasts emitted by the NSE process are not delivered into the Runner
     ///   process; this method rereads the shared DB instead.
-    /// - Item/message streams cannot represent "the whole list is now exactly
-    ///   this" or "this open timeline is empty". Call
+    /// - Chat-list item streams cannot represent "the whole list is now exactly
+    ///   this". Message streams are keyed by group only, while message snapshots
+    ///   are account-specific, so this method does not replay message snapshots
+    ///   onto active message streams. Call
     ///   [`Self::fetch_chat_list_snapshot`],
     ///   [`Self::fetch_archived_chat_list_snapshot`], and
     ///   [`Self::fetch_aggregated_messages_for_group`] after this method when a
-    ///   Flutter view needs exact replacement rather than upsert-style refresh.
+    ///   Flutter view needs exact replacement.
     ///
     /// Returns an error only when the shared account list cannot be read or
     /// another process-wide prerequisite fails. Per-account catch-up failures
@@ -67,7 +63,7 @@ impl Whitenoise {
 
         let accounts = Account::all(&self.shared.database).await?;
         for account in &accounts {
-            if let Err(error) = self.refresh_account_subscriptions(account).await {
+            if let Err(error) = self.catch_up_account_subscriptions(account).await {
                 tracing::warn!(
                     target: "whitenoise::foreground_catchup",
                     account = %account.pubkey.to_hex(),
@@ -93,7 +89,6 @@ impl Whitenoise {
 
     async fn replay_foreground_stream_snapshots(&self, accounts: &[Account]) {
         self.replay_chat_list_stream_snapshots(accounts).await;
-        self.replay_message_stream_snapshots(accounts).await;
     }
 
     async fn replay_chat_list_stream_snapshots(&self, accounts: &[Account]) {
@@ -164,93 +159,18 @@ impl Whitenoise {
             }
         }
     }
-
-    async fn replay_message_stream_snapshots(&self, accounts: &[Account]) {
-        for group_id in self.shared.message_stream_manager.subscribed_group_ids() {
-            self.replay_message_stream_snapshot_for_group(accounts, &group_id)
-                .await;
-        }
-    }
-
-    async fn replay_message_stream_snapshot_for_group(
-        &self,
-        accounts: &[Account],
-        group_id: &GroupId,
-    ) {
-        for account in accounts {
-            match self
-                .fetch_aggregated_messages_for_group(
-                    &account.pubkey,
-                    group_id,
-                    &PaginationOptions::default(),
-                    Some(FOREGROUND_MESSAGE_SNAPSHOT_LIMIT),
-                )
-                .await
-            {
-                Ok(messages) => {
-                    for message in messages {
-                        self.shared.message_stream_manager.emit(
-                            group_id,
-                            MessageUpdate {
-                                trigger: UpdateTrigger::SnapshotRefresh,
-                                message,
-                            },
-                        );
-                    }
-                    return;
-                }
-                Err(WhitenoiseError::AccountNotFound | WhitenoiseError::GroupNotFound) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        target: "whitenoise::foreground_catchup",
-                        account = %account.pubkey.to_hex(),
-                        group_id = %hex::encode(group_id.as_slice()),
-                        "Failed to replay message snapshot: {}",
-                        error
-                    );
-                }
-            }
-        }
-
-        tracing::debug!(
-            target: "whitenoise::foreground_catchup",
-            group_id = %hex::encode(group_id.as_slice()),
-            "Skipped message snapshot replay because no account session could read the group"
-        );
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use mdk_core::prelude::GroupId;
     use nostr_sdk::prelude::*;
 
     use super::*;
-    use crate::whitenoise::{
-        aggregated_message::AggregatedMessage,
-        message_aggregator::{ChatMessage, ReactionSummary},
-        test_utils::{create_mock_whitenoise, create_nostr_group_config_data, insert_test_account},
+    use crate::whitenoise::test_utils::{
+        create_mock_whitenoise, create_nostr_group_config_data, insert_test_account,
     };
-
-    fn test_message(seed: u8, author: PublicKey, created_at: Timestamp) -> ChatMessage {
-        ChatMessage {
-            id: format!("{:0>64x}", seed),
-            author,
-            content: format!("resume snapshot message {seed}"),
-            created_at,
-            tags: Tags::new(),
-            is_reply: false,
-            reply_to_id: None,
-            is_deleted: false,
-            content_tokens: whitenoise_markdown::Document::default(),
-            reactions: ReactionSummary::default(),
-            kind: 9,
-            media_attachments: vec![],
-            delivery_status: None,
-        }
-    }
 
     #[tokio::test]
     async fn resume_after_background_is_idempotent_with_no_accounts() {
@@ -332,50 +252,5 @@ mod tests {
 
         assert_eq!(update.trigger, ChatListUpdateTrigger::SnapshotRefresh);
         assert_eq!(update.item.mls_group_id, group.mls_group_id);
-    }
-
-    #[tokio::test]
-    async fn resume_after_background_replays_message_snapshot_to_active_subscribers() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
-        config.name = "Message replay".to_string();
-
-        let group = whitenoise
-            .require_session(&creator.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(vec![member.pubkey], config, None)
-            .await
-            .unwrap();
-        let group_id: GroupId = group.mls_group_id.clone();
-
-        let mut subscription = whitenoise
-            .subscribe_to_group_messages(&creator.pubkey, &group_id, None)
-            .await
-            .unwrap();
-        assert!(subscription.initial_messages.is_empty());
-
-        let message = test_message(42, member.pubkey, Timestamp::from(1_800_000_042));
-        let session = whitenoise.require_session(&creator.pubkey).unwrap();
-        AggregatedMessage::insert_message(
-            &message,
-            &group_id,
-            &creator.pubkey,
-            &session.account_db.inner,
-        )
-        .await
-        .unwrap();
-
-        whitenoise.resume_after_background().await.unwrap();
-
-        let update = tokio::time::timeout(Duration::from_secs(5), subscription.updates.recv())
-            .await
-            .expect("resume should replay a message snapshot")
-            .expect("message stream should stay open");
-
-        assert_eq!(update.trigger, UpdateTrigger::SnapshotRefresh);
-        assert_eq!(update.message.id, message.id);
     }
 }
