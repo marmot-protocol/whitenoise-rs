@@ -466,6 +466,47 @@ mod tests {
             .unwrap()
     }
 
+    fn key_package_event(kind: Kind) -> Event {
+        EventBuilder::new(kind, "test_content")
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_has_live_canonical_key_package_requires_canonical_kind() {
+        let canonical = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![1]);
+        let legacy = live_package(key_package_event(MLS_KEY_PACKAGE_KIND_LEGACY), vec![2]);
+        let legacy_only = std::slice::from_ref(&legacy);
+
+        assert!(!has_live_canonical_key_package(&[]));
+        assert!(!has_live_canonical_key_package(legacy_only));
+        assert!(has_live_canonical_key_package(&[legacy, canonical]));
+    }
+
+    #[test]
+    fn test_find_non_expired_packages_filters_whole_expired_hash_groups() {
+        let expired_canonical = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![1]);
+        let expired_legacy = live_package(key_package_event(MLS_KEY_PACKAGE_KIND_LEGACY), vec![1]);
+        let fresh_canonical = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![2]);
+        let fresh_legacy = live_package(key_package_event(MLS_KEY_PACKAGE_KIND_LEGACY), vec![2]);
+        let packages = vec![
+            expired_canonical.clone(),
+            expired_legacy.clone(),
+            fresh_canonical.clone(),
+            fresh_legacy.clone(),
+        ];
+        let expired_packages = vec![expired_canonical, expired_legacy];
+
+        let non_expired = find_non_expired_packages(&packages, &expired_packages);
+
+        assert_eq!(non_expired.len(), 2);
+        assert!(
+            non_expired
+                .iter()
+                .all(|package| package.key_package_hash_ref == vec![2])
+        );
+    }
+
     /// Publishes a key package without the encoding tag for testing outdated package rotation.
     async fn publish_outdated_key_package(
         whitenoise: &Whitenoise,
