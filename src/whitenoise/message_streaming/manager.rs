@@ -22,6 +22,10 @@ impl MessageStreamManager {
     pub fn emit(&self, group_id: &GroupId, update: MessageUpdate) {
         self.0.emit(group_id, update);
     }
+
+    pub(crate) fn subscribed_group_ids(&self) -> Vec<GroupId> {
+        self.0.subscriber_keys()
+    }
 }
 
 impl Default for MessageStreamManager {

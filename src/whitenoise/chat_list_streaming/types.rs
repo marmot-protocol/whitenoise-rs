@@ -37,6 +37,10 @@ pub enum ChatListUpdateTrigger {
     /// A user was blocked or unblocked. Chats for the account should refresh
     /// block-sensitive projections such as unread counts and DM block banners.
     UserBlockChanged,
+    /// The main app process replayed the current DB snapshot after foreground
+    /// resume or notification tap. This is an upsert-style item refresh; callers
+    /// that need exact removal of stale rows should reread the snapshot API.
+    SnapshotRefresh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +81,7 @@ mod tests {
             ChatListUpdateTrigger::ChatCleared,
             ChatListUpdateTrigger::ChatDeleted,
             ChatListUpdateTrigger::UserBlockChanged,
+            ChatListUpdateTrigger::SnapshotRefresh,
         ];
 
         for trigger in triggers {

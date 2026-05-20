@@ -29,6 +29,11 @@ pub enum UpdateTrigger {
     /// The delivery status of an outgoing message changed (e.g. Sending → Sent or Failed).
     /// The message stays in its current position in the chat.
     DeliveryStatusChanged,
+
+    /// The main app process replayed the current DB snapshot after foreground
+    /// resume or notification tap. The message is not necessarily new; callers
+    /// should upsert it by id or reread the group snapshot for exact replacement.
+    SnapshotRefresh,
 }
 
 /// Represents a single update to be sent to subscribers.
