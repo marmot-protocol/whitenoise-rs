@@ -12,6 +12,7 @@
 mod drafts;
 mod follows;
 mod group_push_tokens;
+mod maintenance_tasks;
 mod published_key_packages;
 mod push_registrations;
 mod settings;
@@ -23,6 +24,7 @@ use nostr_sdk::PublicKey;
 pub use self::drafts::DraftsRepo;
 pub use self::follows::AccountFollowsRepo;
 pub use self::group_push_tokens::GroupPushTokensRepo;
+pub use self::maintenance_tasks::MaintenanceTasksRepo;
 pub use self::published_key_packages::PublishedKeyPackagesRepo;
 pub use self::push_registrations::PushRegistrationsRepo;
 pub use self::settings::AccountSettingsRepo;
@@ -42,6 +44,8 @@ pub struct AccountRepositories {
     pub follows: AccountFollowsRepo,
     /// Published key package lifecycle tracking repository for this account.
     pub published_key_packages: PublishedKeyPackagesRepo,
+    /// One-time maintenance task marker repository for this account.
+    pub maintenance_tasks: MaintenanceTasksRepo,
     /// Push registration repository for this account.
     pub push_registrations: PushRegistrationsRepo,
     /// Cached group push tokens repository for this account.
@@ -62,6 +66,7 @@ impl AccountRepositories {
             follows: AccountFollowsRepo::new(account_db.clone(), db),
             push_registrations: PushRegistrationsRepo::new(account_pubkey, account_db.clone()),
             published_key_packages: PublishedKeyPackagesRepo::new(account_db.clone()),
+            maintenance_tasks: MaintenanceTasksRepo::new(account_db.clone()),
             group_push_tokens: GroupPushTokensRepo::new(account_pubkey, account_db),
         })
     }

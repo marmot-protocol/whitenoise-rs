@@ -1,12 +1,24 @@
 use std::collections::HashSet;
+#[cfg(not(test))]
+use std::time::Duration;
 
 use crate::perf_instrument;
+#[cfg(not(test))]
+use crate::whitenoise::session::key_packages::{
+    KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, KeyPackageRelayCleanupOutcome,
+};
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
     error::{Result, WhitenoiseError},
 };
+
+#[cfg(not(test))]
+const KEY_PACKAGE_RELAY_CLEANUP_DELAY: Duration =
+    Duration::from_secs(KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS);
+#[cfg(not(test))]
+const KEY_PACKAGE_RELAY_CLEANUP_MAX_ATTEMPTS: usize = 3;
 
 impl Whitenoise {
     /// Catch the main app process up after foreground resume or notification tap.
@@ -45,7 +57,108 @@ impl Whitenoise {
     pub async fn resume_after_background(&self) -> Result<()> {
         let accounts = self.force_foreground_subscription_catch_up().await?;
         self.replay_chat_list_stream_snapshots(&accounts).await;
+        self.schedule_key_package_relay_cleanup_after_grace("foreground")
+            .await;
         Ok(())
+    }
+
+    pub(crate) async fn schedule_key_package_relay_cleanup_after_grace(
+        &self,
+        trigger: &'static str,
+    ) {
+        let Some(wn) = self.this.upgrade() else {
+            tracing::warn!(
+                target: "whitenoise::foreground_catchup",
+                "Cannot schedule key package relay cleanup: Whitenoise handle is shutting down"
+            );
+            return;
+        };
+
+        self.spawn_background(async move {
+            wn.run_key_package_relay_cleanup_after_grace(trigger).await;
+        })
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_key_package_relay_cleanup_after_grace(&self, _trigger: &'static str) {}
+
+    #[cfg(not(test))]
+    pub(crate) async fn run_key_package_relay_cleanup_after_grace(&self, trigger: &'static str) {
+        let mut shutdown_rx = self.scheduler_shutdown.subscribe();
+
+        for attempt in 1..=KEY_PACKAGE_RELAY_CLEANUP_MAX_ATTEMPTS {
+            tokio::select! {
+                _ = tokio::time::sleep(KEY_PACKAGE_RELAY_CLEANUP_DELAY) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        tracing::debug!(
+                            target: "whitenoise::foreground_catchup",
+                            "Skipping delayed key package relay cleanup because shutdown began"
+                        );
+                        return;
+                    }
+                }
+            }
+
+            let mut saw_deferred = false;
+            for session in self.account_manager.sessions_iter() {
+                match session
+                    .key_packages()
+                    .cleanup_relay_key_packages_once()
+                    .await
+                {
+                    Ok(KeyPackageRelayCleanupOutcome::AlreadyCompleted) => {
+                        tracing::debug!(
+                            target: "whitenoise::foreground_catchup",
+                            account = %session.account_pubkey.to_hex(),
+                            trigger,
+                            "One-time key package relay cleanup already completed"
+                        );
+                    }
+                    Ok(KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage) => {
+                        saw_deferred = true;
+                        tracing::info!(
+                            target: "whitenoise::foreground_catchup",
+                            account = %session.account_pubkey.to_hex(),
+                            trigger,
+                            attempt,
+                            "Deferring one-time key package relay cleanup until consumed \
+                             key packages leave the quiet period"
+                        );
+                    }
+                    Ok(KeyPackageRelayCleanupOutcome::DeletedAndPublished { deleted }) => {
+                        tracing::info!(
+                            target: "whitenoise::foreground_catchup",
+                            account = %session.account_pubkey.to_hex(),
+                            trigger,
+                            deleted,
+                            "Completed one-time key package relay cleanup"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "whitenoise::foreground_catchup",
+                            account = %session.account_pubkey.to_hex(),
+                            trigger,
+                            "One-time key package relay cleanup failed: {}",
+                            error
+                        );
+                    }
+                }
+            }
+
+            if !saw_deferred {
+                return;
+            }
+        }
+
+        tracing::warn!(
+            target: "whitenoise::foreground_catchup",
+            trigger,
+            attempts = KEY_PACKAGE_RELAY_CLEANUP_MAX_ATTEMPTS,
+            "One-time key package relay cleanup remained deferred after all attempts"
+        );
     }
 
     async fn force_foreground_subscription_catch_up(&self) -> Result<Vec<Account>> {

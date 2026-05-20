@@ -49,6 +49,11 @@ CREATE INDEX IF NOT EXISTS idx_published_kp_event_id
 CREATE INDEX IF NOT EXISTS idx_published_kp_cleanup
     ON published_key_packages(consumed_at, key_material_deleted);
 
+CREATE TABLE IF NOT EXISTS account_maintenance_tasks (
+    name          TEXT PRIMARY KEY,
+    completed_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS published_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id    TEXT NOT NULL UNIQUE

@@ -1073,7 +1073,10 @@ impl Whitenoise {
                             target: "whitenoise::new",
                             "Background subscription setup failed: {error}"
                         );
+                        return;
                     }
+                    wn.run_key_package_relay_cleanup_after_grace("startup")
+                        .await;
                 })
                 .await;
         } else {

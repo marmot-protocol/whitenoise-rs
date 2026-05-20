@@ -227,6 +227,27 @@ impl PublishedKeyPackage {
         Ok(rows)
     }
 
+    /// Returns true if any consumed key package still falls within the quiet period.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn has_consumed_since(
+        db: &AccountDatabase,
+        quiet_period_secs: i64,
+    ) -> Result<bool, DatabaseError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM published_key_packages
+                WHERE consumed_at IS NOT NULL
+                  AND key_material_deleted = 0
+                  AND consumed_at > unixepoch() - ?
+             )",
+        )
+        .bind(quiet_period_secs)
+        .fetch_one(&db.inner.pool)
+        .await?;
+
+        Ok(count != 0)
+    }
+
     /// Marks all rows sharing a key package hash as deleted.
     ///
     /// Dual-published kind:30443/kind:443 events point at the same local MLS
@@ -527,6 +548,54 @@ mod tests {
         assert!(
             eligible.is_empty(),
             "rows with key_material_deleted = 1 must not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_consumed_since_respects_quiet_period() {
+        let (db, _dir) = setup().await;
+
+        PublishedKeyPackage::create(&db, &[1, 2, 3], "recent", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+            .await
+            .unwrap();
+        PublishedKeyPackage::mark_consumed(&db, "recent")
+            .await
+            .unwrap();
+
+        assert!(
+            PublishedKeyPackage::has_consumed_since(&db, 30)
+                .await
+                .unwrap()
+        );
+
+        PublishedKeyPackage::backdate_consumed_at(&db, "recent", 60)
+            .await
+            .unwrap();
+        assert!(
+            !PublishedKeyPackage::has_consumed_since(&db, 30)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_consumed_since_ignores_deleted_key_material() {
+        let (db, _dir) = setup().await;
+
+        PublishedKeyPackage::create(&db, &[1, 2, 3], "recent", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+            .await
+            .unwrap();
+        PublishedKeyPackage::mark_consumed(&db, "recent")
+            .await
+            .unwrap();
+        PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(&db, &[1, 2, 3])
+            .await
+            .unwrap();
+
+        assert!(
+            !PublishedKeyPackage::has_consumed_since(&db, 30)
+                .await
+                .unwrap()
         );
     }
 

@@ -59,6 +59,11 @@ impl PublishedKeyPackagesRepo {
         Ok(PublishedKeyPackage::find_eligible_for_cleanup(&self.db, quiet_period_secs).await?)
     }
 
+    /// Returns true if any consumed key package still falls within the quiet period.
+    pub async fn has_consumed_since(&self, quiet_period_secs: i64) -> Result<bool> {
+        Ok(PublishedKeyPackage::has_consumed_since(&self.db, quiet_period_secs).await?)
+    }
+
     /// Mark a published key package's key material as deleted by hash ref.
     pub async fn mark_key_material_deleted_by_hash_ref(&self, hash_ref: &[u8]) -> Result<()> {
         PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(&self.db, hash_ref).await?;
