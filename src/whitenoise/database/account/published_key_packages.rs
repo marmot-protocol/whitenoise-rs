@@ -182,4 +182,48 @@ mod tests {
             "by-id variant must only flip the canonical row"
         );
     }
+
+    #[tokio::test]
+    async fn has_consumed_since_tracks_recent_non_deleted_rows() {
+        let (repo, _dir) = setup().await;
+        let hash_ref = b"recent_hash";
+
+        repo.create(hash_ref, "evt_recent", Kind::Custom(443), None)
+            .await
+            .unwrap();
+        assert!(!repo.has_consumed_since(30).await.unwrap());
+
+        repo.mark_consumed("evt_recent").await.unwrap();
+        assert!(repo.has_consumed_since(30).await.unwrap());
+
+        repo.mark_key_material_deleted_by_hash_ref(hash_ref)
+            .await
+            .unwrap();
+        assert!(!repo.has_consumed_since(30).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn find_eligible_for_cleanup_delegates_quiet_period_filter() {
+        let (repo, _dir) = setup().await;
+        let hash_ref = b"eligible_hash";
+
+        repo.create(hash_ref, "evt_eligible", Kind::Custom(443), None)
+            .await
+            .unwrap();
+        repo.mark_consumed("evt_eligible").await.unwrap();
+        sqlx::query(
+            "UPDATE published_key_packages
+             SET consumed_at = unixepoch() - 60
+             WHERE event_id = ?",
+        )
+        .bind("evt_eligible")
+        .execute(&repo.db.inner.pool)
+        .await
+        .unwrap();
+
+        let eligible = repo.find_eligible_for_cleanup(30).await.unwrap();
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].event_id, "evt_eligible");
+    }
 }

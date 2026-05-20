@@ -354,10 +354,6 @@ impl<'a> KeyPackageOps<'a> {
             )));
         }
 
-        if self.has_recent_consumed_key_package().await? {
-            return Ok(KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage);
-        }
-
         let (key_package_data, canonical_created_at) = self
             .prepare_canonical_publish_inputs(&publish_relays)
             .await?;
@@ -1005,7 +1001,7 @@ fn has_exact_key_package_pair(events: &[Event]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::{EventBuilder, EventId, Keys, RelayUrl, Tag};
+    use nostr_sdk::{EventBuilder, EventId, Keys, Kind, RelayUrl, Tag};
 
     use super::{
         KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, KEY_PACKAGE_RELAY_CLEANUP_TASK,
@@ -1013,7 +1009,11 @@ mod tests {
         MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, has_exact_key_package_pair,
         merge_cleanup_relay_urls,
     };
+    use crate::RelayType;
+    use crate::whitenoise::error::WhitenoiseError;
+    use crate::whitenoise::relays::Relay;
     use crate::whitenoise::session::test_helpers::test_session;
+    use crate::whitenoise::users::User;
 
     #[tokio::test]
     async fn delete_keeps_local_material_when_no_relays() {
@@ -1092,6 +1092,301 @@ mod tests {
 
         let result = session.key_packages().delete_batch(vec![], false, 0).await;
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_batch_from_relay_urls_empty_returns_zero_before_relay_check() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        let result = session
+            .key_packages()
+            .delete_batch_from_relay_urls(vec![], true, 0, &[])
+            .await;
+
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_batch_from_relay_urls_requires_relays_for_nonempty_batch() {
+        let keys = Keys::generate();
+        let session = test_session(keys.public_key()).await;
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "key-package")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = session
+            .key_packages()
+            .delete_batch_from_relay_urls(vec![event], false, 0, &[])
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::AccountMissingKeyPackageRelays)
+        ));
+    }
+
+    #[tokio::test]
+    async fn filter_fetched_key_package_events_drops_wrong_kind_and_author() {
+        let account_keys = Keys::generate();
+        let session = test_session(account_keys.public_key()).await;
+        let matching = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "legacy")
+            .sign_with_keys(&account_keys)
+            .unwrap();
+        let wrong_kind = EventBuilder::new(Kind::TextNote, "not a key package")
+            .sign_with_keys(&account_keys)
+            .unwrap();
+        let wrong_author = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "wrong author")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        let filtered = session
+            .key_packages()
+            .filter_fetched_key_package_events(vec![matching.clone(), wrong_kind, wrong_author]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, matching.id);
+    }
+
+    #[tokio::test]
+    async fn delete_local_key_material_marks_hash_ref_group_deleted() {
+        let account_keys = Keys::generate();
+        let pk = account_keys.public_key();
+        let session = test_session(pk).await;
+        let dummy_url = RelayUrl::parse("wss://test.invalid").unwrap();
+        let kp_data = session
+            .mdk
+            .create_key_package_for_event(&pk, vec![dummy_url])
+            .expect("create key package");
+        let canonical = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &kp_data.content)
+            .tags(kp_data.tags_30443.to_vec())
+            .sign_with_keys(&account_keys)
+            .unwrap();
+        let legacy = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, &kp_data.content)
+            .tags(kp_data.tags_443.to_vec())
+            .sign_with_keys(&account_keys)
+            .unwrap();
+
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &kp_data.hash_ref,
+                &canonical.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(&kp_data.d_tag),
+            )
+            .await
+            .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &kp_data.hash_ref,
+                &legacy.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
+            .await
+            .unwrap();
+
+        session
+            .key_packages()
+            .delete_local_key_material(&canonical.id)
+            .await;
+
+        let records = session
+            .repos
+            .published_key_packages
+            .find_by_hash_ref(&kp_data.hash_ref)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.key_material_deleted));
+    }
+
+    #[tokio::test]
+    async fn delete_local_key_material_handles_missing_and_already_deleted_records() {
+        let keys = Keys::generate();
+        let session = test_session(keys.public_key()).await;
+        let missing = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "missing")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        session
+            .key_packages()
+            .delete_local_key_material(&missing.id)
+            .await;
+
+        session
+            .repos
+            .published_key_packages
+            .create(
+                b"already-deleted",
+                &missing.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
+            .await
+            .unwrap();
+        let record = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&missing.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .mark_key_material_deleted(record.id)
+            .await
+            .unwrap();
+
+        session
+            .key_packages()
+            .delete_local_key_material(&missing.id)
+            .await;
+
+        let record = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&missing.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.key_material_deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_from_storage_deletes_parseable_events_and_ignores_invalid_events() {
+        let account_keys = Keys::generate();
+        let pk = account_keys.public_key();
+        let session = test_session(pk).await;
+        let dummy_url = RelayUrl::parse("wss://test.invalid").unwrap();
+        let kp_data = session
+            .mdk
+            .create_key_package_for_event(&pk, vec![dummy_url])
+            .expect("create key package");
+        let valid = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, &kp_data.content)
+            .tags(kp_data.tags_443.to_vec())
+            .sign_with_keys(&account_keys)
+            .unwrap();
+        let invalid = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-a-key-package")
+            .sign_with_keys(&account_keys)
+            .unwrap();
+
+        session
+            .key_packages()
+            .delete_from_storage(&[valid, invalid])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_once_returns_already_completed_before_relay_resolution() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+        session
+            .repos
+            .maintenance_tasks
+            .mark_completed(KEY_PACKAGE_RELAY_CLEANUP_TASK)
+            .await
+            .unwrap();
+
+        let outcome = session
+            .key_packages()
+            .cleanup_relay_key_packages_once()
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, KeyPackageRelayCleanupOutcome::AlreadyCompleted);
+    }
+
+    #[tokio::test]
+    async fn cleanup_once_defers_recent_consumption_before_purge() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+        let event_id = EventId::all_zeros().to_hex();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                b"recent-consumed",
+                &event_id,
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .mark_consumed(&event_id)
+            .await
+            .unwrap();
+
+        let outcome = session
+            .key_packages()
+            .cleanup_relay_key_packages_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_once_requires_publish_relays_when_not_deferred() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        let result = session
+            .key_packages()
+            .cleanup_relay_key_packages_once()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::AccountMissingKeyPackageRelays)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_relay_urls_reads_key_package_nip65_and_default_sources() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+        let user = User::find_by_pubkey(&pk, &session.shared.database)
+            .await
+            .unwrap();
+        let key_package_url = RelayUrl::parse("wss://cleanup-kp.example").unwrap();
+        let nip65_url = RelayUrl::parse("wss://cleanup-nip65.example").unwrap();
+        let key_package_relay =
+            Relay::find_or_create_by_url(&key_package_url, &session.shared.database)
+                .await
+                .unwrap();
+        let nip65_relay = Relay::find_or_create_by_url(&nip65_url, &session.shared.database)
+            .await
+            .unwrap();
+        user.add_relays(
+            &[key_package_relay],
+            RelayType::KeyPackage,
+            &session.shared.database,
+        )
+        .await
+        .unwrap();
+        user.add_relays(&[nip65_relay], RelayType::Nip65, &session.shared.database)
+            .await
+            .unwrap();
+
+        let cleanup_urls = session.key_packages().cleanup_relay_urls().await.unwrap();
+
+        assert!(cleanup_urls.contains(&key_package_url));
+        assert!(cleanup_urls.contains(&nip65_url));
+        for default_url in &session.shared.config.default_account_relays {
+            assert!(cleanup_urls.contains(default_url));
+        }
     }
 
     #[test]
