@@ -176,7 +176,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             context,
             &account,
             "maintenance to publish a replacement key package",
-            |packages| !packages.is_empty(),
+            has_key_package_pair,
         )
         .await?;
         tracing::info!(
@@ -230,7 +230,10 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             context,
             &account,
             "expired key package rotation to complete",
-            |packages| !packages.is_empty() && packages.iter().all(|e| e.id != expired_event_id),
+            |packages| {
+                has_key_package_pair(packages)
+                    && packages.iter().all(|event| event.id != expired_event_id)
+            },
         )
         .await?;
 
@@ -299,17 +302,18 @@ where
 
 fn assert_contains_key_package_pair(packages: &[Event], description: &str) {
     assert!(
-        packages
-            .iter()
-            .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
-        "{description} should include a canonical kind:30443 key package"
+        has_key_package_pair(packages),
+        "{description} should include canonical kind:30443 and legacy kind:443 key packages"
     );
-    assert!(
-        packages
+}
+
+fn has_key_package_pair(packages: &[Event]) -> bool {
+    packages
+        .iter()
+        .any(|event| event.kind == MLS_KEY_PACKAGE_KIND)
+        && packages
             .iter()
-            .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
-        "{description} should include a legacy kind:443 key package"
-    );
+            .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY)
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.
