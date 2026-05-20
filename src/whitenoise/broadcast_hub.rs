@@ -69,7 +69,7 @@ where
             .unwrap_or(false)
     }
 
-    pub fn subscriber_keys(&self) -> Vec<K> {
+    pub(crate) fn subscriber_keys(&self) -> Vec<K> {
         self.streams
             .iter()
             .filter(|entry| entry.receiver_count() > 0)

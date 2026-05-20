@@ -967,41 +967,7 @@ impl Whitenoise {
             account.pubkey
         );
 
-        // Gather all inputs before touching existing subscriptions so that a
-        // fallible data-fetch cannot leave the account with no active subs.
-        let inbox_relays: Vec<RelayUrl> =
-            Relay::urls(&account.effective_inbox_relays(&self.shared).await?);
-
-        let group_specs = self.extract_group_subscription_specs(account).await?;
-
-        // Use a larger buffer when resubscribing after teardown to cover the gap
-        // window between deactivate and the new subscriptions going live.
-        // Any duplicate events are deduplicated by the event tracker.
-        // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
-        let since = Self::group_resubscribe_since(account);
-
-        let signer = self.get_signer_for_account(account)?;
-
-        let Some(session) = self.session(&account.pubkey) else {
-            return Err(WhitenoiseError::AccountNotFound);
-        };
-
-        // All inputs ready — now safe to tear down and replace.
-        session.deactivate_subscriptions().await;
-
-        let (activation_result, _) = tokio::join!(
-            session.activate_subscriptions(
-                &self.shared.relay_control,
-                &inbox_relays,
-                &group_specs,
-                since,
-                signer,
-            ),
-            self.warm_ephemeral_account_relays(account),
-        );
-        activation_result.map_err(WhitenoiseError::from)?;
-
-        Ok(())
+        self.activate_account_subscriptions(account, true).await
     }
 
     /// Catch up an account's inbox and group subscriptions without first
@@ -1021,15 +987,34 @@ impl Whitenoise {
             account.pubkey
         );
 
+        self.activate_account_subscriptions(account, false).await
+    }
+
+    async fn activate_account_subscriptions(
+        &self,
+        account: &Account,
+        deactivate_first: bool,
+    ) -> Result<()> {
+        // Gather all inputs before optionally touching existing subscriptions so
+        // that a fallible data-fetch cannot leave the account with no active subs.
         let inbox_relays: Vec<RelayUrl> =
             Relay::urls(&account.effective_inbox_relays(&self.shared).await?);
         let group_specs = self.extract_group_subscription_specs(account).await?;
+
+        // Use the account's replay buffer for both destructive refresh and
+        // foreground catch-up. Duplicate events are deduplicated by the event tracker.
+        // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
         let since = Self::group_resubscribe_since(account);
         let signer = self.get_signer_for_account(account)?;
 
         let Some(session) = self.session(&account.pubkey) else {
             return Err(WhitenoiseError::AccountNotFound);
         };
+
+        if deactivate_first {
+            // All inputs are ready, so refresh can safely tear down and replace.
+            session.deactivate_subscriptions().await;
+        }
 
         let (activation_result, _) = tokio::join!(
             session.activate_subscriptions(

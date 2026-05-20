@@ -237,7 +237,9 @@ impl Whitenoise {
     /// It rereads the current database state, including rows written by another
     /// process that shares the App Group database. Use this after
     /// [`Self::resume_after_background`] when the caller needs to replace a UI
-    /// list rather than apply item-level stream updates.
+    /// list rather than apply item-level stream updates. Flutter/FFI consumers
+    /// that receive a `SnapshotRefresh` stream trigger should call this when
+    /// they need exact removal of rows that are no longer present.
     #[perf_instrument("whitenoise")]
     pub async fn fetch_chat_list_snapshot(
         &self,
@@ -252,7 +254,9 @@ impl Whitenoise {
     /// Fetch the current archived chat-list snapshot without opening a stream.
     ///
     /// This is the archived-list counterpart to
-    /// [`Self::fetch_chat_list_snapshot`].
+    /// [`Self::fetch_chat_list_snapshot`]. Flutter/FFI consumers that receive a
+    /// `SnapshotRefresh` stream trigger on the archived chat-list stream should
+    /// call this when they need exact removal of rows that are no longer present.
     #[perf_instrument("whitenoise")]
     pub async fn fetch_archived_chat_list_snapshot(
         &self,

@@ -44,7 +44,7 @@ impl Whitenoise {
     #[perf_instrument("whitenoise")]
     pub async fn resume_after_background(&self) -> Result<()> {
         let accounts = self.force_foreground_subscription_catch_up().await?;
-        self.replay_foreground_stream_snapshots(&accounts).await;
+        self.replay_chat_list_stream_snapshots(&accounts).await;
         Ok(())
     }
 
@@ -77,9 +77,14 @@ impl Whitenoise {
     }
 
     fn foreground_catch_up_should_abort(error: &WhitenoiseError) -> bool {
+        // Relay/network/subscription errors are treated as transient catch-up
+        // failures so foreground resume can still refresh other accounts and
+        // replay local DB snapshots. Process-wide storage/config/init failures
+        // mean the app cannot reliably read shared state, so return them.
         matches!(
             error,
-            WhitenoiseError::Database(_)
+            WhitenoiseError::Initialization
+                | WhitenoiseError::Database(_)
                 | WhitenoiseError::SqlxError(_)
                 | WhitenoiseError::MdkSqliteStorage(_)
                 | WhitenoiseError::Filesystem(_)
@@ -87,11 +92,12 @@ impl Whitenoise {
         )
     }
 
-    async fn replay_foreground_stream_snapshots(&self, accounts: &[Account]) {
-        self.replay_chat_list_stream_snapshots(accounts).await;
-    }
-
     async fn replay_chat_list_stream_snapshots(&self, accounts: &[Account]) {
+        // These are point-in-time subscriber snapshots used to avoid DB work
+        // for accounts that had no active stream at resume time. A stream that
+        // subscribes after this point receives its own initial snapshot from
+        // subscribe_to_chat_list/subscribe_to_archived_chat_list, so it does not
+        // depend on this replay.
         let active_subscribers: HashSet<_> = self
             .shared
             .chat_list_stream_manager
@@ -178,6 +184,19 @@ mod tests {
 
         whitenoise.resume_after_background().await.unwrap();
         whitenoise.resume_after_background().await.unwrap();
+    }
+
+    #[test]
+    fn foreground_catch_up_abort_classification_separates_process_failures() {
+        assert!(Whitenoise::foreground_catch_up_should_abort(
+            &WhitenoiseError::Initialization
+        ));
+        assert!(Whitenoise::foreground_catch_up_should_abort(
+            &WhitenoiseError::Configuration("bad config".to_string())
+        ));
+        assert!(!Whitenoise::foreground_catch_up_should_abort(
+            &WhitenoiseError::AccountNotFound
+        ));
     }
 
     #[tokio::test]
