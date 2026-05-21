@@ -57,15 +57,11 @@ impl Whitenoise {
     pub async fn resume_after_background(&self) -> Result<()> {
         let accounts = self.force_foreground_subscription_catch_up().await?;
         self.replay_chat_list_stream_snapshots(&accounts).await;
-        self.schedule_key_package_relay_cleanup_after_grace("foreground")
-            .await;
+        self.schedule_key_package_relay_cleanup_after_grace().await;
         Ok(())
     }
 
-    pub(crate) async fn schedule_key_package_relay_cleanup_after_grace(
-        &self,
-        trigger: &'static str,
-    ) {
+    pub(crate) async fn schedule_key_package_relay_cleanup_after_grace(&self) {
         let Some(wn) = self.this.upgrade() else {
             tracing::warn!(
                 target: "whitenoise::foreground_catchup",
@@ -75,7 +71,8 @@ impl Whitenoise {
         };
 
         self.spawn_background(async move {
-            wn.run_key_package_relay_cleanup_after_grace(trigger).await;
+            wn.run_key_package_relay_cleanup_after_grace("foreground")
+                .await;
         })
         .await;
     }
@@ -378,7 +375,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         whitenoise
-            .schedule_key_package_relay_cleanup_after_grace("test")
+            .schedule_key_package_relay_cleanup_after_grace()
             .await;
 
         tokio::time::timeout(
