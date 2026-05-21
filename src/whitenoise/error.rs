@@ -266,6 +266,9 @@ pub enum WhitenoiseError {
     #[error("Key package publish failed: {0}")]
     KeyPackagePublishFailed(String),
 
+    #[error("Key package delete failed: {0}")]
+    KeyPackageDeleteFailed(String),
+
     #[error("MLS message unprocessable: {0}")]
     MlsMessageUnprocessable(String),
 

@@ -1,12 +1,24 @@
 use std::collections::HashSet;
+use std::time::Duration;
+
+use tokio::sync::watch;
 
 use crate::perf_instrument;
+use crate::whitenoise::session::key_packages::KeyPackageRelayCleanupOutcome;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
     error::{Result, WhitenoiseError},
 };
+
+#[cfg(not(test))]
+const KEY_PACKAGE_RELAY_CLEANUP_DELAY: Duration = Duration::from_secs(
+    crate::whitenoise::session::key_packages::KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS,
+);
+#[cfg(test)]
+const KEY_PACKAGE_RELAY_CLEANUP_DELAY: Duration = Duration::from_millis(50);
+const KEY_PACKAGE_RELAY_CLEANUP_MAX_ATTEMPTS: usize = 3;
 
 impl Whitenoise {
     /// Catch the main app process up after foreground resume or notification tap.
@@ -45,7 +57,128 @@ impl Whitenoise {
     pub async fn resume_after_background(&self) -> Result<()> {
         let accounts = self.force_foreground_subscription_catch_up().await?;
         self.replay_chat_list_stream_snapshots(&accounts).await;
+        self.schedule_key_package_relay_cleanup_after_grace().await;
         Ok(())
+    }
+
+    pub(crate) async fn schedule_key_package_relay_cleanup_after_grace(&self) {
+        let Some(wn) = self.this.upgrade() else {
+            tracing::warn!(
+                target: "whitenoise::foreground_catchup",
+                "Cannot schedule key package relay cleanup: Whitenoise handle is shutting down"
+            );
+            return;
+        };
+
+        self.spawn_background(async move {
+            wn.run_key_package_relay_cleanup_after_grace("foreground")
+                .await;
+        })
+        .await;
+    }
+
+    pub(crate) async fn run_key_package_relay_cleanup_after_grace(&self, trigger: &'static str) {
+        let mut shutdown_rx = self.scheduler_shutdown.subscribe();
+        if *shutdown_rx.borrow() {
+            tracing::debug!(
+                target: "whitenoise::foreground_catchup",
+                "Skipping delayed key package relay cleanup because shutdown already began"
+            );
+            return;
+        }
+
+        for attempt in 1..=KEY_PACKAGE_RELAY_CLEANUP_MAX_ATTEMPTS {
+            if Self::key_package_relay_cleanup_shutdown_started(&mut shutdown_rx).await {
+                return;
+            }
+
+            if !self
+                .run_key_package_relay_cleanup_sweep(trigger, attempt)
+                .await
+            {
+                return;
+            }
+        }
+
+        tracing::warn!(
+            target: "whitenoise::foreground_catchup",
+            trigger,
+            attempts = KEY_PACKAGE_RELAY_CLEANUP_MAX_ATTEMPTS,
+            "One-time key package relay cleanup remained deferred after all attempts"
+        );
+    }
+
+    async fn key_package_relay_cleanup_shutdown_started(
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(KEY_PACKAGE_RELAY_CLEANUP_DELAY) => false,
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    tracing::debug!(
+                        target: "whitenoise::foreground_catchup",
+                        "Skipping delayed key package relay cleanup because shutdown began"
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    async fn run_key_package_relay_cleanup_sweep(
+        &self,
+        trigger: &'static str,
+        attempt: usize,
+    ) -> bool {
+        let mut saw_deferred = false;
+        for session in self.account_manager.sessions_iter() {
+            match session
+                .key_packages()
+                .cleanup_relay_key_packages_once()
+                .await
+            {
+                Ok(KeyPackageRelayCleanupOutcome::AlreadyCompleted) => {
+                    tracing::debug!(
+                        target: "whitenoise::foreground_catchup",
+                        account = %session.account_pubkey.to_hex(),
+                        trigger,
+                        "One-time key package relay cleanup already completed"
+                    );
+                }
+                Ok(KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage) => {
+                    saw_deferred = true;
+                    tracing::info!(
+                        target: "whitenoise::foreground_catchup",
+                        account = %session.account_pubkey.to_hex(),
+                        trigger,
+                        attempt,
+                        "Deferring one-time key package relay cleanup until consumed \
+                         key packages leave the quiet period"
+                    );
+                }
+                Ok(KeyPackageRelayCleanupOutcome::DeletedAndPublished { deleted }) => {
+                    tracing::info!(
+                        target: "whitenoise::foreground_catchup",
+                        account = %session.account_pubkey.to_hex(),
+                        trigger,
+                        deleted,
+                        "Completed one-time key package relay cleanup"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "whitenoise::foreground_catchup",
+                        account = %session.account_pubkey.to_hex(),
+                        trigger,
+                        "One-time key package relay cleanup failed: {}",
+                        error
+                    );
+                }
+            }
+        }
+        saw_deferred
     }
 
     async fn force_foreground_subscription_catch_up(&self) -> Result<Vec<Account>> {
@@ -184,6 +317,73 @@ mod tests {
 
         whitenoise.resume_after_background().await.unwrap();
         whitenoise.resume_after_background().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_package_relay_cleanup_exits_when_shutdown_already_started() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let _ = whitenoise.scheduler_shutdown.send(true);
+        let wn = whitenoise.clone();
+
+        let handle =
+            tokio::spawn(async move { wn.run_key_package_relay_cleanup_after_grace("test").await });
+
+        tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("cleanup should not sleep when shutdown was already requested")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_package_relay_cleanup_waits_for_grace_period() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let wn = whitenoise.clone();
+
+        let handle =
+            tokio::spawn(async move { wn.run_key_package_relay_cleanup_after_grace("test").await });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "cleanup should wait through the invite grace period before running"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cleanup should finish after the test grace period")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_package_relay_cleanup_exits_when_shutdown_changes_during_delay() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let wn = whitenoise.clone();
+
+        let handle =
+            tokio::spawn(async move { wn.run_key_package_relay_cleanup_after_grace("test").await });
+
+        tokio::task::yield_now().await;
+        let _ = whitenoise.scheduler_shutdown.send(true);
+        tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("cleanup should exit after shutdown changes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_key_package_relay_cleanup_runs_background_task() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        whitenoise
+            .schedule_key_package_relay_cleanup_after_grace()
+            .await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            whitenoise.wait_for_pending_background_tasks(),
+        )
+        .await
+        .expect("scheduled cleanup should finish after the test grace period");
     }
 
     #[test]

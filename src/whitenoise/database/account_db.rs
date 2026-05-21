@@ -5,9 +5,10 @@
 //!
 //! **Current status (Phase 18d shipped):** physically separate file per
 //! account holding `account_settings`, `drafts`, `published_key_packages`,
-//! `published_events`, `account_follows`, the account-scoped subset of
-//! `processed_events`, plus `accounts_groups`, `push_registrations`, and
-//! `group_push_tokens`. Phase 18e will move message projections.
+//! `account_maintenance_tasks`, `published_events`, `account_follows`, the
+//! account-scoped subset of `processed_events`, plus `accounts_groups`,
+//! `push_registrations`, and `group_push_tokens`. Phase 18e will move message
+//! projections.
 
 use std::path::PathBuf;
 
@@ -21,7 +22,7 @@ use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 /// Each account will have its own file, identified by the account's hex public
 /// key. Account-scoped tables: `account_settings`, `account_follows`,
 /// `accounts_groups`, `drafts`, `push_registrations`, `group_push_tokens`,
-/// `published_key_packages`, `published_events`,
+/// `published_key_packages`, `account_maintenance_tasks`, `published_events`,
 /// `processed_events` (account-level), `aggregated_messages`,
 /// `message_delivery_status`, `media_references`, and `mute_list`.
 ///
