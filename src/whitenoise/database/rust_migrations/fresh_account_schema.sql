@@ -50,7 +50,8 @@ CREATE INDEX IF NOT EXISTS idx_published_kp_cleanup
     ON published_key_packages(consumed_at, key_material_deleted);
 
 CREATE TABLE IF NOT EXISTS account_maintenance_tasks (
-    name          TEXT PRIMARY KEY,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL UNIQUE,
     completed_at  INTEGER NOT NULL
 );
 

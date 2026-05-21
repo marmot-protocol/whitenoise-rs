@@ -24,7 +24,8 @@ impl LocalMigration for Migration {
     ) -> Result<(), DatabaseError> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS account_maintenance_tasks (
-                name TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
                 completed_at INTEGER NOT NULL
             )",
         )

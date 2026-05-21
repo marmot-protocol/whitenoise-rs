@@ -33,14 +33,11 @@ impl MaintenanceTasksRepo {
     }
 
     /// Mark `name` complete for this account.
-    ///
-    /// This is intentionally an upsert so retrying the same successful
-    /// maintenance task remains idempotent.
     pub async fn mark_completed(&self, name: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO account_maintenance_tasks (name, completed_at)
              VALUES (?, unixepoch())
-             ON CONFLICT(name) DO UPDATE SET completed_at = excluded.completed_at",
+             ON CONFLICT(name) DO NOTHING",
         )
         .bind(name)
         .execute(&self.db.inner.pool)
@@ -79,7 +76,8 @@ mod tests {
             .unwrap();
         sqlx::query(
             "CREATE TABLE account_maintenance_tasks (
-                name TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
                 completed_at INTEGER NOT NULL
             )",
         )
@@ -104,6 +102,18 @@ mod tests {
         let (repo, _dir) = setup().await;
 
         repo.mark_completed("cleanup").await.unwrap();
+        sqlx::query(
+            "UPDATE account_maintenance_tasks SET completed_at = 123 WHERE name = 'cleanup'",
+        )
+        .execute(&repo.db.inner.pool)
+        .await
+        .unwrap();
+        let first_completed_at: i64 = sqlx::query_scalar(
+            "SELECT completed_at FROM account_maintenance_tasks WHERE name = 'cleanup'",
+        )
+        .fetch_one(&repo.db.inner.pool)
+        .await
+        .unwrap();
         repo.mark_completed("cleanup").await.unwrap();
 
         let completed_count: i64 = sqlx::query_scalar(
@@ -113,5 +123,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(completed_count, 1);
+        let second_completed_at: i64 = sqlx::query_scalar(
+            "SELECT completed_at FROM account_maintenance_tasks WHERE name = 'cleanup'",
+        )
+        .fetch_one(&repo.db.inner.pool)
+        .await
+        .unwrap();
+        assert_eq!(second_completed_at, first_completed_at);
     }
 }

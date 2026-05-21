@@ -34,8 +34,7 @@ pub(crate) const KEY_PACKAGE_RELAY_CLEANUP_TASK: &str = "key_package_relay_clean
 pub(crate) const KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS: u64 = 30;
 
 /// Quiet period after a key package is consumed before relay cleanup may start.
-pub(crate) const KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS: u64 =
-    KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS;
+pub(crate) const KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS: u64 = 30;
 
 const KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS: u64 = 500;
 
@@ -44,6 +43,12 @@ pub(crate) enum KeyPackageRelayCleanupOutcome {
     AlreadyCompleted,
     DeferredRecentConsumedKeyPackage,
     DeletedAndPublished { deleted: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublishedKeyPackagePair {
+    canonical: EventId,
+    legacy: Option<EventId>,
 }
 
 /// View over [`AccountSession`] for key package lifecycle operations.
@@ -103,7 +108,7 @@ impl<'a> KeyPackageOps<'a> {
                 .publish_pair(&key_package_data, canonical_created_at, &relay_urls)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::key_packages",
@@ -144,7 +149,8 @@ impl<'a> KeyPackageOps<'a> {
             self.prepare_canonical_publish_inputs(relays).await?;
         let relay_urls = Relay::urls(relays);
         self.publish_pair(&key_package_data, canonical_created_at, &relay_urls)
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Resolves persisted canonical-slot state and generates the key package
@@ -201,7 +207,7 @@ impl<'a> KeyPackageOps<'a> {
         key_package_data: &KeyPackageEventData,
         canonical_created_at: Timestamp,
         relay_urls: &[RelayUrl],
-    ) -> Result<()> {
+    ) -> Result<PublishedKeyPackagePair> {
         let canonical_event_id = self
             .publish_to_relays(
                 MLS_KEY_PACKAGE_KIND,
@@ -223,6 +229,7 @@ impl<'a> KeyPackageOps<'a> {
         )
         .await?;
 
+        let mut legacy_event_id = None;
         match self
             .publish_to_relays(
                 MLS_KEY_PACKAGE_KIND_LEGACY,
@@ -233,13 +240,14 @@ impl<'a> KeyPackageOps<'a> {
             )
             .await
         {
-            Ok(legacy_event_id) => {
+            Ok(published_legacy_event_id) => {
                 // Legacy tracking is best-effort: kind:443 is regular per
                 // NIP-01 (not addressable), so a missed row only affects
                 // audit-trail completeness, not future canonical
                 // replacement.
-                self.track_published_legacy(&key_package_data.hash_ref, &legacy_event_id)
+                self.track_published_legacy(&key_package_data.hash_ref, &published_legacy_event_id)
                     .await;
+                legacy_event_id = Some(published_legacy_event_id);
             }
             Err(e) => {
                 tracing::warn!(
@@ -252,7 +260,10 @@ impl<'a> KeyPackageOps<'a> {
             }
         }
 
-        Ok(())
+        Ok(PublishedKeyPackagePair {
+            canonical: canonical_event_id,
+            legacy: legacy_event_id,
+        })
     }
 
     #[perf_instrument("key_packages")]
@@ -271,7 +282,10 @@ impl<'a> KeyPackageOps<'a> {
     ///
     /// The cleanup deliberately deletes only relay events, never local MLS key
     /// material. Pending Welcome processing still needs the local material for
-    /// key packages that were consumed before this job runs.
+    /// key packages that were consumed before this job runs. Local rows and key
+    /// material for stale, unconsumed packages may remain orphaned; this bounded
+    /// one-time leak is intentional because deleting them here could break late
+    /// Welcome processing.
     #[perf_instrument("key_packages")]
     pub(crate) async fn cleanup_relay_key_packages_once(
         &self,
@@ -290,12 +304,8 @@ impl<'a> KeyPackageOps<'a> {
             return Ok(KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage);
         }
 
-        let publish_relays = self.prepare_relays().await?;
+        let (publish_relays, cleanup_relay_urls) = self.cleanup_relay_scope().await?;
         if publish_relays.is_empty() {
-            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
-        }
-        let cleanup_relay_urls = self.cleanup_relay_urls().await?;
-        if cleanup_relay_urls.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
@@ -318,68 +328,83 @@ impl<'a> KeyPackageOps<'a> {
             return Ok(KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage);
         }
 
-        let mut total_deleted = 0;
-        for round in 0..MAX_DELETE_ROUNDS {
-            let key_package_events = self
-                .fetch_all_from_reachable_cleanup_relays(&cleanup_relay_urls)
-                .await?;
-            if key_package_events.is_empty() {
-                break;
-            }
-
-            let deleted = self
-                .delete_batch_from_relay_urls(key_package_events, false, 1, &cleanup_relay_urls)
-                .await?;
-            total_deleted += deleted;
-
-            if deleted == 0 {
-                let remaining = self
-                    .fetch_all_from_reachable_cleanup_relays(&cleanup_relay_urls)
-                    .await?;
-                return Err(WhitenoiseError::KeyPackagePublishFailed(format!(
-                    "one-time key package cleanup could not delete relay event(s): {} still \
-                     present after round {}",
-                    remaining.len(),
-                    round + 1
-                )));
-            }
-        }
-
-        let remaining = self
-            .fetch_all_from_reachable_cleanup_relays(&cleanup_relay_urls)
-            .await?;
-        if !remaining.is_empty() {
-            return Err(WhitenoiseError::KeyPackagePublishFailed(format!(
-                "one-time key package cleanup left {} relay event(s) after {} delete round(s)",
-                remaining.len(),
-                MAX_DELETE_ROUNDS
-            )));
-        }
-
         let (key_package_data, canonical_created_at) = self
             .prepare_canonical_publish_inputs(&publish_relays)
             .await?;
         let publish_relay_urls = Relay::urls(&publish_relays);
-        self.publish_pair(&key_package_data, canonical_created_at, &publish_relay_urls)
+        let published_pair = self
+            .publish_pair(&key_package_data, canonical_created_at, &publish_relay_urls)
             .await?;
+        let Some(legacy_event_id) = published_pair.legacy else {
+            return Err(WhitenoiseError::KeyPackagePublishFailed(
+                "one-time key package cleanup could not publish legacy replacement".to_string(),
+            ));
+        };
+        let replacement_event_ids = [published_pair.canonical, legacy_event_id];
 
         tokio::time::sleep(Duration::from_millis(
             KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS,
         ))
         .await;
 
-        let final_events = self
-            .fetch_all_from_reachable_cleanup_relays(&cleanup_relay_urls)
-            .await?;
-        if !has_exact_key_package_pair(&final_events) {
-            let (canonical, legacy) = key_package_pair_counts(&final_events);
+        let mut total_deleted = 0;
+        for round in 0..MAX_DELETE_ROUNDS {
+            let stale_key_package_events = self
+                .fetch_all_from_relay_urls(&cleanup_relay_urls)
+                .await?
+                .into_iter()
+                .filter(|event| !replacement_event_ids.contains(&event.id))
+                .collect::<Vec<_>>();
+            if stale_key_package_events.is_empty() {
+                break;
+            }
+
+            let deleted = self
+                .delete_batch_from_relay_urls(
+                    stale_key_package_events,
+                    false,
+                    1,
+                    &cleanup_relay_urls,
+                )
+                .await?;
+            total_deleted += deleted;
+
+            if deleted == 0 {
+                let remaining = self
+                    .fetch_all_from_relay_urls(&cleanup_relay_urls)
+                    .await?
+                    .into_iter()
+                    .filter(|event| !replacement_event_ids.contains(&event.id))
+                    .count();
+                return Err(WhitenoiseError::KeyPackageDeleteFailed(format!(
+                    "one-time key package cleanup could not delete relay event(s): {} stale \
+                     event(s) still present after round {}",
+                    remaining,
+                    round + 1
+                )));
+            }
+        }
+
+        let remaining = self
+            .fetch_all_from_relay_urls(&cleanup_relay_urls)
+            .await?
+            .into_iter()
+            .filter(|event| !replacement_event_ids.contains(&event.id))
+            .count();
+        if remaining > 0 {
+            return Err(WhitenoiseError::KeyPackageDeleteFailed(format!(
+                "one-time key package cleanup left {} stale relay event(s) after {} delete round(s)",
+                remaining, MAX_DELETE_ROUNDS
+            )));
+        }
+
+        let final_events = self.fetch_all_from_relay_urls(&cleanup_relay_urls).await?;
+        if !published_key_package_pair_is_visible(&final_events, &replacement_event_ids) {
             return Err(WhitenoiseError::KeyPackagePublishFailed(format!(
-                "one-time key package cleanup verification expected exactly one kind:{} and \
-                 one kind:{} event, found {} canonical, {} legacy, {} total",
-                MLS_KEY_PACKAGE_KIND.as_u16(),
-                MLS_KEY_PACKAGE_KIND_LEGACY.as_u16(),
-                canonical,
-                legacy,
+                "one-time key package cleanup verification did not find replacement events {} \
+                 and {}; {} key package event(s) visible",
+                replacement_event_ids[0].to_hex(),
+                replacement_event_ids[1].to_hex(),
                 final_events.len()
             )));
         }
@@ -402,17 +427,6 @@ impl<'a> KeyPackageOps<'a> {
             .fetch_key_packages_from_relays(relay_urls)
             .await?;
         Ok(self.filter_fetched_key_package_events(key_package_events))
-    }
-
-    async fn fetch_all_from_reachable_cleanup_relays(
-        &self,
-        relay_urls: &[RelayUrl],
-    ) -> Result<Vec<Event>> {
-        // This naming wrapper keeps cleanup call sites explicit. Partial-connect
-        // handling lives inside the ephemeral fetch path; cleanup should operate
-        // on relays that are reachable now without one disconnected relay
-        // blocking the rest.
-        self.fetch_all_from_relay_urls(relay_urls).await
     }
 
     fn filter_fetched_key_package_events(&self, key_package_events: Vec<Event>) -> Vec<Event> {
@@ -602,7 +616,6 @@ impl<'a> KeyPackageOps<'a> {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
-        let original_count = key_package_events.len();
         let original_ids: HashSet<EventId> = key_package_events.iter().map(|e| e.id).collect();
 
         if delete_mls_stored_keys {
@@ -637,15 +650,15 @@ impl<'a> KeyPackageOps<'a> {
             }
         }
 
-        let deleted_count = original_count - pending_ids.len();
+        let deleted_count = original_ids.len() - pending_ids.len();
 
         if !pending_ids.is_empty() {
             tracing::warn!(
-                target: "whitenoise::key_packages",
-                "After {} retries, {} of {} key package(s) still not deleted for account {}",
+            target: "whitenoise::key_packages",
+            "After {} retries, {} of {} key package(s) still not deleted for account {}",
                 max_retries,
                 pending_ids.len(),
-                original_count,
+                original_ids.len(),
                 self.session.account_pubkey.to_hex()
             );
         }
@@ -774,7 +787,7 @@ impl<'a> KeyPackageOps<'a> {
             .await
     }
 
-    async fn cleanup_relay_urls(&self) -> Result<Vec<RelayUrl>> {
+    async fn cleanup_relay_scope(&self) -> Result<(Vec<Relay>, Vec<RelayUrl>)> {
         let user =
             User::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
                 .await
@@ -786,8 +799,8 @@ impl<'a> KeyPackageOps<'a> {
             .relays(RelayType::Nip65, &self.session.shared.database)
             .await?;
 
-        Ok(merge_cleanup_relay_urls(
-            key_package_relays.into_iter().map(|relay| relay.url),
+        let cleanup_relay_urls = merge_cleanup_relay_urls(
+            key_package_relays.iter().map(|relay| relay.url.clone()),
             nip65_relays.into_iter().map(|relay| relay.url),
             self.session
                 .shared
@@ -795,7 +808,9 @@ impl<'a> KeyPackageOps<'a> {
                 .default_account_relays
                 .iter()
                 .cloned(),
-        ))
+        );
+
+        Ok((key_package_relays, cleanup_relay_urls))
     }
 
     async fn has_recent_consumed_key_package(&self) -> Result<bool> {
@@ -944,16 +959,6 @@ impl<'a> KeyPackageOps<'a> {
     }
 }
 
-fn push_unique_relay_url(
-    relay_urls: &mut Vec<RelayUrl>,
-    seen: &mut HashSet<String>,
-    relay_url: RelayUrl,
-) {
-    if seen.insert(relay_url.as_str().to_owned()) {
-        relay_urls.push(relay_url);
-    }
-}
-
 fn merge_cleanup_relay_urls<KeyPackageRelays, Nip65Relays, DefaultRelays>(
     key_package_relays: KeyPackageRelays,
     nip65_relays: Nip65Relays,
@@ -964,36 +969,19 @@ where
     Nip65Relays: IntoIterator<Item = RelayUrl>,
     DefaultRelays: IntoIterator<Item = RelayUrl>,
 {
-    let mut relay_urls = Vec::new();
     let mut seen = HashSet::new();
-    for relay_url in key_package_relays {
-        push_unique_relay_url(&mut relay_urls, &mut seen, relay_url);
-    }
-    for relay_url in nip65_relays {
-        push_unique_relay_url(&mut relay_urls, &mut seen, relay_url);
-    }
-    for relay_url in default_relays {
-        push_unique_relay_url(&mut relay_urls, &mut seen, relay_url);
-    }
-
-    relay_urls
+    key_package_relays
+        .into_iter()
+        .chain(nip65_relays)
+        .chain(default_relays)
+        .filter(|relay_url| seen.insert(relay_url.as_str().to_owned()))
+        .collect()
 }
 
-fn key_package_pair_counts(events: &[Event]) -> (usize, usize) {
-    let canonical = events
+fn published_key_package_pair_is_visible(events: &[Event], event_ids: &[EventId; 2]) -> bool {
+    event_ids
         .iter()
-        .filter(|event| event.kind == MLS_KEY_PACKAGE_KIND)
-        .count();
-    let legacy = events
-        .iter()
-        .filter(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY)
-        .count();
-    (canonical, legacy)
-}
-
-fn has_exact_key_package_pair(events: &[Event]) -> bool {
-    let (canonical, legacy) = key_package_pair_counts(events);
-    canonical == 1 && legacy == 1 && events.len() == 2
+        .all(|event_id| events.iter().any(|event| event.id == *event_id))
 }
 
 #[cfg(test)]
@@ -1004,7 +992,7 @@ mod tests {
         KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS,
         KEY_PACKAGE_RELAY_CLEANUP_TASK, KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS,
         KeyPackageRelayCleanupOutcome, MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY,
-        has_exact_key_package_pair, merge_cleanup_relay_urls,
+        merge_cleanup_relay_urls, published_key_package_pair_is_visible,
     };
     use crate::RelayType;
     use crate::whitenoise::error::WhitenoiseError;
@@ -1351,7 +1339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_relay_urls_reads_key_package_nip65_and_default_sources() {
+    async fn cleanup_relay_scope_reads_key_package_nip65_and_default_sources() {
         let pk = Keys::generate().public_key();
         let session = test_session(pk).await;
         let user = User::find_by_pubkey(&pk, &session.shared.database)
@@ -1377,8 +1365,10 @@ mod tests {
             .await
             .unwrap();
 
-        let cleanup_urls = session.key_packages().cleanup_relay_urls().await.unwrap();
+        let (publish_relays, cleanup_urls) =
+            session.key_packages().cleanup_relay_scope().await.unwrap();
 
+        assert_eq!(Relay::urls(&publish_relays), vec![key_package_url.clone()]);
         assert!(cleanup_urls.contains(&key_package_url));
         assert!(cleanup_urls.contains(&nip65_url));
         for default_url in &session.shared.config.default_account_relays {
@@ -1423,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_pair_requires_one_canonical_and_one_legacy_event() {
+    fn published_pair_visibility_requires_both_replacement_event_ids() {
         let keys = Keys::generate();
         let canonical = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "canonical")
             .tags([Tag::parse(["d", "slot"]).unwrap()])
@@ -1435,18 +1425,15 @@ mod tests {
         let extra_legacy = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "extra")
             .sign_with_keys(&keys)
             .unwrap();
+        let event_ids = [canonical.id, legacy.id];
 
-        assert!(has_exact_key_package_pair(&[
-            canonical.clone(),
-            legacy.clone()
-        ]));
-        assert!(!has_exact_key_package_pair(std::slice::from_ref(
-            &canonical
-        )));
-        assert!(!has_exact_key_package_pair(&[
-            canonical,
-            legacy,
-            extra_legacy
-        ]));
+        assert!(published_key_package_pair_is_visible(
+            &[canonical.clone(), legacy.clone(), extra_legacy],
+            &event_ids
+        ));
+        assert!(!published_key_package_pair_is_visible(
+            std::slice::from_ref(&canonical),
+            &event_ids
+        ));
     }
 }
