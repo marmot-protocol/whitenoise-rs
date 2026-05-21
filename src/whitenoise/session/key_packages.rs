@@ -23,6 +23,9 @@ use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 /// Maximum number of relay publish attempts before giving up.
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
+/// Legacy cleanup retries after the canonical replacement has already landed.
+const LEGACY_TWIN_RETRY_ATTEMPTS: u32 = 3;
+
 /// Maximum number of fetch-delete rounds before giving up.
 pub(crate) const MAX_DELETE_ROUNDS: u32 = 10;
 
@@ -229,26 +232,8 @@ impl<'a> KeyPackageOps<'a> {
         )
         .await?;
 
-        let mut legacy_event_id = None;
-        match self
-            .publish_to_relays(
-                MLS_KEY_PACKAGE_KIND_LEGACY,
-                &key_package_data.content,
-                relay_urls,
-                &key_package_data.tags_443,
-                None,
-            )
-            .await
-        {
-            Ok(published_legacy_event_id) => {
-                // Legacy tracking is best-effort: kind:443 is regular per
-                // NIP-01 (not addressable), so a missed row only affects
-                // audit-trail completeness, not future canonical
-                // replacement.
-                self.track_published_legacy(&key_package_data.hash_ref, &published_legacy_event_id)
-                    .await;
-                legacy_event_id = Some(published_legacy_event_id);
-            }
+        let legacy_event_id = match self.publish_legacy_twin(key_package_data, relay_urls).await {
+            Ok(published_legacy_event_id) => Some(published_legacy_event_id),
             Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::key_packages",
@@ -257,8 +242,9 @@ impl<'a> KeyPackageOps<'a> {
                     self.session.account_pubkey.to_hex(),
                     e,
                 );
+                None
             }
-        }
+        };
 
         Ok(PublishedKeyPackagePair {
             canonical: canonical_event_id,
@@ -335,10 +321,12 @@ impl<'a> KeyPackageOps<'a> {
         let published_pair = self
             .publish_pair(&key_package_data, canonical_created_at, &publish_relay_urls)
             .await?;
-        let Some(legacy_event_id) = published_pair.legacy else {
-            return Err(WhitenoiseError::KeyPackagePublishFailed(
-                "one-time key package cleanup could not publish legacy replacement".to_string(),
-            ));
+        let legacy_event_id = match published_pair.legacy {
+            Some(event_id) => event_id,
+            None => {
+                self.publish_legacy_twin_with_retry(&key_package_data, &publish_relay_urls)
+                    .await?
+            }
         };
         let replacement_event_ids = [published_pair.canonical, legacy_event_id];
 
@@ -728,6 +716,61 @@ impl<'a> KeyPackageOps<'a> {
         Ok(*result.id())
     }
 
+    async fn publish_legacy_twin(
+        &self,
+        key_package_data: &KeyPackageEventData,
+        relay_urls: &[RelayUrl],
+    ) -> Result<EventId> {
+        let legacy_event_id = self
+            .publish_to_relays(
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                &key_package_data.content,
+                relay_urls,
+                &key_package_data.tags_443,
+                None,
+            )
+            .await?;
+        // Legacy tracking is best-effort: kind:443 is regular per NIP-01
+        // (not addressable), so a missed row only affects the audit trail.
+        self.track_published_legacy(&key_package_data.hash_ref, &legacy_event_id)
+            .await;
+        Ok(legacy_event_id)
+    }
+
+    async fn publish_legacy_twin_with_retry(
+        &self,
+        key_package_data: &KeyPackageEventData,
+        relay_urls: &[RelayUrl],
+    ) -> Result<EventId> {
+        let mut last_error = None;
+        for attempt in 1..=LEGACY_TWIN_RETRY_ATTEMPTS {
+            tokio::time::sleep(legacy_twin_retry_delay(attempt)).await;
+            match self.publish_legacy_twin(key_package_data, relay_urls).await {
+                Ok(legacy_event_id) => return Ok(legacy_event_id),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "whitenoise::key_packages",
+                        "Legacy key package cleanup retry {}/{} failed for account {}: {}",
+                        attempt,
+                        LEGACY_TWIN_RETRY_ATTEMPTS,
+                        self.session.account_pubkey.to_hex(),
+                        error,
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(WhitenoiseError::KeyPackagePublishFailed(format!(
+            "one-time key package cleanup could not publish legacy replacement after {} retry \
+             attempt(s): {}",
+            LEGACY_TWIN_RETRY_ATTEMPTS,
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no retry attempted".to_string())
+        )))
+    }
+
     /// Tracks a canonical (kind:30443) publish in the per-account DB.
     ///
     /// Errors propagate to the caller because the d-tag reuse and
@@ -984,15 +1027,22 @@ fn published_key_package_pair_is_visible(events: &[Event], event_ids: &[EventId;
         .all(|event_id| events.iter().any(|event| event.id == *event_id))
 }
 
+fn legacy_twin_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250 * 2_u64.pow(attempt.saturating_sub(1)))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use nostr_sdk::{EventBuilder, EventId, Keys, Kind, RelayUrl, Tag};
 
     use super::{
         KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS,
         KEY_PACKAGE_RELAY_CLEANUP_TASK, KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS,
-        KeyPackageRelayCleanupOutcome, MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY,
-        merge_cleanup_relay_urls, published_key_package_pair_is_visible,
+        KeyPackageRelayCleanupOutcome, LEGACY_TWIN_RETRY_ATTEMPTS, MLS_KEY_PACKAGE_KIND,
+        MLS_KEY_PACKAGE_KIND_LEGACY, legacy_twin_retry_delay, merge_cleanup_relay_urls,
+        published_key_package_pair_is_visible,
     };
     use crate::RelayType;
     use crate::whitenoise::error::WhitenoiseError;
@@ -1385,6 +1435,7 @@ mod tests {
         assert_eq!(KEY_PACKAGE_RELAY_CLEANUP_INVITE_GRACE_SECS, 30);
         assert_eq!(KEY_PACKAGE_RELAY_CLEANUP_QUIET_PERIOD_SECS, 30);
         assert_eq!(KEY_PACKAGE_RELAY_CLEANUP_VERIFY_DELAY_MS, 500);
+        assert_eq!(LEGACY_TWIN_RETRY_ATTEMPTS, 3);
         let outcomes = [
             KeyPackageRelayCleanupOutcome::AlreadyCompleted,
             KeyPackageRelayCleanupOutcome::DeferredRecentConsumedKeyPackage,
@@ -1435,5 +1486,12 @@ mod tests {
             std::slice::from_ref(&canonical),
             &event_ids
         ));
+    }
+
+    #[test]
+    fn legacy_twin_retry_delay_uses_short_exponential_backoff() {
+        assert_eq!(legacy_twin_retry_delay(1), Duration::from_millis(250));
+        assert_eq!(legacy_twin_retry_delay(2), Duration::from_millis(500));
+        assert_eq!(legacy_twin_retry_delay(3), Duration::from_millis(1000));
     }
 }
