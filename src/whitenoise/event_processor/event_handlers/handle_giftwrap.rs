@@ -135,6 +135,9 @@ impl Whitenoise {
             }
         }
 
+        // Cheap pre-MLS block check using the verified NIP-59 seal author.
+        // The inner rumor pubkey is unsigned, so it must not drive block
+        // decisions.
         if session.mute_list().is_user_blocked(&seal_sender).await? {
             tracing::info!(
                 target: "whitenoise::event_processor::process_welcome",
@@ -173,6 +176,13 @@ impl Whitenoise {
                     "Dropping welcome containing blocked user {}",
                     pubkey,
                 );
+                if let Err(e) = mdk.delete_group(&group_id) {
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome",
+                        error = %e,
+                        "Failed to clean up pending MDK group after blocked welcome"
+                    );
+                }
                 return Ok(());
             }
         }
@@ -933,6 +943,12 @@ mod tests {
         assert!(
             visible_groups.is_empty(),
             "blocked welcomer must not create a visible account group"
+        );
+
+        let mdk_groups = member_session.mdk.get_groups().unwrap();
+        assert!(
+            mdk_groups.is_empty(),
+            "blocked welcomer must not leave pending MDK group state"
         );
     }
 
