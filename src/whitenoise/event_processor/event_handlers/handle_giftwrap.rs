@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use chrono::Utc;
 use mdk_core::GroupId;
@@ -48,7 +48,7 @@ impl Whitenoise {
 
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {
-                self.process_welcome(session, account, event, unwrapped.rumor)
+                self.process_welcome(session, account, event, unwrapped.sender, unwrapped.rumor)
                     .await?;
             }
             _ => {
@@ -69,6 +69,7 @@ impl Whitenoise {
         session: &Arc<AccountSession>,
         account: &Account,
         event: Event,
+        seal_sender: PublicKey,
         rumor: UnsignedEvent,
     ) -> Result<()> {
         // Extract key package event ID from the rumor tags early — required for pre-check
@@ -134,14 +135,11 @@ impl Whitenoise {
             }
         }
 
-        // Reject welcomes from blocked users before any MLS processing.
-        // Using `rumor.pubkey` (the Nostr identity of the sender) avoids
-        // allocating MDK group state or writing any DB rows for blocked senders.
-        if session.mute_list().is_user_blocked(&rumor.pubkey).await? {
+        if session.mute_list().is_user_blocked(&seal_sender).await? {
             tracing::info!(
                 target: "whitenoise::event_processor::process_welcome",
-                "Dropping welcome from blocked user {}",
-                rumor.pubkey,
+                "Dropping welcome from blocked gift-wrap sender {}",
+                seal_sender,
             );
             return Ok(());
         }
@@ -157,6 +155,27 @@ impl Whitenoise {
         let group_id = welcome.mls_group_id.clone();
         let group_name = welcome.group_name.clone();
         let welcomer_pubkey = welcome.welcomer;
+
+        // The gift-wrap rumor is unsigned, so its pubkey is not enough for
+        // block decisions. After MLS processing, also check the welcome
+        // metadata identities before saving app-visible state.
+        let mut welcome_identities = BTreeSet::from([welcomer_pubkey]);
+        welcome_identities.extend(welcome.group_admin_pubkeys.iter().copied());
+
+        for pubkey in welcome_identities {
+            if pubkey == account.pubkey {
+                continue;
+            }
+
+            if session.mute_list().is_user_blocked(&pubkey).await? {
+                tracing::info!(
+                    target: "whitenoise::event_processor::process_welcome",
+                    "Dropping welcome containing blocked user {}",
+                    pubkey,
+                );
+                return Ok(());
+            }
+        }
 
         // For DM groups (empty name), the welcomer is the other participant.
         // In the Marmot protocol, DM welcomes are always sent by the initiator,
@@ -532,7 +551,10 @@ impl Whitenoise {
 mod tests {
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
+    use crate::whitenoise::database::mute_list::MuteListEntry;
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
     use crate::whitenoise::relays::Relay;
+    use crate::whitenoise::session::AccountSession;
     use crate::whitenoise::test_utils::*;
 
     // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
@@ -573,6 +595,31 @@ mod tests {
             .first()
             .expect("welcome rumor exists")
             .clone()
+    }
+
+    async fn create_account_with_session(whitenoise: &Arc<Whitenoise>, keys: &Keys) -> Account {
+        let (account, _) = Account::new(whitenoise, Some(keys.clone())).await.unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(keys)
+            .unwrap();
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
+        let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
+        let signer: Arc<dyn NostrSigner> = Arc::new(keys.clone());
+        let session = Arc::new(
+            AccountSession::new(
+                account.pubkey,
+                mdk,
+                whitenoise.shared.clone(),
+                whitenoise.this.clone(),
+                Some(signer),
+            )
+            .await
+            .unwrap(),
+        );
+        whitenoise.account_manager.insert_session(session);
+        account
     }
 
     // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
@@ -718,7 +765,175 @@ mod tests {
         let result = whitenoise
             .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_blocked_seal_sender_is_dropped() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise_with(|config| {
+            config
+                .with_default_account_relays(vec![])
+                .with_discovery_relays(vec![])
+        })
+        .await;
+
+        let creator_keys = create_test_keys();
+        let creator_account = create_account_with_session(&whitenoise, &creator_keys).await;
+        let member_keys = create_test_keys();
+        let member_account = create_account_with_session(&whitenoise, &member_keys).await;
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let blocked_seal_signer = Keys::generate();
+
+        MuteListEntry::insert(
+            &blocked_seal_signer.public_key(),
+            false,
+            &member_session.account_db,
+        )
+        .await
+        .unwrap();
+
+        let key_package_data = member_session
+            .mdk
+            .create_key_package_for_event(
+                &member_account.pubkey,
+                vec![RelayUrl::parse("wss://relay.example.com").unwrap()],
+            )
+            .unwrap();
+        let key_package_event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &key_package_data.content)
+            .tags(key_package_data.tags_30443.clone())
+            .sign_with_keys(&member_keys)
+            .unwrap();
+        member_session
+            .repos
+            .published_key_packages
+            .create(
+                &key_package_data.hash_ref,
+                &key_package_event.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(&key_package_data.d_tag),
+            )
+            .await
+            .unwrap();
+
+        let creator_mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+        let create_group_result = creator_mdk
+            .create_group(
+                &creator_account.pubkey,
+                vec![key_package_event],
+                create_nostr_group_config_data(vec![creator_account.pubkey]),
+            )
+            .unwrap();
+        let mut welcome_rumor = create_group_result
+            .welcome_rumors
+            .first()
+            .expect("welcome rumor exists")
+            .clone();
+        welcome_rumor.pubkey = blocked_seal_signer.public_key();
+        welcome_rumor.ensure_id();
+
+        let giftwrap_event = EventBuilder::gift_wrap(
+            &blocked_seal_signer,
+            &member_account.pubkey,
+            welcome_rumor,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = whitenoise
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
+            .await;
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+
+        let visible_groups = AccountGroup::visible_for_account(&whitenoise, &member_account.pubkey)
+            .await
+            .unwrap();
+        assert!(
+            visible_groups.is_empty(),
+            "blocked seal sender must not create a visible account group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_blocked_welcomer_with_decoy_rumor_is_dropped() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise_with(|config| {
+            config
+                .with_default_account_relays(vec![])
+                .with_discovery_relays(vec![])
+        })
+        .await;
+
+        let creator_keys = create_test_keys();
+        let creator_account = create_account_with_session(&whitenoise, &creator_keys).await;
+        let member_keys = create_test_keys();
+        let member_account = create_account_with_session(&whitenoise, &member_keys).await;
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+
+        MuteListEntry::insert(&creator_account.pubkey, false, &member_session.account_db)
+            .await
+            .unwrap();
+
+        let key_package_data = member_session
+            .mdk
+            .create_key_package_for_event(
+                &member_account.pubkey,
+                vec![RelayUrl::parse("wss://relay.example.com").unwrap()],
+            )
+            .unwrap();
+        let key_package_event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &key_package_data.content)
+            .tags(key_package_data.tags_30443.clone())
+            .sign_with_keys(&member_keys)
+            .unwrap();
+        member_session
+            .repos
+            .published_key_packages
+            .create(
+                &key_package_data.hash_ref,
+                &key_package_event.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(&key_package_data.d_tag),
+            )
+            .await
+            .unwrap();
+
+        let creator_mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+        let create_group_result = creator_mdk
+            .create_group(
+                &creator_account.pubkey,
+                vec![key_package_event],
+                create_nostr_group_config_data(vec![creator_account.pubkey]),
+            )
+            .unwrap();
+        let mut welcome_rumor = create_group_result
+            .welcome_rumors
+            .first()
+            .expect("welcome rumor exists")
+            .clone();
+        let decoy_signer = Keys::generate();
+        welcome_rumor.pubkey = decoy_signer.public_key();
+        welcome_rumor.ensure_id();
+
+        let giftwrap_event =
+            EventBuilder::gift_wrap(&decoy_signer, &member_account.pubkey, welcome_rumor, vec![])
+                .await
+                .unwrap();
+
+        let result = whitenoise
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
+            .await;
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+
+        let visible_groups = AccountGroup::visible_for_account(&whitenoise, &member_account.pubkey)
+            .await
+            .unwrap();
+        assert!(
+            visible_groups.is_empty(),
+            "blocked welcomer must not create a visible account group"
+        );
     }
 
     #[tokio::test]
