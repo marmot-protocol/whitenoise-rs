@@ -51,6 +51,14 @@ pub struct ChatMessage {
     /// Whether this message has been deleted
     pub is_deleted: bool,
 
+    /// `true` if the message author was on this account's mute list when the
+    /// row was first cached. Frozen at ingest time and almost never mutated
+    /// after — the only exception is the post-sync unstamp sweep, which
+    /// clears `is_blocked` when this device belatedly learns that an unblock
+    /// pre-dated the message's `created_at`. The frontend hides messages
+    /// where `is_blocked == true`.
+    pub is_blocked: bool,
+
     /// Parsed Markdown AST (CommonMark + GFM + nostr extensions) of the message
     /// content. Empty `Document` when content is empty.
     pub content_tokens: whitenoise_markdown::Document,
@@ -122,6 +130,12 @@ pub struct ChatMessageSummary {
 
     /// Number of media attachments
     pub media_attachment_count: usize,
+
+    /// `true` if the message author was on this account's mute list when the
+    /// row was cached. Carried so the chat-list preview surface can hand it
+    /// to the frontend for group chats; DM previews are filtered server-side
+    /// and so always carry `false` here.
+    pub is_blocked: bool,
 }
 
 /// Summary of reactions on a message

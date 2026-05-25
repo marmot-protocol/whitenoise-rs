@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use nostr_sdk::{EventBuilder, Keys, Kind, NostrSigner, Tag};
 
     use crate::whitenoise::database::mute_list::MuteListEntry;
@@ -70,7 +71,7 @@ mod tests {
         let session = whitenoise.require_session(&account.pubkey).unwrap();
 
         // Insert directly — bypasses relay so the test is Docker-independent.
-        MuteListEntry::insert(&target, true, &session.account_db)
+        MuteListEntry::insert(&target, true, Utc::now(), &session.account_db)
             .await
             .unwrap();
 
@@ -136,10 +137,10 @@ mod tests {
         let target2 = Keys::generate().public_key();
         let session = whitenoise.require_session(&account.pubkey).unwrap();
 
-        MuteListEntry::insert(&target1, true, &session.account_db)
+        MuteListEntry::insert(&target1, true, Utc::now(), &session.account_db)
             .await
             .unwrap();
-        MuteListEntry::insert(&target2, false, &session.account_db)
+        MuteListEntry::insert(&target2, false, Utc::now(), &session.account_db)
             .await
             .unwrap();
 
@@ -159,7 +160,7 @@ mod tests {
         let other_target = Keys::generate().public_key();
         let session = whitenoise.require_session(&account.pubkey).unwrap();
 
-        MuteListEntry::insert(&blocked_target, true, &session.account_db)
+        MuteListEntry::insert(&blocked_target, true, Utc::now(), &session.account_db)
             .await
             .unwrap();
 
@@ -288,7 +289,11 @@ mod tests {
 
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let entries = vec![(target1, true), (target2, false)];
-        session.mute_list().sync_and_emit(&entries).await.unwrap();
+        session
+            .mute_list()
+            .sync_and_emit(&entries, Utc::now())
+            .await
+            .unwrap();
 
         let blocked = session.mute_list().get_blocked_users().await.unwrap();
         assert_eq!(blocked.len(), 2);
@@ -313,14 +318,14 @@ mod tests {
         let session = whitenoise.require_session(&account.pubkey).unwrap();
 
         // Seed with old_target
-        MuteListEntry::insert(&old_target, true, &session.account_db)
+        MuteListEntry::insert(&old_target, true, Utc::now(), &session.account_db)
             .await
             .unwrap();
 
         // Sync with only new_target
         session
             .mute_list()
-            .sync_and_emit(&[(new_target, false)])
+            .sync_and_emit(&[(new_target, false)], Utc::now())
             .await
             .unwrap();
 
@@ -345,11 +350,15 @@ mod tests {
         let target = Keys::generate().public_key();
 
         let session = whitenoise.require_session(&account.pubkey).unwrap();
-        MuteListEntry::insert(&target, true, &session.account_db)
+        MuteListEntry::insert(&target, true, Utc::now(), &session.account_db)
             .await
             .unwrap();
 
-        session.mute_list().sync_and_emit(&[]).await.unwrap();
+        session
+            .mute_list()
+            .sync_and_emit(&[], Utc::now())
+            .await
+            .unwrap();
 
         let blocked = session.mute_list().get_blocked_users().await.unwrap();
         assert!(blocked.is_empty());
@@ -368,7 +377,10 @@ mod tests {
         // so we insert directly and call sync_and_emit which internally calls it.
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let entries = vec![(stranger, true)];
-        let result = session.mute_list().sync_and_emit(&entries).await;
+        let result = session
+            .mute_list()
+            .sync_and_emit(&entries, Utc::now())
+            .await;
         assert!(
             result.is_ok(),
             "sync_and_emit with no DM group must succeed"

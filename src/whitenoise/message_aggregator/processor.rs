@@ -150,6 +150,10 @@ pub(crate) async fn process_regular_message(
         is_reply,
         reply_to_id,
         is_deleted: false,
+        // The aggregator has no mute-list access. The ingest caller
+        // (`cache_chat_message`) overwrites this from `MuteListEntry::exists`
+        // before persisting.
+        is_blocked: false,
         content_tokens,
         reactions: Default::default(),
         kind: u16::from(message.kind),
@@ -558,6 +562,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: Default::default(),
                 kind: 9,
