@@ -113,7 +113,7 @@ pub(crate) fn wn(socket: &PathBuf, args: &[&str]) -> serde_json::Value {
 
 /// Extract a hex-encoded MLS group ID from a group JSON response.
 ///
-/// The MDK `GroupId` serializes as `{"value": {"vec": [u8, ...]}}`.
+/// Legacy `GroupId` JSON can serialize as `{"value": {"vec": [u8, ...]}}`.
 pub(crate) fn group_id_hex(group_json: &serde_json::Value) -> String {
     bytes_field_hex(group_json, "mls_group_id")
 }

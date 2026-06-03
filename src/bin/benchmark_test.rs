@@ -161,14 +161,8 @@ fn write_json_output(
 /// The DB encryption keys are random 32-byte blobs that cannot be re-derived
 /// from any other material. The Nostr private key is re-seeded separately in
 /// `restore_keyring_sidecar`.
-fn save_keyring_sidecar(
-    data_dir: &std::path::Path,
-    pubkey_hex: &str,
-) -> Result<(), WhitenoiseError> {
-    let db_key_ids = [
-        BENCHMARK_WHITENOISE_DB_KEY_ID.to_string(),
-        format!("mdk.db.key.{pubkey_hex}"),
-    ];
+fn save_keyring_sidecar(data_dir: &std::path::Path) -> Result<(), WhitenoiseError> {
+    let db_key_ids = [BENCHMARK_WHITENOISE_DB_KEY_ID.to_string()];
 
     let mut sidecar = String::new();
     for db_key_id in &db_key_ids {
@@ -344,7 +338,7 @@ async fn main() -> Result<(), WhitenoiseError> {
 
         // Save DB encryption keys to a sidecar file so that subsequent
         // --init-only --seed-nsec runs can restore them to their empty mock keyrings.
-        save_keyring_sidecar(&args.data_dir, &account.pubkey.to_hex())?;
+        save_keyring_sidecar(&args.data_dir)?;
 
         whitenoise.shutdown().await?;
         return Ok(());

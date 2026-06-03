@@ -1,7 +1,7 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::whitenoise::media_processing::MediaProcessingOptions;
 use async_trait::async_trait;
-use mdk_core::media_processing::MediaProcessingOptions;
 use nostr_sdk::Url;
 
 pub struct UploadChatImageTestCase {

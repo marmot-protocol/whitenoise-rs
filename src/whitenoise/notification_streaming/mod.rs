@@ -6,8 +6,8 @@ pub use types::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
 };
 
+use crate::marmot::GroupId;
 use chrono::Utc;
-use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 
 use crate::perf_instrument;

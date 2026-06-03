@@ -15,8 +15,9 @@ pub enum DebugCmd {
     /// Show subscription health status
     Health,
 
-    /// Show MLS ratchet tree info for a group
-    RatchetTree {
+    /// Show redacted Marmot group forensics
+    #[command(alias = "ratchet-tree")]
+    GroupForensics {
         /// MLS group ID (hex)
         group_id: String,
     },
@@ -32,8 +33,8 @@ impl DebugCmd {
         match self {
             Self::RelayControlState => relay_control_state(socket, json).await,
             Self::Health => health(socket, json, account_flag).await,
-            Self::RatchetTree { group_id } => {
-                ratchet_tree(socket, json, account_flag, group_id).await
+            Self::GroupForensics { group_id } => {
+                group_forensics(socket, json, account_flag, group_id).await
             }
         }
     }
@@ -50,7 +51,7 @@ async fn health(socket: &Path, json: bool, account_flag: Option<&str>) -> crate:
     output::print_and_exit(&resp, json)
 }
 
-async fn ratchet_tree(
+async fn group_forensics(
     socket: &Path,
     json: bool,
     account_flag: Option<&str>,
@@ -59,7 +60,7 @@ async fn ratchet_tree(
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
-        &Request::DebugRatchetTree {
+        &Request::DebugGroupForensics {
             account: pubkey,
             group_id,
         },

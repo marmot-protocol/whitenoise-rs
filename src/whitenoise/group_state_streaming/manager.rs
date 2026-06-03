@@ -6,8 +6,8 @@
 //! removed" — and one account leaving a group does not change another
 //! account's membership in the same group, so the stream must isolate them.
 
+use crate::marmot::GroupId;
 use dashmap::DashMap;
-use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use tokio::sync::broadcast;
 

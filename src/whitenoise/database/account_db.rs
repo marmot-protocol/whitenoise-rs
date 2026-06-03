@@ -7,8 +7,8 @@
 //! account holding `account_settings`, `drafts`, `published_key_packages`,
 //! `account_maintenance_tasks`, `published_events`, `account_follows`, the
 //! account-scoped subset of `processed_events`, plus `accounts_groups`,
-//! `push_registrations`, and `group_push_tokens`. Phase 18e will move message
-//! projections.
+//! `push_registrations`, `group_push_tokens`, `aggregated_messages`,
+//! `message_delivery_status`, and `marmot_message_projections`.
 
 use std::path::PathBuf;
 
@@ -24,7 +24,8 @@ use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 /// `accounts_groups`, `drafts`, `push_registrations`, `group_push_tokens`,
 /// `published_key_packages`, `account_maintenance_tasks`, `published_events`,
 /// `processed_events` (account-level), `aggregated_messages`,
-/// `message_delivery_status`, `media_references`, and `mute_list`.
+/// `message_delivery_status`, `marmot_message_projections`,
+/// `media_references`, and `mute_list`.
 ///
 /// See `rearchitecture.md` Appendix B for the authoritative table ownership
 /// map.

@@ -1,7 +1,7 @@
 //! Unsent message drafts scoped to (account, group).
 
+use crate::marmot::GroupId;
 use chrono::{DateTime, Utc};
-use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +27,7 @@ pub struct Draft {
 
 #[cfg(test)]
 mod tests {
-    use mdk_core::prelude::GroupId;
+    use crate::marmot::GroupId;
 
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::test_utils::*;

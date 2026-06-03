@@ -55,8 +55,8 @@ impl TestCase for VerifySelfUpdateTestCase {
 
         // The self-update runs as a deferred background task after welcome
         // processing. It waits for in-flight messages at the current epoch to
-        // arrive before advancing the epoch, then performs MDK operations and
-        // a relay round-trip. Use a generous retry window to accommodate the
+        // arrive before advancing the epoch, then performs protocol operations
+        // and a relay round-trip. Use a generous retry window to accommodate the
         // intentional delay plus network/processing time.
         let config = RetryConfig::new(40, Duration::from_millis(500));
 

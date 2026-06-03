@@ -1,5 +1,5 @@
+use crate::marmot::GroupId;
 use chrono::{DateTime, Utc};
-use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 
@@ -194,6 +194,27 @@ impl AccountGroup {
                     chat_cleared_at, created_at, updated_at
              FROM accounts_groups
              WHERE user_confirmation IS NULL OR user_confirmation = 1",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| r.into_account_group(*account_pubkey))
+            .collect()
+    }
+
+    /// Finds all AccountGroups for the account, including hidden and removed rows.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn all_for_account(
+        account_pubkey: &PublicKey,
+        pool: &SqlitePool,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, LocalAccountGroupRow>(
+            "SELECT id, mls_group_id, user_confirmation, welcomer_pubkey,
+                    last_read_message_id, pin_order, dm_peer_pubkey,
+                    archived_at, removed_at, self_removed, muted_until,
+                    chat_cleared_at, created_at, updated_at
+             FROM accounts_groups",
         )
         .fetch_all(pool)
         .await?;
@@ -601,9 +622,9 @@ impl AccountGroup {
 
     /// Finds the most recently created visible DM group with a given peer.
     ///
-    /// Uses the `dm_peer_pubkey` column for an efficient single-query lookup
-    /// without requiring MLS/MDK calls. Returns `None` if no DM group exists
-    /// with this peer, or if the group has been declined.
+    /// Uses the `dm_peer_pubkey` column for an efficient single-query lookup.
+    /// Returns `None` if no DM group exists with this peer, or if the group has
+    /// been declined.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_dm_group_id_by_peer(
         peer_pubkey: &PublicKey,

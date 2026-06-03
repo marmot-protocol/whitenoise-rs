@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 
 use super::AccountSession;
+use crate::marmot::{GroupId, group_types};
 use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::aggregated_message::AggregatedMessage;
@@ -14,7 +14,7 @@ use crate::whitenoise::chat_list::{
     ChatListItem, assemble_chat_list_items, collect_pubkeys_to_fetch, sort_chat_list,
 };
 use crate::whitenoise::chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger};
-use crate::whitenoise::error::Result;
+use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::group_information::{GroupInformation, GroupType};
 use crate::whitenoise::groups::GroupWithMembership;
 use crate::whitenoise::message_aggregator::ChatMessageSummary;
@@ -159,8 +159,10 @@ impl<'a> ChatListOps<'a> {
     /// Returns `Ok(None)` if the group is not visible or not fully initialized.
     #[perf_instrument("chat_list")]
     pub(crate) async fn build_item(&self, group_id: &GroupId) -> Result<Option<ChatListItem>> {
-        let Some(group) = self.session.mdk.get_group(group_id)? else {
-            return Ok(None);
+        let group = match self.session.groups().get(group_id) {
+            Ok(group) => group,
+            Err(WhitenoiseError::GroupNotFound) => return Ok(None),
+            Err(error) => return Err(error),
         };
 
         let account_group = AccountGroup::find_by_account_and_group(
@@ -205,9 +207,9 @@ impl<'a> ChatListOps<'a> {
             .collect();
 
         let group_info_map = {
-            let infos = GroupInformation::get_by_mls_group_ids_with_mdk(
+            let infos = GroupInformation::get_by_mls_group_ids_with_marmot_storage(
                 &group_ids,
-                &self.session.mdk,
+                &self.session.marmot_storage,
                 &self.session.shared.database,
             )
             .await?;
@@ -304,12 +306,29 @@ impl<'a> ChatListOps<'a> {
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::{Keys, Metadata};
+    use async_trait::async_trait;
+    use cgka_traits::transport::TransportMessage;
+    use nostr_sdk::{Keys, Metadata, RelayUrl};
 
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
+    use crate::marmot::{GroupConfig, GroupId};
     use crate::whitenoise::group_information::GroupType;
     use crate::whitenoise::session::test_helpers::test_session;
-    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
+    use crate::whitenoise::test_utils::{
+        assert_obsolete_mls_artifacts_absent, create_group_config, create_mock_whitenoise,
+        remove_obsolete_mls_artifacts, wait_for_key_package_publication,
+    };
     use crate::whitenoise::users::User;
+
+    #[derive(Clone, Default)]
+    struct RecordingMarmotPublisher;
+
+    #[async_trait]
+    impl MarmotMessagePublisher for RecordingMarmotPublisher {
+        async fn publish(&self, _message: TransportMessage) -> MarmotPublishOutcome {
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
 
     #[tokio::test]
     async fn active_returns_empty_for_new_session() {
@@ -333,7 +352,7 @@ mod tests {
     async fn build_item_returns_none_for_nonexistent_group() {
         let pk = Keys::generate().public_key();
         let session = test_session(pk).await;
-        let fake_group_id = mdk_core::prelude::GroupId::from_slice(&[0xAB; 32]);
+        let fake_group_id = GroupId::from_slice(&[0xAB; 32]);
 
         let result = session
             .chat_list()
@@ -355,7 +374,7 @@ mod tests {
         user.metadata = Metadata::new().display_name("Bob");
         user.save(&whitenoise.shared.database).await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let session = whitenoise.session(&creator.pubkey).unwrap();
         let group = session
@@ -375,5 +394,96 @@ mod tests {
         assert_eq!(item.group_type, GroupType::DirectMessage);
         assert_eq!(item.name, Some("Bob".to_string()));
         assert_eq!(item.dm_peer_pubkey, Some(member.pubkey));
+    }
+
+    #[tokio::test]
+    async fn active_includes_darkmatter_group_when_group_information_is_missing() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "darkmatter chat list".to_string(),
+            "chat-list projection repair".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher,
+            )
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&creator, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
+            .bind(group.mls_group_id.as_slice())
+            .execute(&whitenoise.shared.database.pool)
+            .await
+            .unwrap();
+
+        let items = creator_session.chat_list().active().await.unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].mls_group_id, group.mls_group_id);
+        assert_eq!(items[0].group_type, GroupType::Group);
+        assert_eq!(items[0].name, Some("darkmatter chat list".to_string()));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn build_item_includes_darkmatter_group_without_legacy_group() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "darkmatter item".to_string(),
+            "single chat-list item projection".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher,
+            )
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&creator, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let item = creator_session
+            .chat_list()
+            .build_item(&group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert!(item.is_some());
+        let item = item.unwrap();
+        assert_eq!(item.mls_group_id, group.mls_group_id);
+        assert_eq!(item.group_type, GroupType::Group);
+        assert_eq!(item.name, Some("darkmatter item".to_string()));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
     }
 }

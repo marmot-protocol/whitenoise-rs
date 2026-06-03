@@ -1,5 +1,5 @@
+use crate::marmot::GroupId;
 use chrono::{DateTime, Utc};
-use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;

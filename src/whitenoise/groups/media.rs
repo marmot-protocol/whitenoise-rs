@@ -1,4 +1,4 @@
-use mdk_core::prelude::GroupId;
+use crate::marmot::GroupId;
 use nostr_blossom::client::BlossomClient;
 use nostr_sdk::prelude::*;
 
@@ -22,15 +22,24 @@ impl Whitenoise {
         group_id: &GroupId,
     ) {
         let Some(session) = self.session(&account.pubkey) else {
-            tracing::error!(
+            tracing::debug!(
                 target: "whitenoise::groups::background_sync_group_image_cache_if_needed",
                 account = %account.pubkey,
                 "No active session for background image cache"
             );
             return;
         };
+        let Some(session_operation) = session.begin_operation() else {
+            tracing::debug!(
+                target: "whitenoise::groups::background_sync_group_image_cache_if_needed",
+                account = %account.pubkey,
+                "Skipping background image cache because account session is closing"
+            );
+            return;
+        };
         let group_id = group_id.clone();
         tokio::spawn(async move {
+            let _session_operation = session_operation;
             if let Err(e) = session
                 .groups()
                 .media()

@@ -4,10 +4,10 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
-use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
+use crate::marmot::{GroupId, group_types};
 use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise,
@@ -26,7 +26,7 @@ pub struct ChatListItem {
     pub mls_group_id: GroupId,
 
     /// Display name for this chat:
-    /// - Groups: The group name from MDK (may be empty string)
+    /// - Groups: The projected group name (may be empty string)
     /// - DMs: The other participant's display name (None if no metadata)
     pub name: Option<String>,
 
@@ -128,7 +128,7 @@ pub(crate) fn resolve_display_name(user: Option<&User>) -> Option<String> {
 
 /// Resolves the chat name based on group type.
 ///
-/// - Groups: Returns the group name from MDK (may be empty string)
+/// - Groups: Returns the projected group name (may be empty string)
 /// - DMs: Returns the other user's display name (None if no metadata)
 pub(crate) fn resolve_chat_name(
     group: &group_types::Group,
@@ -416,8 +416,8 @@ impl Whitenoise {
 
     /// Resolves image paths for multiple groups in parallel.
     ///
-    /// Directly uses the groups already fetched from MDK, avoiding
-    /// redundant MDK instantiation and group fetching per group.
+    /// Directly uses the groups already fetched by the caller, avoiding
+    /// redundant group fetching per group.
     ///
     /// Groups without images return None (not an error).
     /// Download failures are logged but don't fail the batch.
@@ -482,7 +482,7 @@ mod tests {
     use super::*;
     use crate::whitenoise::aggregated_message::AggregatedMessage;
     use crate::whitenoise::message_aggregator::ChatMessage;
-    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
+    use crate::whitenoise::test_utils::{create_group_config, create_mock_whitenoise};
     use nostr_sdk::{Metadata, Timestamp};
 
     #[tokio::test]
@@ -506,7 +506,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let _group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -545,7 +545,7 @@ mod tests {
         member_user.metadata = Metadata::new();
         member_user.save(&whitenoise.shared.database).await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
             .require_session(&creator.pubkey)
@@ -587,7 +587,7 @@ mod tests {
         user.metadata = Metadata::new().display_name("Bob Display").name("Bob Name");
         user.save(&whitenoise.shared.database).await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
             .require_session(&creator.pubkey)
@@ -625,7 +625,7 @@ mod tests {
         user.metadata = Metadata::new().name("Bob Name");
         user.save(&whitenoise.shared.database).await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
             .require_session(&creator.pubkey)
@@ -664,7 +664,7 @@ mod tests {
         user.metadata = metadata;
         user.save(&whitenoise.shared.database).await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
             .require_session(&creator.pubkey)
@@ -696,7 +696,7 @@ mod tests {
         let member1 = whitenoise.create_identity().await.unwrap();
         let member2 = whitenoise.create_identity().await.unwrap();
 
-        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config1 = create_group_config(vec![creator.pubkey]);
         config1.name = "First Group".to_string();
         let _group1 = whitenoise
             .require_session(&creator.pubkey)
@@ -706,7 +706,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey]);
         config2.name = "Second Group".to_string();
         let _group2 = whitenoise
             .require_session(&creator.pubkey)
@@ -736,7 +736,7 @@ mod tests {
         let member1 = whitenoise.create_identity().await.unwrap();
         let member2 = whitenoise.create_identity().await.unwrap();
 
-        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config1 = create_group_config(vec![creator.pubkey]);
         config1.name = "First".to_string();
         let _group1 = whitenoise
             .require_session(&creator.pubkey)
@@ -749,7 +749,7 @@ mod tests {
         // Small delay to ensure different timestamps
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey]);
         config2.name = "Second".to_string();
         let _group2 = whitenoise
             .require_session(&creator.pubkey)
@@ -780,7 +780,7 @@ mod tests {
         let member1 = whitenoise.create_identity().await.unwrap();
         let member2 = whitenoise.create_identity().await.unwrap();
 
-        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config1 = create_group_config(vec![creator.pubkey]);
         config1.name = "Old Message Group".to_string();
         let group1 = whitenoise
             .require_session(&creator.pubkey)
@@ -793,7 +793,7 @@ mod tests {
         // Small delay
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey]);
         config2.name = "New Message Group".to_string();
         let group2 = whitenoise
             .require_session(&creator.pubkey)
@@ -873,7 +873,7 @@ mod tests {
         let member1 = whitenoise.create_identity().await.unwrap();
         let member2 = whitenoise.create_identity().await.unwrap();
 
-        let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config1 = create_group_config(vec![creator.pubkey]);
         let _group1 = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -882,7 +882,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey, member2.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey, member2.pubkey]);
         config2.name = String::new();
         let _group2 = whitenoise
             .require_session(&creator.pubkey)
@@ -932,7 +932,7 @@ mod tests {
             .picture(nostr_sdk::Url::parse("https://example.com/pic.jpg").unwrap());
         user.save(&whitenoise.shared.database).await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let _group = whitenoise
             .require_session(&creator.pubkey)
@@ -968,7 +968,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let _group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1005,7 +1005,7 @@ mod tests {
         user.metadata = user.metadata.display_name("Alice");
         user.save(&whitenoise.shared.database).await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1062,7 +1062,7 @@ mod tests {
         let member1 = whitenoise.create_identity().await.unwrap();
         let member2 = whitenoise.create_identity().await.unwrap();
 
-        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config1 = create_group_config(vec![creator.pubkey]);
         config1.name = "Old Message".to_string();
         let group1 = whitenoise
             .require_session(&creator.pubkey)
@@ -1074,7 +1074,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey]);
         config2.name = "No Message".to_string();
         let _group2 = whitenoise
             .require_session(&creator.pubkey)
@@ -1305,7 +1305,7 @@ mod tests {
         // Create multiple groups rapidly (same created_at timestamp)
         let mut groups = Vec::new();
         for i in 0..3 {
-            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            let mut config = create_group_config(vec![creator.pubkey]);
             config.name = format!("Group {}", i);
             let group = whitenoise
                 .require_session(&creator.pubkey)
@@ -1349,7 +1349,7 @@ mod tests {
 
         let mut groups = Vec::new();
         for i in 0..3 {
-            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            let mut config = create_group_config(vec![creator.pubkey]);
             config.name = format!("Group {}", i);
             let group = whitenoise
                 .require_session(&creator.pubkey)
@@ -1689,7 +1689,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1738,7 +1738,7 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         // Create 3 groups
-        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config1 = create_group_config(vec![creator.pubkey]);
         config1.name = "Group A".to_string();
         let group_a = whitenoise
             .require_session(&creator.pubkey)
@@ -1750,7 +1750,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey]);
         config2.name = "Group B".to_string();
         let group_b = whitenoise
             .require_session(&creator.pubkey)
@@ -1762,7 +1762,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let mut config3 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config3 = create_group_config(vec![creator.pubkey]);
         config3.name = "Group C".to_string();
         let _group_c = whitenoise
             .require_session(&creator.pubkey)
@@ -1821,7 +1821,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config1 = create_group_config(vec![creator.pubkey]);
         let group1 = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1830,7 +1830,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey]);
         config2.name = "Archived Group".to_string();
         let group2 = whitenoise
             .require_session(&creator.pubkey)
@@ -1878,7 +1878,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config1 = create_group_config(vec![creator.pubkey]);
         let _group1 = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1887,7 +1887,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey]);
         config2.name = "Archived Group".to_string();
         let group2 = whitenoise
             .require_session(&creator.pubkey)
@@ -1936,7 +1936,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2016,7 +2016,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2073,7 +2073,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2117,7 +2117,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()

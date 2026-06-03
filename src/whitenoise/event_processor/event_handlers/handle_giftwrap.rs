@@ -1,21 +1,34 @@
 use std::sync::Arc;
 
-use chrono::Utc;
-use mdk_core::GroupId;
+use crate::marmot::GroupId;
+use cgka_traits::transport::TransportMessage;
 use nostr_sdk::prelude::*;
+use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::{
+    marmot::{
+        publish::{MarmotMessagePublisher, MarmotPublishedEffects, publish_effects},
+        transport::MarmotRelayControlPublisher,
+    },
     perf_instrument, perf_span,
     whitenoise::{
         Whitenoise,
         accounts::Account,
-        accounts_groups::AccountGroup,
         chat_list_streaming::ChatListUpdateTrigger,
         error::{Result, WhitenoiseError},
-        group_information::{GroupInformation, GroupType},
+        group_information::GroupInformation,
         session::AccountSession,
     },
 };
+
+fn marmot_welcome_transport_message_from_event(event: &Event) -> Result<TransportMessage> {
+    let transport_event = NostrTransportEvent::from_nostr_event(event).map_err(|error| {
+        WhitenoiseError::InvalidEvent(format!("invalid Darkmatter welcome event: {error}"))
+    })?;
+    transport_event.to_transport_message().map_err(|error| {
+        WhitenoiseError::InvalidEvent(format!("invalid Darkmatter welcome transport: {error}"))
+    })
+}
 
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
@@ -103,7 +116,7 @@ impl Whitenoise {
 
         // Pre-check: do we have this key package and is its key material still available?
         // This avoids expensive MLS crypto operations when the KP is unknown or deleted.
-        match session
+        let published_key_package = match session
             .repos
             .published_key_packages
             .find_by_event_id(&key_package_event_id.to_hex())
@@ -123,7 +136,7 @@ impl Whitenoise {
                 );
                 return Ok(());
             }
-            Ok(Some(_)) => {} // Good — KP exists, key material available
+            Ok(Some(pkg)) => pkg, // Good — KP exists, key material available
             Err(e) => {
                 tracing::error!(
                     target: "whitenoise::event_processor::process_welcome",
@@ -132,11 +145,11 @@ impl Whitenoise {
                 );
                 return Err(e);
             }
-        }
+        };
 
         // Reject welcomes from blocked users before any MLS processing.
         // Using `rumor.pubkey` (the Nostr identity of the sender) avoids
-        // allocating MDK group state or writing any DB rows for blocked senders.
+        // allocating protocol group state or writing any DB rows for blocked senders.
         if session.mute_list().is_user_blocked(&rumor.pubkey).await? {
             tracing::info!(
                 target: "whitenoise::event_processor::process_welcome",
@@ -146,55 +159,122 @@ impl Whitenoise {
             return Ok(());
         }
 
-        let mdk = &*session.mdk;
+        if published_key_package.package_version == 2 {
+            self.process_marmot_welcome(session, account, &event, &rumor, key_package_event_id)
+                .await?;
+            return Ok(());
+        }
 
-        // Process the welcome to get group info (but don't accept yet)
-        let welcome = mdk
-            .process_welcome(&event.id, &rumor)
-            .map_err(WhitenoiseError::MdkCoreError)?;
-        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
+        tracing::warn!(
+            target: "whitenoise::event_processor::process_welcome",
+            account = %account.pubkey,
+            key_package_event = %key_package_event_id,
+            package_version = published_key_package.package_version,
+            "Ignoring unsupported legacy Welcome"
+        );
+        Ok(())
+    }
 
-        let group_id = welcome.mls_group_id.clone();
-        let group_name = welcome.group_name.clone();
-        let welcomer_pubkey = welcome.welcomer;
+    async fn process_marmot_welcome(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        event: &Event,
+        rumor: &UnsignedEvent,
+        key_package_event_id: EventId,
+    ) -> Result<()> {
+        let transport_message = marmot_welcome_transport_message_from_event(event)?;
+        let marmot_session =
+            session
+                .marmot
+                .clone()
+                .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                    session.account_pubkey,
+                ))?;
 
-        // For DM groups (empty name), the welcomer is the other participant.
-        // In the Marmot protocol, DM welcomes are always sent by the initiator,
-        // who is the only other member in a two-party DM group.
-        let dm_peer_pubkey = if GroupInformation::infer_group_type_from_group_name(&group_name)
-            == GroupType::DirectMessage
-        {
-            Some(welcomer_pubkey)
-        } else {
-            None
+        let joined = {
+            let mut marmot = marmot_session.lock().await;
+            if !marmot.recognizes_transport_message(&transport_message)? {
+                return Err(WhitenoiseError::InvalidEvent(
+                    "Darkmatter welcome is not addressed to this account".to_string(),
+                ));
+            }
+            marmot.join_welcome(transport_message).await?
         };
 
-        let account_group = AccountGroup {
-            id: None,
-            account_pubkey: account.pubkey,
-            mls_group_id: group_id.clone(),
-            user_confirmation: None,
-            welcomer_pubkey: Some(welcomer_pubkey),
-            last_read_message_id: None,
-            pin_order: None,
-            dm_peer_pubkey,
-            archived_at: None,
-            removed_at: None,
-            self_removed: false,
-            muted_until: None,
-            chat_cleared_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+        let routes = self
+            .marmot_publish_routes_for_session_effects(session, account, &joined.effects)
+            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&session.ephemeral, routes);
+        let published = self
+            .publish_marmot_welcome_effects_with_publisher(session, joined.effects, &publisher)
+            .await?;
+
+        let projection = {
+            let marmot = marmot_session.lock().await;
+            marmot.group_projection(&joined.group_id)?
         };
-        account_group.save(&session.account_db.inner.pool).await?;
-        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "New AccountGroup created and saved");
+        let group_id = session
+            .groups()
+            .project_joined_marmot_group(&projection, None, rumor.pubkey)
+            .await?;
 
-        // Now accept the welcome to finalize MLS membership
-        mdk.accept_welcome(&welcome)
-            .map_err(WhitenoiseError::MdkCoreError)?;
-        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
+        for event_effect in published.events {
+            self.handle_marmot_group_event(session, account, event.id, event_effect)
+                .await?;
+        }
 
-        // Spawn background task for remaining operations (DB writes, network calls)
+        self.spawn_welcome_finalization(
+            session,
+            account,
+            group_id,
+            projection.name,
+            key_package_event_id,
+            rumor.pubkey,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn publish_marmot_welcome_effects_with_publisher<P>(
+        &self,
+        session: &Arc<AccountSession>,
+        effects: crate::marmot::session::MarmotSessionEffects,
+        publisher: &P,
+    ) -> Result<MarmotPublishedEffects>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let marmot_session =
+            session
+                .marmot
+                .clone()
+                .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                    session.account_pubkey,
+                ))?;
+        let published = publish_effects(marmot_session, publisher, effects).await?;
+        Self::ensure_marmot_inbound_publish_succeeded(&published)?;
+        if !published.queued.is_empty() {
+            return Err(WhitenoiseError::Internal(format!(
+                "Darkmatter welcome queued {} follow-up intent(s); queued intent driver is not implemented",
+                published.queued.len()
+            )));
+        }
+
+        Ok(published)
+    }
+
+    async fn spawn_welcome_finalization(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        group_id: GroupId,
+        group_name: String,
+        key_package_event_id: EventId,
+        welcomer_pubkey: PublicKey,
+    ) -> Result<()> {
+        // Spawn background task for remaining operations (DB writes, network calls).
         // All operations are idempotent and failures are logged but don't stop other operations.
         //
         // Capture the `Arc<AccountSession>` here rather than re-resolving it
@@ -237,6 +317,16 @@ impl Whitenoise {
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
+        let Some(_session_operation) = session.begin_operation() else {
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                account = %account.pubkey.to_hex(),
+                group = %hex::encode(group_id.as_slice()),
+                "Skipping welcome finalization because account session is closing"
+            );
+            return;
+        };
+
         Self::finalize_welcome_with_instance(
             &whitenoise,
             &account,
@@ -256,14 +346,9 @@ impl Whitenoise {
     /// # Sequencing
     ///
     /// 1. **Subscription setup** — awaited first so the relay connection is live
-    ///    before we do anything else.  Its result gates the self-update: we must
-    ///    not advance the epoch before our subscription is live.
+    ///    before catch-up or background reconciliation starts.
     /// 2. **Independent ops** (group info, key rotation, image sync, welcomer
     ///    user lookup) — run concurrently; failures are logged but do not block.
-    /// 3. **Self-update** — runs only if subscription setup succeeded.  If setup
-    ///    failed, the self-update is skipped and the reason is logged so the
-    ///    caller can diagnose the problem.  Any missed self-update will be
-    ///    retried by the scheduled key-package maintenance task.
     #[perf_instrument("event_handlers")]
     pub(crate) async fn finalize_welcome_with_instance(
         whitenoise: &Whitenoise,
@@ -274,20 +359,19 @@ impl Whitenoise {
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
-        // --- Step 1: subscription setup (must happen before catch-up and self-update) ---
+        // --- Step 1: subscription setup (must happen before catch-up) ---
         //
         // Uses sync_group_subscriptions which only updates the group plane.
         // Unlike refresh_account_subscriptions, this does NOT tear down the
         // inbox or existing group subscriptions — avoiding a cascade failure
         // when relay connections are flaky (e.g. mobile resuming from background).
-        let _subscription_ok = match whitenoise.sync_group_subscriptions(account).await {
+        match whitenoise.sync_group_subscriptions(account).await {
             Ok(()) => {
                 tracing::debug!(
                     target: "whitenoise::event_processor::process_welcome::background",
                     account = %account.pubkey.to_hex(),
                     "Group subscriptions established"
                 );
-                true
             }
             Err(e) => {
                 tracing::error!(
@@ -296,11 +380,10 @@ impl Whitenoise {
                     group = %hex::encode(group_id.as_slice()),
                     error = %e,
                     reason = "subscription_setup_failed",
-                    "Subscription setup failed; skipping catch-up and self-update to avoid epoch mismatch"
+                    "Subscription setup failed; skipping catch-up"
                 );
-                false
             }
-        };
+        }
 
         // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
         let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
@@ -360,26 +443,6 @@ impl Whitenoise {
         // Push token sharing is deferred until the user explicitly accepts
         // the group invite (see accept_account_group). This prevents leaking
         // the device's push token into pending or declined groups.
-
-        // --- Step 3: self-update (only if subscriptions are live) ---
-        //
-        // The self-update advances the group epoch.  It runs only when
-        // subscriptions are live (step 1 succeeded) so we don't advance
-        // the epoch before we can receive any resulting commits from peers.
-        // Any missed self-update will be retried by the scheduled
-        // key-package maintenance task.
-        // Temporarily disabled for now: skip post-welcome self-update.
-        // if subscription_ok
-        //     && let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await
-        // {
-        //     tracing::error!(
-        //         target: "whitenoise::event_processor::process_welcome::background",
-        //         account = %account.pubkey.to_hex(),
-        //         group = %hex::encode(group_id.as_slice()),
-        //         error = %e,
-        //         "Failed to perform post-welcome self-update"
-        //     );
-        // }
 
         tracing::debug!(
             target: "whitenoise::event_processor::process_welcome::background",
@@ -482,117 +545,82 @@ impl Whitenoise {
         whitenoise.resolve_user(&welcomer_pubkey).await?;
         Ok(())
     }
-
-    /// Perform MLS self-update after joining a group (MIP-02 requirement).
-    ///
-    /// Rotates the member's leaf node key material so the group no longer
-    /// relies on the KeyPackage that was publicly available on relays.
-    /// This is a security-critical operation for forward secrecy.
-    ///
-    /// Per MIP-03, the evolution event is published to relays (with retry)
-    /// *before* merging the pending commit locally. This ensures we only
-    /// advance local state after confirming the relay accepted the event.
-    /// If all publish attempts fail, the pending commit is never merged and
-    /// the group state remains unchanged.
-    #[perf_instrument("event_handlers")]
-    async fn perform_self_update(
-        whitenoise: &Whitenoise,
-        session: &Arc<AccountSession>,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let relay_urls = {
-            let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
-            Self::ensure_group_relays(&mdk, group_id)?
-        };
-
-        let evolution_event = {
-            let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
-            let update_result = mdk.self_update(group_id)?;
-            update_result.evolution_event
-        };
-
-        session
-            .groups()
-            .publish_and_merge_commit(evolution_event, group_id, &relay_urls)
-            .await?;
-
-        tracing::info!(
-            target: "whitenoise::event_processor::process_welcome::background",
-            "Self-update completed for account {} in group {}",
-            account.pubkey.to_hex(),
-            hex::encode(group_id.as_slice())
-        );
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    use crate::marmot::GroupConfig;
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
     use crate::whitenoise::accounts_groups::AccountGroup;
-    use crate::whitenoise::relays::Relay;
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
     use crate::whitenoise::test_utils::*;
 
-    // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
-    async fn build_welcome_rumor(
-        whitenoise: &Whitenoise,
-        creator_account: &Account,
-        member_pubkey: PublicKey,
-    ) -> UnsignedEvent {
-        // Fetch a real key package event for the member from relays
-        let relays_urls = Relay::urls(
-            &creator_account
-                .key_package_relays(&whitenoise.shared)
-                .await
-                .unwrap(),
+    fn synthetic_welcome_rumor(creator_pubkey: PublicKey, tags: Vec<Tag>) -> UnsignedEvent {
+        let mut rumor = UnsignedEvent::new(
+            creator_pubkey,
+            Timestamp::now(),
+            Kind::MlsWelcome,
+            tags,
+            "unsupported legacy welcome".to_string(),
         );
-        let key_pkg_event = whitenoise
-            .shared
-            .relay_control
-            .fetch_user_key_package(member_pubkey, &relays_urls)
-            .await
-            .unwrap()
-            .expect("member must have a published key package");
-
-        // Create the group via mdk directly to obtain welcome rumor
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let create_group_result = mdk
-            .create_group(
-                &creator_account.pubkey,
-                vec![key_pkg_event],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-            )
-            .unwrap();
-
-        create_group_result
-            .welcome_rumors
-            .first()
-            .expect("welcome rumor exists")
-            .clone()
+        rumor.ensure_id();
+        rumor
     }
 
-    // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
-    async fn build_welcome_giftwrap(
+    async fn build_welcome_giftwrap_from_rumor(
         whitenoise: &Whitenoise,
         creator_account: &Account,
-        member_pubkey: PublicKey,
+        member_account: &Account,
+        rumor: UnsignedEvent,
     ) -> Event {
-        let welcome_rumor = build_welcome_rumor(whitenoise, creator_account, member_pubkey).await;
-
-        // Use the creator's real keys as signer to build the giftwrap
         let creator_signer = whitenoise
             .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&creator_account.pubkey)
             .unwrap();
 
-        EventBuilder::gift_wrap(&creator_signer, &member_pubkey, welcome_rumor, vec![])
+        EventBuilder::gift_wrap(&creator_signer, &member_account.pubkey, rumor, vec![])
             .await
             .unwrap()
+    }
+
+    async fn create_legacy_key_package_row(session: &Arc<AccountSession>, event_id: EventId) {
+        session
+            .repos
+            .published_key_packages
+            .create(
+                b"legacy-test-key-package",
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some("legacy-test-d"),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn event_tag(event_id: EventId) -> Tag {
+        Tag::parse(vec!["e", &event_id.to_hex()]).unwrap()
+    }
+
+    fn deterministic_event_id(seed: u64) -> EventId {
+        EventId::from_hex(&format!("{seed:064x}")).unwrap()
+    }
+
+    fn assert_obsolete_mls_artifacts_absent_for_account(
+        whitenoise: &Whitenoise,
+        account: &Account,
+    ) {
+        let artifacts = ObsoleteMlsArtifacts {
+            storage_path: crate::whitenoise::test_utils::obsolete_mls_storage_path(
+                &account.pubkey,
+                &whitenoise.config().data_dir,
+            ),
+        };
+        assert_obsolete_mls_artifacts_absent(&artifacts);
     }
 
     #[tokio::test]
@@ -604,8 +632,11 @@ mod tests {
         let member_account = members[0].0.clone();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
-        let mut welcome_rumor =
-            build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
+        let mut welcome_rumor = synthetic_welcome_rumor(
+            creator_account.pubkey,
+            vec![event_tag(deterministic_event_id(0x6001))],
+        );
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
         let mut tags_without_e = Tags::new();
         for tag in welcome_rumor.tags.iter() {
             if tag.kind() != TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)) {
@@ -637,14 +668,7 @@ mod tests {
             "Missing e-tag Welcome should be skipped safely"
         );
 
-        let mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let groups = mdk.get_groups().unwrap();
-        assert!(
-            groups.is_empty(),
-            "Member should not accept Welcome without required e-tag"
-        );
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
     }
 
     #[tokio::test]
@@ -656,8 +680,11 @@ mod tests {
         let member_account = members[0].0.clone();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
-        let mut welcome_rumor =
-            build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
+        let mut welcome_rumor = synthetic_welcome_rumor(
+            creator_account.pubkey,
+            vec![event_tag(deterministic_event_id(0x6002))],
+        );
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
         let mut malformed_tags = Tags::new();
         for tag in welcome_rumor.tags.iter() {
             if tag.kind() != TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)) {
@@ -690,50 +717,62 @@ mod tests {
             "Malformed e-tag Welcome should be skipped safely"
         );
 
-        let mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let groups = mdk.get_groups().unwrap();
-        assert!(
-            groups.is_empty(),
-            "Member should not accept Welcome with malformed e-tag"
-        );
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
     }
 
     #[tokio::test]
-    async fn test_handle_giftwrap_welcome_success() {
+    async fn test_handle_giftwrap_legacy_welcome_does_not_create_legacy_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Create creator and one member account; setup publishes key packages and contacts
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
-        // Build a real MLS Welcome giftwrap addressed to the member
-        let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+        let key_package_event_id = deterministic_event_id(0x6003);
+        create_legacy_key_package_row(&member_session, key_package_event_id).await;
+        let welcome_rumor = synthetic_welcome_rumor(
+            creator_account.pubkey,
+            vec![event_tag(key_package_event_id)],
+        );
+        let giftwrap_event = build_welcome_giftwrap_from_rumor(
+            &whitenoise,
+            &creator_account,
+            &member_account,
+            welcome_rumor,
+        )
+        .await;
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
 
-        // Member should successfully process welcome
-        let result = whitenoise
+        whitenoise
             .handle_giftwrap(&member_session, &member_account, giftwrap_event)
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
+
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
+        assert!(
+            AccountGroup::visible_for_account(&whitenoise, &member_account.pubkey)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unsupported legacy welcomes must not create account group rows"
+        );
     }
 
     #[tokio::test]
     async fn test_handle_giftwrap_creates_account_group_synchronously() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Create creator and one member account; setup publishes key packages and contacts
         let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
+        let member_account = whitenoise.create_identity().await.unwrap();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        // Build a real MLS Welcome giftwrap addressed to the member
-        let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+        let (group_id, giftwrap_event) = build_darkmatter_welcome_giftwrap(
+            &whitenoise,
+            &creator_account,
+            &member_account,
+            "darkmatter synchronous welcome",
+        )
+        .await;
 
         // Member processes the welcome
         let result = whitenoise
@@ -744,17 +783,10 @@ mod tests {
         // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
         // (not just after background task completes). This prevents race conditions
         // where Flutter polls groups() before the AccountGroup record exists.
-        let mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let groups = mdk.get_groups().unwrap();
-        assert!(!groups.is_empty(), "Member should have at least one group");
-
-        let group_id = &groups[0].mls_group_id;
         let session = whitenoise.require_session(&member_account.pubkey).unwrap();
         let account_group = AccountGroup::find_by_account_and_group(
             &member_account.pubkey,
-            group_id,
+            &group_id,
             &session.account_db.inner.pool,
         )
         .await
@@ -777,6 +809,181 @@ mod tests {
             Some(creator_account.pubkey),
             "AccountGroup.welcomer_pubkey should be the group creator's pubkey"
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingMarmotPublisher {
+        messages: Arc<Mutex<Vec<TransportMessage>>>,
+    }
+
+    impl CapturingMarmotPublisher {
+        fn messages(&self) -> Vec<TransportMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MarmotMessagePublisher for CapturingMarmotPublisher {
+        async fn publish(&self, message: TransportMessage) -> MarmotPublishOutcome {
+            self.messages.lock().unwrap().push(message);
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
+
+    async fn build_darkmatter_welcome_giftwrap(
+        whitenoise: &Whitenoise,
+        creator_account: &Account,
+        member_account: &Account,
+        group_name: &str,
+    ) -> (GroupId, Event) {
+        wait_for_key_package_publication(whitenoise, &[member_account]).await;
+
+        let config = GroupConfig::new(
+            group_name.to_string(),
+            "joined from a Darkmatter welcome".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:8080/").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let publisher = CapturingMarmotPublisher::default();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let created_group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let welcome_message = publisher
+            .messages()
+            .into_iter()
+            .find(|message| {
+                matches!(
+                    message.envelope,
+                    cgka_traits::TransportEnvelope::Welcome { .. }
+                )
+            })
+            .expect("Darkmatter group creation should publish a welcome");
+        let giftwrap_event = NostrTransportEvent::from_transport_message(&welcome_message)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+
+        (created_group.mls_group_id, giftwrap_event)
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_accepts_darkmatter_welcome_without_legacy_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let (created_group_id, giftwrap_event) = build_darkmatter_welcome_giftwrap(
+            &whitenoise,
+            &creator_account,
+            &member_account,
+            "darkmatter welcome",
+        )
+        .await;
+
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
+        whitenoise
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
+            .await
+            .unwrap();
+
+        let member_groups = member_session.groups().visible().await.unwrap();
+        assert!(
+            member_groups
+                .iter()
+                .any(|group| group.group.mls_group_id == created_group_id),
+            "Darkmatter welcome should create a visible pending group projection"
+        );
+        let account_group = AccountGroup::find_by_account_and_group(
+            &member_account.pubkey,
+            &created_group_id,
+            &member_session.account_db.inner.pool,
+        )
+        .await
+        .unwrap()
+        .expect("Darkmatter welcome should create AccountGroup");
+        assert!(account_group.is_pending());
+        assert_eq!(account_group.welcomer_pubkey, Some(creator_account.pubkey));
+
+        assert_obsolete_mls_artifacts_absent_for_account(&whitenoise, &member_account);
+    }
+
+    #[tokio::test]
+    async fn test_darkmatter_welcome_effect_publish_uses_injected_publisher() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "darkmatter welcome effects".to_string(),
+            "joined from a Darkmatter welcome".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:8080/").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let group_publisher = CapturingMarmotPublisher::default();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &group_publisher,
+            )
+            .await
+            .unwrap();
+
+        let welcome_message = group_publisher
+            .messages()
+            .into_iter()
+            .find(|message| {
+                matches!(
+                    message.envelope,
+                    cgka_traits::TransportEnvelope::Welcome { .. }
+                )
+            })
+            .expect("Darkmatter group creation should publish a welcome");
+        let effects = crate::marmot::session::MarmotSessionEffects {
+            events: Vec::new(),
+            publish: vec![crate::marmot::session::PublishWork::ApplicationMessage {
+                msg: welcome_message.clone(),
+            }],
+            queued: Vec::new(),
+        };
+        let effect_publisher = CapturingMarmotPublisher::default();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+
+        let published = whitenoise
+            .publish_marmot_welcome_effects_with_publisher(
+                &member_session,
+                effects,
+                &effect_publisher,
+            )
+            .await
+            .unwrap();
+
+        assert!(published.failures.is_empty());
+        assert_eq!(effect_publisher.messages().len(), 1);
+        assert_eq!(effect_publisher.messages()[0].id, welcome_message.id);
     }
 
     #[tokio::test]
@@ -825,7 +1032,7 @@ mod tests {
         let member_pubkey = members[0].0.pubkey;
         wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let config = create_group_config(vec![creator_account.pubkey]);
         whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -851,7 +1058,7 @@ mod tests {
     async fn test_finalize_welcome_with_instance_completes() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = mdk_core::GroupId::from_slice(&[42; 32]);
+        let group_id = GroupId::from_slice(&[42; 32]);
         let group_name = "Test Group";
         let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
 
@@ -894,7 +1101,7 @@ mod tests {
     async fn test_finalize_welcome_with_instance_idempotent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = mdk_core::GroupId::from_slice(&[44; 32]);
+        let group_id = GroupId::from_slice(&[44; 32]);
         let group_name = "Idempotent Test Group";
         let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
 
@@ -939,35 +1146,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_self_update_after_welcome_disabled_does_not_advance_epoch() {
+    async fn test_finalize_welcome_does_not_advance_epoch() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Create creator and one member account
         let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
+        let member_account = whitenoise.create_identity().await.unwrap();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        // Build and process a real MLS Welcome
-        let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+        let (group_id, giftwrap_event) = build_darkmatter_welcome_giftwrap(
+            &whitenoise,
+            &creator_account,
+            &member_account,
+            "darkmatter epoch welcome",
+        )
+        .await;
         whitenoise
             .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await
             .unwrap();
+        whitenoise.wait_for_pending_background_tasks().await;
 
-        // Get the group and record the epoch after welcome acceptance (before background tasks)
-        let mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let groups = mdk.get_groups().unwrap();
-        assert!(!groups.is_empty(), "Member should have at least one group");
-        let group = &groups[0];
-        let group_id = group.mls_group_id.clone();
+        let group = member_session.groups().get(&group_id).unwrap();
         let epoch_after_welcome = group.epoch;
 
-        let member_session = whitenoise.session(&member_account.pubkey).unwrap();
-        // Run finalize_welcome_with_instance which includes perform_self_update
+        // Run finalize_welcome_with_instance.
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &member_account,
@@ -979,14 +1180,11 @@ mod tests {
         )
         .await;
 
-        // Re-read the group and verify epoch does not advance while self-update is disabled
-        let mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let updated_group = mdk.get_group(&group_id).unwrap().expect("group must exist");
+        // Re-read the group and verify finalization does not advance the epoch.
+        let updated_group = member_session.groups().get(&group_id).unwrap();
         assert_eq!(
             updated_group.epoch, epoch_after_welcome,
-            "Epoch should remain unchanged while self-update is disabled (was {}, now {})",
+            "Epoch should remain unchanged during welcome finalization (was {}, now {})",
             epoch_after_welcome, updated_group.epoch
         );
     }
@@ -998,14 +1196,12 @@ mod tests {
     /// from scratch, which could cascade-fail on mobile. The fix uses an
     /// incremental group plane update that leaves the inbox untouched.
     #[tokio::test]
-    async fn test_finalize_welcome_adds_group_to_plane() {
+    async fn test_darkmatter_welcome_finalization_adds_group_to_plane() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
+        let member_account = whitenoise.create_identity().await.unwrap();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         // Member starts with subscriptions but no groups
         assert!(
@@ -1025,34 +1221,18 @@ mod tests {
             "Member should have 0 groups in plane before welcome"
         );
 
-        // Build and process a real MLS Welcome
-        let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+        let (_group_id, giftwrap_event) = build_darkmatter_welcome_giftwrap(
+            &whitenoise,
+            &creator_account,
+            &member_account,
+            "darkmatter plane welcome",
+        )
+        .await;
         whitenoise
             .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await
             .unwrap();
-
-        // Get the group ID from MDK (accept_welcome already ran)
-        let mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let groups = mdk.get_groups().unwrap();
-        assert!(!groups.is_empty(), "Member should have a group in MDK");
-        let group = &groups[0];
-
-        let member_session = whitenoise.session(&member_account.pubkey).unwrap();
-        // Run finalize_welcome_with_instance
-        Whitenoise::finalize_welcome_with_instance(
-            &whitenoise,
-            &member_account,
-            &member_session,
-            &group.mls_group_id,
-            &group.name,
-            EventId::all_zeros(),
-            creator_account.pubkey,
-        )
-        .await;
+        whitenoise.wait_for_pending_background_tasks().await;
 
         // The new group must be in the group plane
         let plane_count = whitenoise
@@ -1083,7 +1263,7 @@ mod tests {
     async fn test_finalize_welcome_no_signer_completes_gracefully() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = mdk_core::GroupId::from_slice(&[99; 32]);
+        let group_id = GroupId::from_slice(&[99; 32]);
         let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
 
         // Pre-create AccountGroup so the function has a record to work with
@@ -1135,9 +1315,17 @@ mod tests {
         let member_account = members[0].0.clone();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
-        // Build a real MLS Welcome giftwrap addressed to the member
-        let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+        let welcome_rumor = synthetic_welcome_rumor(
+            creator_account.pubkey,
+            vec![event_tag(deterministic_event_id(0x6004))],
+        );
+        let giftwrap_event = build_welcome_giftwrap_from_rumor(
+            &whitenoise,
+            &creator_account,
+            &member_account,
+            welcome_rumor,
+        )
+        .await;
 
         // Corrupt the per-account database by dropping the published_key_packages
         // table. The table lives in the account DB after the 18c split.

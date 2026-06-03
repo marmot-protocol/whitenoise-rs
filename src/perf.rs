@@ -11,7 +11,7 @@
 ///
 /// // Sub-operation within a function
 /// let _enc = perf_span!("mls::encrypt");
-/// let ciphertext = mdk.encrypt(...)?;
+/// let ciphertext = encrypt_message(...)?;
 /// drop(_enc); // explicit end; or let scope handle it
 /// ```
 ///

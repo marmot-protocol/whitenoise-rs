@@ -13,15 +13,14 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+use nostr_sdk::PublicKey;
+
 pub use types::{
     AggregatorConfig, ChatMessage, ChatMessageSummary, DeliveryStatus, EmojiReaction,
     GroupStatistics, ProcessingError, ReactionSummary, SearchResult, UserReaction,
 };
 
-use mdk_core::prelude::message_types::Message;
-use mdk_core::prelude::*;
-use nostr_sdk::PublicKey;
-
+use crate::marmot::{GroupId, Message};
 use crate::perf_span;
 use crate::whitenoise::media_files::MediaFile;
 
@@ -51,7 +50,7 @@ impl MessageAggregator {
 
     /// Fetch and aggregate messages for a specific group
     /// This is the main entry point that handles the complete pipeline:
-    /// 1. Fetch raw messages from mdk
+    /// 1. Fetch raw Marmot message projections
     /// 2. Parse the markdown AST for each message
     /// 3. Aggregate reactions, replies, and deletions
     /// 4. Return structured ChatMessage objects
@@ -59,7 +58,7 @@ impl MessageAggregator {
     /// # Arguments
     /// * `pubkey` - The public key of the user requesting messages (for account access)
     /// * `group_id` - The group to fetch and aggregate messages for
-    /// * `messages` - The raw messages to process (from mdk.get_messages())
+    /// * `messages` - The raw messages to process
     /// * `media_files` - Vector of MediaFile records for linking media to messages
     pub async fn aggregate_messages_for_group(
         &self,

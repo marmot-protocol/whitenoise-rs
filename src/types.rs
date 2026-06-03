@@ -1,9 +1,10 @@
-use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::{relay_control::SubscriptionContext, whitenoise::error::WhitenoiseError};
+use crate::{
+    marmot::Message, relay_control::SubscriptionContext, whitenoise::error::WhitenoiseError,
+};
 
 /// Retry information for failed event processing
 #[derive(Debug, Clone)]
@@ -201,15 +202,21 @@ pub struct RelaySessionRelayStateSnapshot {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageWithTokens {
-    pub message: message_types::Message,
+    pub message: Message,
     /// Parsed Markdown AST (CommonMark + GFM + nostr extensions) of
     /// `message.content`. Field name retained for FFI continuity.
     pub tokens: whitenoise_markdown::Document,
 }
 
 impl MessageWithTokens {
-    pub fn new(message: message_types::Message, tokens: whitenoise_markdown::Document) -> Self {
-        Self { message, tokens }
+    pub fn new<M>(message: M, tokens: whitenoise_markdown::Document) -> Self
+    where
+        M: Into<Message>,
+    {
+        Self {
+            message: message.into(),
+            tokens,
+        }
     }
 }
 

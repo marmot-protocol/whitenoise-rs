@@ -1,8 +1,6 @@
 pub mod create_accounts;
 pub mod create_group;
-pub mod create_legacy_peer_account;
 pub mod delete_message;
-pub mod legacy_key_package;
 pub mod send_message;
 pub mod set_chat_pin_order;
 pub mod verify_self_update;
@@ -10,9 +8,7 @@ pub mod wait_for_welcome;
 
 pub use create_accounts::*;
 pub use create_group::*;
-pub(crate) use create_legacy_peer_account::*;
 pub use delete_message::*;
-pub(crate) use legacy_key_package::*;
 pub use send_message::*;
 pub use set_chat_pin_order::*;
 pub use verify_self_update::*;

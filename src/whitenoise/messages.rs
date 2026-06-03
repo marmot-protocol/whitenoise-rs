@@ -1,6 +1,11 @@
 pub use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 
+use std::collections::HashSet;
+
+use nostr_sdk::prelude::*;
+
 use crate::{
+    marmot::{GroupId, Message as MarmotMessage, storage::WhitenoiseMarmotStorage},
     perf_instrument,
     types::MessageWithTokens,
     whitenoise::{
@@ -8,13 +13,15 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
+        database::{
+            Database, account_db::AccountDatabase, marmot_messages::MarmotMessageProjection,
+        },
         error::Result,
         media_files::MediaFile,
         message_aggregator::{ChatMessage, SearchResult},
+        session::account_db_path,
     },
 };
-use mdk_core::prelude::{message_types::Message, *};
-use nostr_sdk::prelude::*;
 
 impl Whitenoise {
     #[perf_instrument("messages")]
@@ -33,7 +40,10 @@ impl Whitenoise {
             .send(message, kind, tags)
             .await?;
 
-        if result.last_message_deleted {
+        if kind == 9 {
+            self.emit_chat_list_update_for_group(group_id, ChatListUpdateTrigger::NewLastMessage)
+                .await;
+        } else if result.last_message_deleted {
             self.emit_chat_list_update_for_group(
                 group_id,
                 ChatListUpdateTrigger::LastMessageDeleted,
@@ -150,7 +160,7 @@ impl Whitenoise {
         session.messages().search(query, limit).await
     }
 
-    /// Synchronize message cache with MDK on startup
+    /// Synchronize message cache with persisted message projections on startup.
     ///
     /// MUST be called BEFORE event processor starts to avoid race conditions.
     /// Uses simple count comparison to detect sync needs, then incrementally syncs missing events.
@@ -167,36 +177,45 @@ impl Whitenoise {
         let accounts = Account::all(&self.shared.database).await?;
 
         for account in accounts {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let groups = mdk.get_groups()?;
+            let mut projected_group_ids = HashSet::new();
 
-            for group_info in groups {
-                total_groups_checked += 1;
-
-                let mdk_messages = mdk.get_messages(&group_info.mls_group_id, None)?;
-
-                if self
-                    .cache_needs_sync(&account.pubkey, &group_info.mls_group_id, &mdk_messages)
-                    .await?
-                {
-                    tracing::info!(
-                        target: "whitenoise::cache",
-                        "Syncing cache for group {} (account {}): {} events",
-                        hex::encode(group_info.mls_group_id.as_slice()),
-                        account.pubkey.to_hex(),
-                        mdk_messages.len()
-                    );
-
-                    self.sync_cache_for_group(
+            if let Some(session) = self.account_manager.get_session(&account.pubkey) {
+                let session_account_db = session.account_db.as_ref().clone();
+                let (checked, synced) = self
+                    .sync_projected_message_cache_for_account(
                         &account.pubkey,
-                        &group_info.mls_group_id,
-                        mdk_messages,
+                        &session_account_db.inner,
+                        &session.marmot_storage,
+                        &mut projected_group_ids,
                     )
                     .await?;
-
-                    total_synced += 1;
-                }
+                total_groups_checked += checked;
+                total_synced += synced;
+                continue;
             }
+
+            let Some(existing_account_db) = self
+                .open_existing_account_db_for_cache_sync(&account.pubkey)
+                .await?
+            else {
+                continue;
+            };
+            let Some(marmot_storage) =
+                self.open_existing_marmot_storage_for_cache_sync(&account.pubkey)?
+            else {
+                continue;
+            };
+
+            let (checked, synced) = self
+                .sync_projected_message_cache_for_account(
+                    &account.pubkey,
+                    &existing_account_db.inner,
+                    &marmot_storage,
+                    &mut projected_group_ids,
+                )
+                .await?;
+            total_groups_checked += checked;
+            total_synced += synced;
         }
 
         tracing::info!(
@@ -209,27 +228,115 @@ impl Whitenoise {
         Ok(())
     }
 
+    async fn open_existing_account_db_for_cache_sync(
+        &self,
+        account_pubkey: &PublicKey,
+    ) -> Result<Option<AccountDatabase>> {
+        let db_path = account_db_path(&self.config().data_dir, account_pubkey);
+        if !db_path.try_exists()? {
+            return Ok(None);
+        }
+
+        let account_db = AccountDatabase::new(*account_pubkey, db_path).await?;
+        account_db
+            .run_account_migrations(&self.shared.database.pool)
+            .await?;
+        Ok(Some(account_db))
+    }
+
+    fn open_existing_marmot_storage_for_cache_sync(
+        &self,
+        account_pubkey: &PublicKey,
+    ) -> Result<Option<WhitenoiseMarmotStorage>> {
+        let marmot_storage_path =
+            Account::marmot_storage_path(account_pubkey, &self.config().data_dir);
+        let marmot_db_key_id = Account::marmot_db_key_id(account_pubkey);
+
+        Ok(WhitenoiseMarmotStorage::open_existing_for_account(
+            marmot_storage_path,
+            self.keyring_service_id(),
+            &marmot_db_key_id,
+        )?)
+    }
+
+    async fn sync_projected_message_cache_for_account(
+        &self,
+        account_pubkey: &PublicKey,
+        account_db: &Database,
+        marmot_storage: &WhitenoiseMarmotStorage,
+        projected_group_ids: &mut HashSet<Vec<u8>>,
+    ) -> Result<(usize, usize)> {
+        let mut checked = 0;
+        let mut synced = 0;
+
+        for projection in marmot_storage.list_group_projections()? {
+            let group_id = GroupId::from_slice(projection.group_id.as_slice());
+            projected_group_ids.insert(group_id.as_slice().to_vec());
+            checked += 1;
+
+            let messages = MarmotMessageProjection::list_by_group(&group_id, account_db).await?;
+
+            if self
+                .cache_needs_sync_for_messages_in_db(&group_id, &messages, account_db)
+                .await?
+            {
+                tracing::info!(
+                    target: "whitenoise::cache",
+                    "Syncing cache for projected group {} (account {}): {} events",
+                    hex::encode(group_id.as_slice()),
+                    account_pubkey.to_hex(),
+                    messages.len()
+                );
+
+                self.sync_marmot_cache_for_group_in_db(
+                    account_pubkey,
+                    &group_id,
+                    messages,
+                    account_db,
+                )
+                .await?;
+
+                synced += 1;
+            }
+        }
+
+        Ok((checked, synced))
+    }
+
     #[perf_instrument("messages")]
-    async fn cache_needs_sync(
+    async fn cache_needs_sync_for_messages(
         &self,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
-        mdk_messages: &[Message],
+        messages: &[MarmotMessage],
     ) -> Result<bool> {
-        if mdk_messages.is_empty() {
+        if messages.is_empty() {
             return Ok(false);
         }
 
         let session = self.require_session(account_pubkey)?;
-        let cached_count =
-            AggregatedMessage::count_by_group(group_id, &session.account_db.inner).await?;
+        self.cache_needs_sync_for_messages_in_db(group_id, messages, &session.account_db.inner)
+            .await
+    }
 
-        if mdk_messages.len() != cached_count {
+    async fn cache_needs_sync_for_messages_in_db(
+        &self,
+        group_id: &GroupId,
+        messages: &[MarmotMessage],
+        account_db: &Database,
+    ) -> Result<bool> {
+        if messages.is_empty() {
+            return Ok(false);
+        }
+
+        let cached_count = AggregatedMessage::count_by_group(group_id, account_db).await?;
+
+        if messages.len() != cached_count {
             tracing::debug!(
                 target: "whitenoise::cache",
-                "Cache count mismatch for group {}: MDK={}, Cache={}",
+                "Cache count mismatch for group {}: projections={}, Cache={}",
                 hex::encode(group_id.as_slice()),
-                mdk_messages.len(),
+                messages.len(),
                 cached_count
             );
             return Ok(true);
@@ -238,17 +345,14 @@ impl Whitenoise {
         Ok(false)
     }
 
-    /// Synchronize cache for a specific group
-    ///
-    /// Filters out events already in cache, then processes and saves only new events.
     #[perf_instrument("messages")]
-    async fn sync_cache_for_group(
+    async fn sync_marmot_cache_for_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
-        mdk_messages: Vec<Message>,
+        messages: Vec<MarmotMessage>,
     ) -> Result<()> {
-        if mdk_messages.is_empty() {
+        if messages.is_empty() {
             return Ok(());
         }
 
@@ -256,12 +360,30 @@ impl Whitenoise {
             .account_manager
             .get_session(pubkey)
             .ok_or_else(|| crate::whitenoise::error::WhitenoiseError::AccountNotFound)?;
+        self.sync_marmot_cache_for_group_in_db(
+            pubkey,
+            group_id,
+            messages,
+            &session.account_db.inner,
+        )
+        .await
+    }
+
+    async fn sync_marmot_cache_for_group_in_db(
+        &self,
+        pubkey: &PublicKey,
+        group_id: &GroupId,
+        messages: Vec<MarmotMessage>,
+        account_db: &Database,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
 
         let cached_ids =
-            AggregatedMessage::get_all_event_ids_by_group(group_id, &session.account_db.inner)
-                .await?;
+            AggregatedMessage::get_all_event_ids_by_group(group_id, account_db).await?;
 
-        let new_events: Vec<Message> = mdk_messages
+        let new_events: Vec<MarmotMessage> = messages
             .into_iter()
             .filter(|msg| !cached_ids.contains(&msg.id.to_string()))
             .collect();
@@ -284,13 +406,9 @@ impl Whitenoise {
             hex::encode(group_id.as_slice())
         );
 
-        let media_files = MediaFile::find_by_group(
-            &session.account_db.inner.pool,
-            &self.shared.database,
-            pubkey,
-            group_id,
-        )
-        .await?;
+        let media_files =
+            MediaFile::find_by_group(&account_db.pool, &self.shared.database, pubkey, group_id)
+                .await?;
 
         let processed_messages = self
             .shared
@@ -298,13 +416,8 @@ impl Whitenoise {
             .aggregate_messages_for_group(pubkey, group_id, new_events.clone(), media_files)
             .await?;
 
-        AggregatedMessage::save_events(
-            new_events,
-            processed_messages,
-            group_id,
-            &session.account_db.inner,
-        )
-        .await?;
+        AggregatedMessage::save_events(new_events, processed_messages, group_id, account_db)
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::cache",
@@ -319,9 +432,14 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{fs, time::Duration};
+
+    use async_trait::async_trait;
+    use cgka_traits::transport::TransportMessage;
 
     use super::*;
+    use crate::marmot::GroupConfig;
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
     use crate::whitenoise::error::WhitenoiseError;
     use crate::whitenoise::message_aggregator::{
         ChatMessage, DeliveryStatus, ReactionSummary, reaction_handler,
@@ -348,6 +466,27 @@ mod tests {
         }
     }
 
+    async fn projected_marmot_messages(
+        whitenoise: &Whitenoise,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+    ) -> Vec<MarmotMessage> {
+        let session = whitenoise.session(account_pubkey).unwrap();
+        MarmotMessageProjection::list_by_group(group_id, &session.account_db.inner)
+            .await
+            .unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingMarmotPublisher;
+
+    #[async_trait]
+    impl MarmotMessagePublisher for RecordingMarmotPublisher {
+        async fn publish(&self, _message: TransportMessage) -> MarmotPublishOutcome {
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
+
     /// Test successful message sending with various scenarios:
     /// - Default tags (None)
     /// - Custom tags (e.g., reply tags)
@@ -363,7 +502,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -463,7 +602,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -571,7 +710,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -609,15 +748,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_needs_sync_empty_mdk() {
+    async fn send_to_unknown_group_fails_without_legacy_protocol_fallback() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let unknown_group_id = GroupId::from_slice(&[171; 32]);
+
+        let result = whitenoise
+            .send_message_to_group(
+                &account,
+                &unknown_group_id,
+                "should not use legacy MLS".to_string(),
+                9,
+                None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn fetch_messages_for_unprojected_group_does_not_create_obsolete_mls_storage() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[0xE7; 32]);
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        creator_session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap()
+            .0
+            .accept(&whitenoise)
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&creator, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let result = whitenoise
+            .fetch_messages_for_group(&creator, &group_id)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_cache_needs_sync_empty_projection() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        // Empty MDK messages should not need sync — short-circuits before
+        // Empty message projections should not need sync — short-circuits before
         // touching the account DB, so the missing group is irrelevant.
         let needs_sync = whitenoise
-            .cache_needs_sync(&account.pubkey, &group_id, &[])
+            .cache_needs_sync_for_messages(&pubkey, &group_id, &[])
             .await
             .unwrap();
         assert!(!needs_sync);
@@ -629,9 +814,9 @@ mod tests {
         let group_id = GroupId::from_slice(&[2; 32]);
         let pubkey = nostr_sdk::Keys::generate().public_key();
 
-        // Syncing empty messages should succeed without error
+        // Syncing empty message projections should succeed without error
         let result = whitenoise
-            .sync_cache_for_group(&pubkey, &group_id, vec![])
+            .sync_marmot_cache_for_group(&pubkey, &group_id, vec![])
             .await;
         assert!(result.is_ok());
     }
@@ -651,7 +836,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
+                crate::whitenoise::test_utils::create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -691,17 +876,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Get messages from MDK
-        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+        // Get messages from Darkmatter projections
+        let marmot_messages =
+            projected_marmot_messages(&whitenoise, &creator.pubkey, &group.mls_group_id).await;
 
-        // Verify we have 3 messages in MDK
-        assert_eq!(mdk_messages.len(), 3);
+        // Verify we have 3 messages in Darkmatter projection storage
+        assert_eq!(marmot_messages.len(), 3);
 
-        // With proactive caching, cache already has kind 9 messages.
-        // But MDK also has kind 7/5 events (MLS protocol), so cache_needs_sync
-        // compares total event count (MDK) vs cache count.
-        // Cache only has kind 9 from proactive caching, sync fills in the rest.
+        // With proactive caching, cache already has projected app messages.
         let session = whitenoise.session(&creator.pubkey).unwrap();
         let cached_count =
             AggregatedMessage::count_by_group(&group.mls_group_id, &session.account_db.inner)
@@ -714,13 +896,17 @@ mod tests {
 
         // Sync the cache (should be idempotent since messages already cached)
         whitenoise
-            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages.clone())
+            .sync_marmot_cache_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                marmot_messages.clone(),
+            )
             .await
             .unwrap();
 
         // Cache should not need sync anymore
         let needs_sync = whitenoise
-            .cache_needs_sync(&creator.pubkey, &group.mls_group_id, &mdk_messages)
+            .cache_needs_sync_for_messages(&creator.pubkey, &group.mls_group_id, &marmot_messages)
             .await
             .unwrap();
         assert!(!needs_sync, "Cache should not need sync after syncing");
@@ -754,7 +940,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
+                crate::whitenoise::test_utils::create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -779,11 +965,11 @@ mod tests {
                 .unwrap();
         assert_eq!(cached_count, 2);
 
-        // Sync the cache (should be idempotent for kind 9, may add other event types)
-        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+        // Sync the cache from projections (should be idempotent for already cached messages)
+        let marmot_messages =
+            projected_marmot_messages(&whitenoise, &creator.pubkey, &group.mls_group_id).await;
         whitenoise
-            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
+            .sync_marmot_cache_for_group(&creator.pubkey, &group.mls_group_id, marmot_messages)
             .await
             .unwrap();
 
@@ -831,7 +1017,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
+                crate::whitenoise::test_utils::create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -913,7 +1099,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
+                crate::whitenoise::test_utils::create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -933,11 +1119,11 @@ mod tests {
                 .unwrap();
         }
 
-        // Populate cache
-        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+        // Populate cache from Darkmatter projections
+        let marmot_messages =
+            projected_marmot_messages(&whitenoise, &creator.pubkey, &group.mls_group_id).await;
         whitenoise
-            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
+            .sync_marmot_cache_for_group(&creator.pubkey, &group.mls_group_id, marmot_messages)
             .await
             .unwrap();
 
@@ -993,7 +1179,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                crate::whitenoise::test_utils::create_nostr_group_config_data(vec![creator.pubkey]),
+                crate::whitenoise::test_utils::create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -1011,11 +1197,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Populate cache
-        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+        // Populate cache from Darkmatter projections
+        let marmot_messages =
+            projected_marmot_messages(&whitenoise, &creator.pubkey, &group.mls_group_id).await;
         whitenoise
-            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
+            .sync_marmot_cache_for_group(&creator.pubkey, &group.mls_group_id, marmot_messages)
             .await
             .unwrap();
 
@@ -1053,7 +1239,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1136,7 +1322,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1200,7 +1386,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1238,7 +1424,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1372,125 +1558,25 @@ mod tests {
         ));
     }
 
-    /// Test publish_with_retries exhausts all attempts and marks status as Failed
-    /// when relays are unreachable.
-    #[tokio::test]
-    async fn test_publish_with_retries_marks_failed_on_exhaustion() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
-
-        let group = whitenoise
-            .require_session(&creator.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![member.pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Send a message (proactively cached with Sending status)
-        let result = whitenoise
-            .send_message_to_group(
-                &creator,
-                &group.mls_group_id,
-                "Retry test".to_string(),
-                9,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let event_id = result.message.id.to_string();
-
-        // Verify initial status is Sending
-        let session = whitenoise.session(&creator.pubkey).unwrap();
-        let msg = AggregatedMessage::find_by_id(
-            &event_id,
-            &group.mls_group_id,
-            &creator.pubkey,
-            &session.account_db.inner,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(msg.delivery_status, Some(DeliveryStatus::Sending));
-
-        // Build a test event for bounded relay-control publish
-        let keys = Keys::generate();
-        let event = EventBuilder::text_note("test")
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        // Call the relay-control publish helper directly with unreachable relays.
-        // Use max_publish_attempts=1 so there are no retry sleeps and the test
-        // runs without needing to pause the Tokio clock (which would break DB
-        // pool timeouts on the status-update write inside publish_message_event).
-        let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
-        let ephemeral = crate::relay_control::ephemeral::EphemeralPlane::new(
-            crate::relay_control::ephemeral::EphemeralPlaneConfig {
-                timeout: std::time::Duration::from_millis(200),
-                reconnect_policy:
-                    crate::relay_control::sessions::RelaySessionReconnectPolicy::Disabled,
-                auth_policy: crate::relay_control::sessions::RelaySessionAuthPolicy::Disabled,
-                max_publish_attempts: 1,
-                ad_hoc_relay_ttl: std::time::Duration::from_secs(30),
-            },
-            whitenoise.shared.database.clone(),
-            whitenoise.event_sender.clone(),
-            whitenoise.shared.relay_control.observability().clone(),
-            whitenoise.shared.event_tracker.clone(),
-        );
-
-        ephemeral
-            .publish_message_event(
-                event,
-                &creator.pubkey,
-                &unreachable_relays,
-                &event_id,
-                &group.mls_group_id,
-                &session.account_db.inner,
-                &whitenoise.shared.message_stream_manager,
-            )
-            .await;
-
-        // Verify status transitioned to Failed
-        let msg = AggregatedMessage::find_by_id(
-            &event_id,
-            &group.mls_group_id,
-            &creator.pubkey,
-            &session.account_db.inner,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            matches!(msg.delivery_status, Some(DeliveryStatus::Failed(_))),
-            "Expected Failed status after exhausting retries, got {:?}",
-            msg.delivery_status
-        );
-    }
-
-    /// Test that cache_needs_sync returns false when there are no MDK messages.
+    /// Test that cache_needs_sync returns false when there are no message projections.
     #[tokio::test]
     async fn test_cache_needs_sync_empty_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let pubkey = Keys::generate().public_key();
 
         let group_id = GroupId::from_slice(&[42u8; 32]);
-        let empty_messages: Vec<Message> = vec![];
 
         let needs_sync = whitenoise
-            .cache_needs_sync(&account.pubkey, &group_id, &empty_messages)
+            .cache_needs_sync_for_messages(&pubkey, &group_id, &[])
             .await
             .unwrap();
-        assert!(!needs_sync, "Empty MDK messages should not need sync");
+        assert!(
+            !needs_sync,
+            "Empty message projections should not need sync"
+        );
     }
 
-    /// Test that cache_needs_sync detects a count mismatch between MDK and cache.
+    /// Test that cache_needs_sync detects a count mismatch between projections and cache.
     #[tokio::test]
     async fn test_cache_needs_sync_detects_mismatch() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -1503,7 +1589,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -1523,12 +1609,12 @@ mod tests {
                 .unwrap();
         }
 
-        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+        let marmot_messages =
+            projected_marmot_messages(&whitenoise, &creator.pubkey, &group.mls_group_id).await;
 
         // Cache is in sync — should return false
         let needs_sync = whitenoise
-            .cache_needs_sync(&creator.pubkey, &group.mls_group_id, &mdk_messages)
+            .cache_needs_sync_for_messages(&creator.pubkey, &group.mls_group_id, &marmot_messages)
             .await
             .unwrap();
         assert!(
@@ -1542,9 +1628,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Now cache count (0) != MDK count (3) — should return true
+        // Now cache count (0) != projected message count (3) — should return true
         let needs_sync = whitenoise
-            .cache_needs_sync(&creator.pubkey, &group.mls_group_id, &mdk_messages)
+            .cache_needs_sync_for_messages(&creator.pubkey, &group.mls_group_id, &marmot_messages)
             .await
             .unwrap();
         assert!(needs_sync, "Cache should need sync after deletion");
@@ -1566,7 +1652,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -1586,10 +1672,10 @@ mod tests {
                 .unwrap();
         }
 
-        // Get MDK messages before clearing cache
-        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
-        assert!(!mdk_messages.is_empty());
+        // Get Darkmatter projections before clearing cache
+        let marmot_messages =
+            projected_marmot_messages(&whitenoise, &creator.pubkey, &group.mls_group_id).await;
+        assert!(!marmot_messages.is_empty());
 
         // Clear the cache entirely
         let session = whitenoise.session(&creator.pubkey).unwrap();
@@ -1602,9 +1688,9 @@ mod tests {
                 .unwrap();
         assert_eq!(cached_count, 0, "Cache should be empty after deletion");
 
-        // Sync should recover all messages from MDK
+        // Sync should recover all messages from Darkmatter projections
         whitenoise
-            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
+            .sync_marmot_cache_for_group(&creator.pubkey, &group.mls_group_id, marmot_messages)
             .await
             .unwrap();
 
@@ -1635,22 +1721,20 @@ mod tests {
     #[tokio::test]
     async fn test_sync_cache_for_group_empty_input() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator = whitenoise.create_identity().await.unwrap();
+        let pubkey = Keys::generate().public_key();
 
         let group_id = GroupId::from_slice(&[99u8; 32]);
-        let empty_messages: Vec<Message> = vec![];
 
         // Should return Ok without touching the database
         whitenoise
-            .sync_cache_for_group(&creator.pubkey, &group_id, empty_messages)
+            .sync_marmot_cache_for_group(&pubkey, &group_id, Vec::new())
             .await
             .unwrap();
 
-        let session = whitenoise.session(&creator.pubkey).unwrap();
-        let cached_count = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
-            .await
-            .unwrap();
-        assert_eq!(cached_count, 0);
+        assert!(
+            whitenoise.session(&pubkey).is_none(),
+            "empty sync should not require or create an account session"
+        );
     }
 
     /// Test that sync_message_cache_on_startup recovers a stale cache.
@@ -1669,7 +1753,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -1733,6 +1817,296 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_recovers_darkmatter_projection() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "startup darkmatter".to_string(),
+            "recover aggregate cache from Marmot projection".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher,
+            )
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&creator, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .send("recover from Marmot projection".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &creator_session.account_db.inner)
+            .await
+            .unwrap();
+
+        let empty_messages = whitenoise
+            .fetch_aggregated_messages_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                &PaginationOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(empty_messages.is_empty());
+
+        whitenoise.sync_message_cache_on_startup().await.unwrap();
+
+        let messages = whitenoise
+            .fetch_aggregated_messages_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                &PaginationOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "recover from Marmot projection");
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_skips_unprojected_groups_without_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[0xE8; 32]);
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        creator_session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&creator, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        whitenoise.sync_message_cache_on_startup().await.unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            &creator.pubkey,
+            None,
+            &creator_session.account_db.inner,
+        )
+        .await
+        .unwrap();
+        assert!(
+            messages.is_empty(),
+            "startup sync must not rebuild local cache for unprojected groups"
+        );
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_does_not_recreate_obsolete_mls_storage_for_darkmatter_group()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "startup darkmatter no obsolete MLS storage".to_string(),
+            "recover aggregate cache without opening obsolete MLS storage".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher,
+            )
+            .await
+            .unwrap();
+
+        creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .send("recover without obsolete MLS storage".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &creator_session.account_db.inner)
+            .await
+            .unwrap();
+
+        let obsolete_mls_storage_path = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+            &creator.pubkey,
+            data_temp.path(),
+        );
+
+        if obsolete_mls_storage_path.is_dir() {
+            fs::remove_dir_all(&obsolete_mls_storage_path).unwrap();
+        } else if obsolete_mls_storage_path.exists() {
+            fs::remove_file(&obsolete_mls_storage_path).unwrap();
+        }
+        assert!(!obsolete_mls_storage_path.exists());
+
+        whitenoise.sync_message_cache_on_startup().await.unwrap();
+
+        let messages = whitenoise
+            .fetch_aggregated_messages_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                &PaginationOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "recover without obsolete MLS storage");
+        assert!(
+            !obsolete_mls_storage_path.exists(),
+            "startup sync for fully projected Darkmatter groups must not recreate obsolete MLS storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_does_not_create_obsolete_mls_storage_for_unsessioned_account()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = Account::new_external(&whitenoise, Keys::generate().public_key())
+            .await
+            .unwrap()
+            .save(&whitenoise.shared.database)
+            .await
+            .unwrap();
+
+        let obsolete_mls_storage_path = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+            &account.pubkey,
+            data_temp.path(),
+        );
+
+        if obsolete_mls_storage_path.is_dir() {
+            fs::remove_dir_all(&obsolete_mls_storage_path).unwrap();
+        } else if obsolete_mls_storage_path.exists() {
+            fs::remove_file(&obsolete_mls_storage_path).unwrap();
+        }
+        assert!(!obsolete_mls_storage_path.exists());
+
+        whitenoise.sync_message_cache_on_startup().await.unwrap();
+
+        assert!(
+            !obsolete_mls_storage_path.exists(),
+            "startup sync must not create obsolete MLS storage for accounts without an existing legacy store"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_recovers_unsessioned_darkmatter_projection() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "startup unsessioned darkmatter".to_string(),
+            "recover aggregate cache from Marmot storage without a live session".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher,
+            )
+            .await
+            .unwrap();
+
+        creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .send(
+                "recover projected cache without session".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &creator_session.account_db.inner)
+            .await
+            .unwrap();
+
+        whitenoise.account_manager.remove_session(&creator.pubkey);
+        assert!(whitenoise.session(&creator.pubkey).is_none());
+
+        let obsolete_mls_storage_path = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+            &creator.pubkey,
+            data_temp.path(),
+        );
+
+        if obsolete_mls_storage_path.is_dir() {
+            fs::remove_dir_all(&obsolete_mls_storage_path).unwrap();
+        } else if obsolete_mls_storage_path.exists() {
+            fs::remove_file(&obsolete_mls_storage_path).unwrap();
+        }
+        assert!(!obsolete_mls_storage_path.exists());
+
+        whitenoise.sync_message_cache_on_startup().await.unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group.mls_group_id,
+            &creator.pubkey,
+            &creator_session.account_db.inner,
+            &PaginationOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content,
+            "recover projected cache without session"
+        );
+        assert!(
+            !obsolete_mls_storage_path.exists(),
+            "startup sync for unsessioned Darkmatter groups must not recreate obsolete MLS storage"
+        );
+    }
+
     /// Test sending a kind 5 (deletion) tracks delivery and applies to target message.
     #[tokio::test]
     async fn test_send_deletion_tracks_delivery_and_marks_target() {
@@ -1744,7 +2118,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let admin_pubkeys = vec![creator.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1842,7 +2216,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -1902,7 +2276,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member.pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2082,7 +2456,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2178,7 +2552,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2273,7 +2647,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2412,7 +2786,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2504,7 +2878,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2644,7 +3018,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2682,7 +3056,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2715,7 +3089,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2783,7 +3157,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2843,7 +3217,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2892,7 +3266,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![members[0].0.pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2926,7 +3300,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await
@@ -2986,7 +3360,7 @@ mod tests {
             .groups()
             .create_group(
                 vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator.pubkey]),
+                create_group_config(vec![creator.pubkey]),
                 None,
             )
             .await

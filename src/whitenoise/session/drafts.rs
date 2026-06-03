@@ -1,6 +1,6 @@
 //! Draft operations scoped to an [`AccountSession`].
 
-use mdk_core::prelude::GroupId;
+use crate::marmot::GroupId;
 use nostr_sdk::EventId;
 
 use super::AccountSession;

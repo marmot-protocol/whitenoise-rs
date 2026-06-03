@@ -39,34 +39,49 @@ impl TestCase for KeyPackageLifecycleTestCase {
         context.add_account(&self.member_name, member.clone());
         tracing::info!("✓ Created member: {}", member.pubkey.to_hex());
 
-        // Wait for initial key package publishing to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Initial key-package publishing happens in a background task in the
+        // integration binary. Relay publish acceptance and local lifecycle
+        // tracking are separate operations, so wait until both are visible.
+        let member_pubkey = member.pubkey;
+        let wn = context.whitenoise.clone();
+        let tracked = retry(
+            50,
+            tokio::time::Duration::from_millis(100),
+            || {
+                let wn = wn.clone();
+                async move {
+                    let key_packages = wn
+                        .require_session(&member_pubkey)?
+                        .key_packages()
+                        .fetch_all()
+                        .await?;
 
-        // Verify the member has at least one published KP tracked in the DB
-        let member_kps = context
-            .whitenoise
-            .require_session(&member.pubkey)?
-            .key_packages()
-            .fetch_all()
-            .await?;
-        assert!(
-            !member_kps.is_empty(),
-            "Member should have at least one key package on relays"
-        );
+                    if key_packages.is_empty() {
+                        return Err(WhitenoiseError::Internal(
+                            "member key package not yet visible on relays".to_string(),
+                        ));
+                    }
 
-        // Look up the tracked record for one of the member's KPs
-        let kp_event_id = member_kps[0].id.to_hex();
-        let tracked = context
-            .whitenoise
-            .require_session(&member.pubkey)?
-            .key_packages()
-            .find_published_for_testing(&kp_event_id)
-            .await?;
-        assert!(
-            tracked.is_some(),
-            "Published KP should be tracked in published_key_packages table"
-        );
-        let tracked = tracked.unwrap();
+                    for key_package in &key_packages {
+                        if let Some(tracked) = wn
+                            .require_session(&member_pubkey)?
+                            .key_packages()
+                            .find_published_for_testing(&key_package.id.to_hex())
+                            .await?
+                        {
+                            return Ok(tracked);
+                        }
+                    }
+
+                    Err(WhitenoiseError::Internal(
+                        "member key package not yet tracked locally".to_string(),
+                    ))
+                }
+            },
+            "member initial key package published and tracked",
+        )
+        .await?;
+
         assert!(
             tracked.consumed_at.is_none(),
             "Freshly published KP should not be consumed yet"
@@ -95,33 +110,37 @@ impl TestCase for KeyPackageLifecycleTestCase {
             .execute(context)
             .await?;
 
-        // The background `rotate_key_package` marks the KP consumed asynchronously.
-        // Poll the DB until consumed_at is set.
-        let member_pubkey = member.pubkey;
-        let kp_event_id_clone = kp_event_id.clone();
-        let wn = &context.whitenoise;
-
-        retry_default(
+        // The background `rotate_key_package` marks the actual Welcome key
+        // package as consumed asynchronously. The consumed event can be newer
+        // than the sample event read above if maintenance published a fresh
+        // package between relay visibility and group creation, so observe the
+        // account-scoped lifecycle table rather than assuming `member_kps[0]`
+        // was the selected package.
+        let consumed_packages = retry(
+            50,
+            tokio::time::Duration::from_millis(100),
             || {
-                let kp_event_id = kp_event_id_clone.clone();
+                let wn = wn.clone();
                 async move {
-                    let pkg = wn
+                    let consumed = wn
                         .require_session(&member_pubkey)?
                         .key_packages()
-                        .find_published_for_testing(&kp_event_id)
+                        .find_consumed_published_for_testing()
                         .await?;
 
-                    match pkg {
-                        Some(p) if p.consumed_at.is_some() => Ok(()),
-                        _ => Err(WhitenoiseError::Internal(
+                    if consumed.is_empty() {
+                        return Err(WhitenoiseError::Internal(
                             "KP not yet marked as consumed".to_string(),
-                        )),
+                        ));
                     }
+
+                    Ok(consumed)
                 }
             },
             "KP marked as consumed after Welcome",
         )
         .await?;
+        let consumed_event_id = consumed_packages[0].event_id.clone();
 
         tracing::info!("✓ KP marked as consumed after Welcome processing");
 
@@ -136,7 +155,7 @@ impl TestCase for KeyPackageLifecycleTestCase {
             .whitenoise
             .require_session(&member.pubkey)?
             .key_packages()
-            .backdate_consumed_at_for_testing(&kp_event_id, 60)
+            .backdate_consumed_at_for_testing(&consumed_event_id, 60)
             .await?;
 
         // Run the cleanup task
@@ -148,7 +167,7 @@ impl TestCase for KeyPackageLifecycleTestCase {
             .whitenoise
             .require_session(&member.pubkey)?
             .key_packages()
-            .find_published_for_testing(&kp_event_id)
+            .find_published_for_testing(&consumed_event_id)
             .await?;
 
         let after_cleanup = after_cleanup.expect("KP record should still exist (never deleted)");

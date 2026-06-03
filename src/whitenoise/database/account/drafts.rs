@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use mdk_core::prelude::GroupId;
+use crate::marmot::GroupId;
 use nostr_sdk::EventId;
 
 use crate::whitenoise::database::account_db::AccountDatabase;
@@ -54,7 +54,7 @@ impl DraftsRepo {
 mod tests {
     use std::sync::Arc;
 
-    use mdk_core::prelude::GroupId;
+    use crate::marmot::GroupId;
     use nostr_sdk::Keys;
     use tempfile::TempDir;
 

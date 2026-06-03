@@ -8,9 +8,9 @@ use std::collections::HashMap;
 
 use super::reaction_handler;
 use super::types::{AggregatorConfig, ChatMessage, ProcessingError};
+use crate::marmot::Message;
 use crate::perf_span;
 use crate::whitenoise::media_files::MediaFile;
-use mdk_core::prelude::message_types::Message;
 
 /// Process raw messages into aggregated chat messages
 pub async fn process_messages(
@@ -315,11 +315,9 @@ fn extract_media_attachments(
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::Utc;
-    use mdk_core::prelude::GroupId;
-    use mdk_core::prelude::message_types::{Message, MessageState};
-
     use super::*;
+    use crate::marmot::{GroupId, Message, MessageState};
+    use chrono::Utc;
 
     // Test the pure logic functions that don't require complex Message structs
 

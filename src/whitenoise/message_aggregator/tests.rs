@@ -7,6 +7,7 @@
 #[cfg(test)]
 mod integration_tests {
     use super::super::*;
+    use crate::marmot::{Message, MessageState};
     use nostr_sdk::prelude::*;
 
     #[tokio::test]
@@ -21,6 +22,48 @@ mod integration_tests {
             .unwrap();
 
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_single_message_accepts_marmot_message_projection() {
+        let aggregator = MessageAggregator::new();
+        let keys = Keys::generate();
+        let event_id = EventId::from_slice(&[1; 32]).unwrap();
+        let wrapper_event_id = EventId::from_slice(&[2; 32]).unwrap();
+        let created_at = Timestamp::from(100);
+        let processed_at = Timestamp::from(101);
+        let event = UnsignedEvent {
+            id: Some(event_id),
+            pubkey: keys.public_key(),
+            created_at,
+            kind: Kind::Custom(9),
+            tags: Tags::new(),
+            content: "hello from marmot".to_string(),
+        };
+        let message = Message {
+            id: event_id,
+            pubkey: keys.public_key(),
+            kind: Kind::Custom(9),
+            mls_group_id: GroupId::from_slice(&[3; 32]),
+            created_at,
+            processed_at,
+            content: "hello from marmot".to_string(),
+            tags: Tags::new(),
+            event,
+            wrapper_event_id,
+            epoch: Some(7),
+            state: MessageState::Processed,
+        };
+
+        let chat_message = aggregator
+            .process_single_message(&message, vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(chat_message.id, event_id.to_string());
+        assert_eq!(chat_message.author, keys.public_key());
+        assert_eq!(chat_message.content, "hello from marmot");
+        assert_eq!(chat_message.kind, 9);
     }
 
     #[test]

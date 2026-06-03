@@ -4,10 +4,10 @@ use crate::integration_tests::{
     core::*,
     test_cases::{group_membership::*, group_state_streaming::*, shared::*},
 };
+use crate::marmot::GroupId;
 use crate::whitenoise::group_state_streaming::GroupStateUpdate;
 use crate::{Whitenoise, WhitenoiseError};
 use async_trait::async_trait;
-use mdk_core::prelude::GroupId;
 
 /// End-to-end coverage for [`crate::whitenoise::group_state_streaming`].
 ///
@@ -18,9 +18,9 @@ use mdk_core::prelude::GroupId;
 ///      account never reaches another account's subscriber on the same group.
 ///
 /// Each phase uses its own MLS group so the membership-changing flows can't
-/// race against each other (two destructive proposals against the same group
-/// in quick succession produces "MLS message unprocessable" warnings on the
-/// affected member's MDK before any state event can fire).
+/// race against each other. Two destructive proposals against the same group in
+/// quick succession can produce unprocessable MLS messages before any state
+/// event can fire for the affected member.
 pub struct GroupStateStreamingScenario {
     context: ScenarioContext,
 }

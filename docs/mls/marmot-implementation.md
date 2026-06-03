@@ -16,7 +16,7 @@ Whitenoise implements the Marmot protocol, which brings MLS group messaging to t
 The following Nostr event kinds are used for MLS functionality:
 
 ```
-Kind::MlsKeyPackage (443) - MLS key packages for group joining
+Kind::Custom(30443) - Darkmatter v2 MLS key packages for group joining
 Kind::MlsWelcome (444) - MLS welcome messages for new group members
 Kind::MlsGroupMessage (445) - MLS application messages within groups
 Kind::GiftWrap (1059) - Encrypted MLS protocol messages (Welcome messages, etc.)
@@ -43,7 +43,8 @@ MLS messages are received via account-specific subscriptions that include the ac
 
 ### Storage Integration
 
-MLS state is stored using the `mdk-sqlite-storage` crate, integrated with our main SQLite database.
+MLS and Marmot state is stored in WhiteNoise-owned SQLite tables through
+`WhitenoiseMarmotStorage`.
 
 ## Security Considerations
 

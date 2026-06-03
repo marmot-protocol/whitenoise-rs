@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::benchmarks::BenchmarkTestCase;
 use crate::integration_tests::core::ScenarioContext;
+use crate::marmot::GroupConfig;
 
 /// Benchmark test case for measuring `create_group` performance.
 ///
@@ -56,7 +56,7 @@ impl BenchmarkTestCase for CreateGroupBenchmark {
             .collect::<Result<Vec<_>, _>>()?;
         let admin_pubkeys = vec![creator.pubkey];
 
-        let config = NostrGroupConfigData::new(
+        let config = GroupConfig::new(
             format!("Benchmark Group {}", iteration),
             "Benchmark group for create_group performance".to_string(),
             None,

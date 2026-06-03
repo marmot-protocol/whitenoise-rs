@@ -26,8 +26,8 @@ use crate::whitenoise::database::{Database, DatabaseError};
 /// These FKs cross the shared/account boundary and require application-level
 /// enforcement after the physical split. Phase 18c moved
 /// `account_settings`, `drafts`, `published_key_packages`, `published_events`,
-/// and `account_follows` out of shared (their FKs are no longer relevant).
-/// Phase 18d/18e will move the rest.
+/// `account_follows`, message projections, and their supporting state out of
+/// shared (their FKs are no longer relevant).
 ///
 /// ## Pubkey-keyed FKs (application-level enforcement only — Phase 18d)
 ///

@@ -3,32 +3,31 @@
 use core::fmt;
 use std::time::Duration;
 
-#[cfg(test)]
-use mdk_core::mip05::{Mip05GroupMessage, parse_group_message};
-#[cfg(test)]
-use std::time::Instant;
 use std::{
     collections::{BTreeMap, HashSet},
+    ops::Range,
     str::FromStr,
     sync::Arc,
 };
 
+use base64ct::{Base64, Encoding as _};
 use chrono::{DateTime, Utc};
-use mdk_core::mip05::{
-    EncryptedToken, LeafTokenTag, NotificationPlatform, PushTokenPlaintext, TokenTag,
-    build_notification_batches, build_token_list_response_rumor, build_token_request_rumor,
-    encrypt_push_token,
+use nostr_sdk::{
+    Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, RelayUrl, Tag, TagKind, Timestamp,
+    UnsignedEvent, nips::nip44,
 };
-use mdk_core::prelude::{GroupId, MDK, group_types::GroupState};
-use mdk_sqlite_storage::MdkSqliteStorage;
-use nostr_sdk::{EventId, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 
+use crate::marmot::GroupId;
+use crate::marmot::push::{
+    ENCRYPTED_TOKEN_LEN, EncryptedToken, MAX_NOTIFICATION_REQUEST_TOKENS, Mip05Error,
+    NOTIFICATION_REQUEST_KIND, NotificationEventBatch, NotificationPlatform, PushTokenPlaintext,
+    TOKEN_LIST_RESPONSE_KIND, TOKEN_REMOVAL_KIND, TOKEN_REQUEST_KIND, TokenTag, encrypt_push_token,
+    push_token_fingerprint,
+};
 use crate::whitenoise::{
-    Whitenoise, WhitenoiseConfig,
+    Whitenoise,
     accounts::Account,
-    accounts_groups::AccountGroup,
     database::Database,
     error::{Result, WhitenoiseError},
     event_tracker::EventTracker,
@@ -45,6 +44,9 @@ use crate::{
 /// that arrive before the cooldown expires are silently dropped.  Normal usage
 /// is ≤5 requests per hour, so 30 seconds is generous while blocking spam.
 pub(crate) const TOKEN_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
+const MIP05_NOTIFICATION_VERSION: &str = "mip05-v1";
+const MIP05_NOTIFICATION_VERSION_TAG: &str = "v";
+const NIP59_RANDOM_TIMESTAMP_TWEAK: Range<u64> = 0..172800;
 
 /// Discriminator so token requests and removals have independent cooldowns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +71,20 @@ impl PushPlatform {
         match self {
             Self::Apns => "apns",
             Self::Fcm => "fcm",
+        }
+    }
+
+    pub(crate) const fn to_notification_platform(self) -> NotificationPlatform {
+        match self {
+            Self::Apns => NotificationPlatform::Apns,
+            Self::Fcm => NotificationPlatform::Fcm,
+        }
+    }
+
+    pub(crate) const fn from_notification_platform(platform: NotificationPlatform) -> Self {
+        match platform {
+            NotificationPlatform::Apns => Self::Apns,
+            NotificationPlatform::Fcm => Self::Fcm,
         }
     }
 }
@@ -111,6 +127,8 @@ pub struct GroupPushToken {
     pub mls_group_id: GroupId,
     pub member_pubkey: PublicKey,
     pub leaf_index: u32,
+    pub platform: Option<PushPlatform>,
+    pub token_fingerprint: Option<String>,
     pub server_pubkey: PublicKey,
     pub relay_hint: Option<RelayUrl>,
     pub encrypted_token: String,
@@ -175,6 +193,8 @@ impl fmt::Debug for GroupPushToken {
             .field("mls_group_id", &self.mls_group_id)
             .field("member_pubkey", &self.member_pubkey)
             .field("leaf_index", &self.leaf_index)
+            .field("platform", &self.platform)
+            .field("token_fingerprint", &self.token_fingerprint)
             .field("server_pubkey", &self.server_pubkey)
             .field("relay_hint", &self.relay_hint)
             .field("encrypted_token", &"<redacted>")
@@ -190,130 +210,13 @@ impl fmt::Debug for GroupPushToken {
 pub(crate) const MAX_CONCURRENT_TOKEN_RESPONSE_TASKS: usize = 10;
 
 const PUSH_GROUP_MESSAGE_KINDS: [u16; 3] = [
-    mdk_core::mip05::TOKEN_REQUEST_KIND,
-    mdk_core::mip05::TOKEN_LIST_RESPONSE_KIND,
-    mdk_core::mip05::TOKEN_REMOVAL_KIND,
+    TOKEN_REQUEST_KIND,
+    TOKEN_LIST_RESPONSE_KIND,
+    TOKEN_REMOVAL_KIND,
 ];
 
 pub(crate) fn is_push_group_message_kind(kind: Kind) -> bool {
     PUSH_GROUP_MESSAGE_KINDS.contains(&kind.as_u16())
-}
-
-#[perf_instrument("push_notifications")]
-async fn group_push_token_tags_for_response_with(
-    account_pubkey: &PublicKey,
-    group_id: &GroupId,
-    pool: &SqlitePool,
-    mdk: &MDK<MdkSqliteStorage>,
-) -> Result<Vec<LeafTokenTag>> {
-    let tokens = GroupPushToken::find_by_account_and_group(account_pubkey, group_id, pool).await?;
-    let active_leaf_map = mdk.group_leaf_map(group_id)?;
-
-    let mut response_tokens = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let Some(active_member_pubkey) = active_leaf_map.get(&token.leaf_index) else {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account_pubkey.to_hex(),
-                group_id = %hex::encode(group_id.as_slice()),
-                member_pubkey = %token.member_pubkey.to_hex(),
-                leaf_index = token.leaf_index,
-                "Skipping cached push token for inactive group leaf"
-            );
-            continue;
-        };
-
-        if active_member_pubkey != &token.member_pubkey {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account_pubkey.to_hex(),
-                group_id = %hex::encode(group_id.as_slice()),
-                member_pubkey = %token.member_pubkey.to_hex(),
-                leaf_index = token.leaf_index,
-                active_member_pubkey = %active_member_pubkey.to_hex(),
-                "Skipping cached push token whose member pubkey no longer matches the active leaf"
-            );
-            continue;
-        }
-
-        let Some(relay_hint) = token.relay_hint.clone() else {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account_pubkey.to_hex(),
-                group_id = %hex::encode(group_id.as_slice()),
-                member_pubkey = %token.member_pubkey.to_hex(),
-                "Skipping cached push token without relay hint in token-list response"
-            );
-            continue;
-        };
-        let encrypted_token = match EncryptedToken::from_base64(&token.encrypted_token) {
-            Ok(encrypted_token) => encrypted_token,
-            Err(error) => {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account_pubkey.to_hex(),
-                    group_id = %hex::encode(group_id.as_slice()),
-                    member_pubkey = %token.member_pubkey.to_hex(),
-                    error = %error,
-                    "Skipping cached push token with invalid encrypted payload in token-list response"
-                );
-                continue;
-            }
-        };
-
-        response_tokens.push(LeafTokenTag {
-            leaf_index: token.leaf_index,
-            token_tag: TokenTag {
-                encrypted_token,
-                server_pubkey: token.server_pubkey,
-                relay_hint,
-            },
-        });
-    }
-
-    Ok(response_tokens)
-}
-
-#[perf_instrument("push_notifications")]
-pub(crate) async fn publish_push_group_message_with(
-    mdk: &MDK<MdkSqliteStorage>,
-    relay_control: &RelayControlPlane,
-    account_pubkey: &PublicKey,
-    group_id: &GroupId,
-    rumor: nostr_sdk::UnsignedEvent,
-) -> Result<()> {
-    let relay_urls = Whitenoise::ensure_group_relays(mdk, group_id)?;
-    let event = mdk.create_message(group_id, rumor, None)?;
-
-    relay_control
-        .publish_event_to(event, account_pubkey, &relay_urls)
-        .await?;
-    Ok(())
-}
-
-#[perf_instrument("push_notifications")]
-pub(crate) async fn respond_to_token_request_with(
-    mdk: &MDK<MdkSqliteStorage>,
-    pool: &SqlitePool,
-    relay_control: &RelayControlPlane,
-    account_pubkey: &PublicKey,
-    group_id: &GroupId,
-    request_event_id: EventId,
-) -> Result<()> {
-    let token_tags =
-        group_push_token_tags_for_response_with(account_pubkey, group_id, pool, mdk).await?;
-
-    if token_tags.is_empty() {
-        return Ok(());
-    }
-
-    let rumor = build_token_list_response_rumor(
-        *account_pubkey,
-        nostr_sdk::Timestamp::now(),
-        request_event_id,
-        token_tags,
-    )?;
-    publish_push_group_message_with(mdk, relay_control, account_pubkey, group_id, rumor).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +299,8 @@ fn prepare_notification_recipient_tokens(
 
         recipient_tokens.push(TokenTag {
             encrypted_token,
+            platform: token.platform.map(PushPlatform::to_notification_platform),
+            token_fingerprint: token.token_fingerprint.clone(),
             server_pubkey: token.server_pubkey,
             relay_hint,
         });
@@ -499,7 +404,7 @@ async fn publish_notification_batches_best_effort(
     ephemeral: &EphemeralPlane,
     account_pubkey: PublicKey,
     token_counts_by_server: &BTreeMap<PublicKey, usize>,
-    batches: Vec<mdk_core::prelude::NotificationEventBatch>,
+    batches: Vec<NotificationEventBatch>,
 ) {
     for batch in batches {
         let token_count = token_counts_by_server
@@ -580,34 +485,179 @@ async fn publish_notification_batches_best_effort(
     }
 }
 
-pub(crate) async fn publish_notification_requests_after_delivery_with(
-    config: &WhitenoiseConfig,
+fn build_notification_batches(
+    tokens: Vec<TokenTag>,
+) -> std::result::Result<Vec<NotificationEventBatch>, Mip05Error> {
+    if tokens.is_empty() {
+        return Err(Mip05Error::NotificationRequestMustIncludeToken);
+    }
+
+    group_tokens_by_server(tokens)
+        .into_iter()
+        .map(|(server_pubkey, server_tokens)| {
+            build_notification_batch_for_server(server_pubkey, server_tokens)
+        })
+        .collect()
+}
+
+fn group_tokens_by_server(tokens: Vec<TokenTag>) -> BTreeMap<PublicKey, Vec<TokenTag>> {
+    let mut grouped_tokens: BTreeMap<PublicKey, Vec<TokenTag>> = BTreeMap::new();
+
+    for token in tokens {
+        grouped_tokens
+            .entry(token.server_pubkey)
+            .or_default()
+            .push(token);
+    }
+
+    grouped_tokens
+}
+
+fn build_notification_batch_for_server(
+    server_pubkey: PublicKey,
+    server_tokens: Vec<TokenTag>,
+) -> std::result::Result<NotificationEventBatch, Mip05Error> {
+    validate_unique_encrypted_tokens(&server_tokens)?;
+    let relay_hints = collect_relay_hints(&server_tokens);
+    let events = server_tokens
+        .chunks(MAX_NOTIFICATION_REQUEST_TOKENS)
+        .map(|chunk| {
+            let encrypted_tokens = chunk
+                .iter()
+                .map(|token| token.encrypted_token.clone())
+                .collect::<Vec<_>>();
+            build_notification_event_chunk(&server_pubkey, encrypted_tokens)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(NotificationEventBatch {
+        server_pubkey,
+        relay_hints,
+        events,
+    })
+}
+
+fn validate_unique_encrypted_tokens(tokens: &[TokenTag]) -> std::result::Result<(), Mip05Error> {
+    let mut unique_tokens = HashSet::with_capacity(tokens.len());
+
+    for token in tokens {
+        if !unique_tokens.insert(token.encrypted_token.clone()) {
+            return Err(Mip05Error::DuplicateEncryptedToken);
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_relay_hints(tokens: &[TokenTag]) -> Vec<RelayUrl> {
+    let mut relay_hints = Vec::new();
+
+    for token in tokens {
+        if !relay_hints.contains(&token.relay_hint) {
+            relay_hints.push(token.relay_hint.clone());
+        }
+    }
+
+    relay_hints
+}
+
+fn build_notification_event_chunk(
+    server_pubkey: &PublicKey,
+    encrypted_tokens: Vec<EncryptedToken>,
+) -> std::result::Result<Event, Mip05Error> {
+    let sender_keys = Keys::generate();
+    let rumor = build_notification_request_rumor(
+        sender_keys.public_key(),
+        Timestamp::now(),
+        encrypted_tokens,
+    )?;
+    let seal = build_notification_request_seal(&sender_keys, server_pubkey, rumor)?;
+    EventBuilder::gift_wrap_from_seal(server_pubkey, &seal, []).map_err(|error| {
+        tracing::warn!(
+            target: "whitenoise::push_notifications",
+            error = %error,
+            "Failed to gift-wrap notification request"
+        );
+        Mip05Error::NotificationRequestGiftWrapFailed
+    })
+}
+
+fn build_notification_request_rumor(
+    pubkey: PublicKey,
+    created_at: Timestamp,
+    tokens: Vec<EncryptedToken>,
+) -> std::result::Result<UnsignedEvent, Mip05Error> {
+    if tokens.is_empty() {
+        return Err(Mip05Error::NotificationRequestMustIncludeToken);
+    }
+
+    let mut content_bytes = Vec::with_capacity(tokens.len() * ENCRYPTED_TOKEN_LEN);
+    for token in &tokens {
+        content_bytes.extend_from_slice(token.as_bytes());
+    }
+
+    let mut rumor = UnsignedEvent::new(
+        pubkey,
+        created_at,
+        Kind::from(NOTIFICATION_REQUEST_KIND),
+        [Tag::custom(
+            TagKind::Custom(MIP05_NOTIFICATION_VERSION_TAG.into()),
+            [MIP05_NOTIFICATION_VERSION],
+        )],
+        Base64::encode_string(&content_bytes),
+    );
+    rumor.ensure_id();
+    Ok(rumor)
+}
+
+fn build_notification_request_seal(
+    sender_keys: &Keys,
+    server_pubkey: &PublicKey,
+    rumor: UnsignedEvent,
+) -> std::result::Result<Event, Mip05Error> {
+    let content = nip44::encrypt(
+        sender_keys.secret_key(),
+        server_pubkey,
+        rumor.as_json(),
+        nip44::Version::default(),
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            target: "whitenoise::push_notifications",
+            error = %error,
+            "Failed to encrypt notification request"
+        );
+        Mip05Error::NotificationRequestEncryptionFailed
+    })?;
+
+    EventBuilder::new(Kind::Seal, content)
+        .custom_created_at(Timestamp::tweaked(NIP59_RANDOM_TIMESTAMP_TWEAK))
+        .sign_with_keys(sender_keys)
+        .map_err(|error| {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                error = %error,
+                "Failed to sign notification request seal"
+            );
+            Mip05Error::NotificationRequestSealFailed
+        })
+}
+
+pub(crate) async fn publish_notification_requests_after_delivery_from_cache(
     database: &Database,
-    account_pool: &SqlitePool,
     relay_control: &RelayControlPlane,
     event_tracker: &Arc<dyn EventTracker>,
     ephemeral: &EphemeralPlane,
     account_pubkey: PublicKey,
-    group_id: &GroupId,
+    cached_tokens: &[GroupPushToken],
+    active_leaf_map: &BTreeMap<u32, PublicKey>,
+    sender_member_pubkey: &PublicKey,
 ) -> Result<()> {
-    let mdk = Account::create_mdk(account_pubkey, &config.data_dir, &config.keyring_service_id)?;
-    let own_leaf_index = mdk.own_leaf_index(group_id)?;
-    let active_leaf_map = mdk.group_leaf_map(group_id)?;
-    let sender_member_pubkey = active_leaf_map
-        .get(&own_leaf_index)
-        .copied()
-        .ok_or_else(|| {
-            WhitenoiseError::Configuration(
-                "sender leaf index missing from active group leaf map".to_string(),
-            )
-        })?;
-    let cached_tokens =
-        GroupPushToken::find_by_account_and_group(&account_pubkey, group_id, account_pool).await?;
     let recipient_tokens = prepare_notification_recipient_tokens(
         &account_pubkey,
-        &cached_tokens,
-        &active_leaf_map,
-        &sender_member_pubkey,
+        cached_tokens,
+        active_leaf_map,
+        sender_member_pubkey,
     );
 
     if recipient_tokens.is_empty() {
@@ -632,485 +682,6 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
 }
 
 impl Whitenoise {
-    #[cfg(test)]
-    #[perf_instrument("push_notifications")]
-    pub(crate) async fn handle_received_push_group_message(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        message: &mdk_core::prelude::message_types::Message,
-        sender_leaf_index: Option<u32>,
-    ) -> Result<bool> {
-        if !is_push_group_message_kind(message.kind) {
-            return Ok(false);
-        }
-
-        let group_message = parse_group_message(message)?;
-
-        match group_message {
-            Mip05GroupMessage::TokenRequest(request) => {
-                let leaf_index = sender_leaf_index.ok_or_else(|| {
-                    WhitenoiseError::InvalidEvent(
-                        "MIP-05 token request missing sender leaf index".to_string(),
-                    )
-                })?;
-
-                if !self.check_token_request_rate(
-                    &account.pubkey,
-                    &message.mls_group_id,
-                    leaf_index,
-                    TokenRateKind::Request,
-                ) {
-                    tracing::debug!(
-                        target: "whitenoise::push_notifications",
-                        group_id = %hex::encode(message.mls_group_id.as_slice()),
-                        leaf_index,
-                        "Dropping rate-limited MIP-05 token request"
-                    );
-                    return Ok(true);
-                }
-
-                self.merge_token_request(
-                    account,
-                    &message.mls_group_id,
-                    message.event.pubkey,
-                    leaf_index,
-                    request,
-                )
-                .await?;
-
-                if let Some(request_event_id) = message.event.id {
-                    self.schedule_pending_token_response(
-                        account.clone(),
-                        message.mls_group_id.clone(),
-                        request_event_id,
-                    );
-                }
-            }
-            Mip05GroupMessage::TokenListResponse(response) => {
-                let request_event_id = response.request_event_id;
-                self.merge_token_list_response(mdk, account, &message.mls_group_id, response)
-                    .await?;
-                self.clear_pending_token_response(
-                    &account.pubkey,
-                    &message.mls_group_id,
-                    &request_event_id,
-                );
-            }
-            Mip05GroupMessage::TokenRemoval(_) => {
-                let leaf_index = sender_leaf_index.ok_or_else(|| {
-                    WhitenoiseError::InvalidEvent(
-                        "MIP-05 token removal missing sender leaf index".to_string(),
-                    )
-                })?;
-
-                if !self.check_token_request_rate(
-                    &account.pubkey,
-                    &message.mls_group_id,
-                    leaf_index,
-                    TokenRateKind::Removal,
-                ) {
-                    tracing::debug!(
-                        target: "whitenoise::push_notifications",
-                        group_id = %hex::encode(message.mls_group_id.as_slice()),
-                        leaf_index,
-                        "Dropping rate-limited MIP-05 token removal"
-                    );
-                    return Ok(true);
-                }
-
-                let session = self.require_session(&account.pubkey)?;
-                GroupPushToken::delete(
-                    &message.mls_group_id,
-                    leaf_index,
-                    &session.account_db.inner.pool,
-                )
-                .await?;
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Calls `schedule_pending_token_response` directly. Used in tests to exercise
-    /// the scheduling logic without going through the full MLS message pipeline.
-    #[cfg(test)]
-    pub(crate) fn schedule_token_response_for_test(
-        &self,
-        account: Account,
-        group_id: GroupId,
-        request_event_id: EventId,
-    ) {
-        self.schedule_pending_token_response(account, group_id, request_event_id);
-    }
-
-    /// Acquires all permits from the token-response semaphore and returns the
-    /// owned guard. Dropping the guard releases the permits. Used in tests to
-    /// simulate a fully-saturated semaphore.
-    #[cfg(test)]
-    pub(crate) fn exhaust_token_response_semaphore(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.shared
-            .token_response_semaphore
-            .clone()
-            .try_acquire_many_owned(MAX_CONCURRENT_TOKEN_RESPONSE_TASKS as u32)
-            .expect("semaphore should be fully available at start of test")
-    }
-
-    /// Directly inserts a key into the pending token response map without
-    /// spawning a task. Used in tests to simulate an in-flight request.
-    #[cfg(test)]
-    pub(crate) fn insert_pending_token_response_for_test(
-        &self,
-        account_pubkey: PublicKey,
-        group_id: GroupId,
-        request_event_id: EventId,
-    ) {
-        self.shared
-            .pending_push_token_responses
-            .insert((account_pubkey, group_id, request_event_id), ());
-    }
-
-    /// Returns `true` if the MIP-05 message from `(account, group_id, leaf_index, kind)`
-    /// is allowed, i.e. no message of the same kind from that sender has been accepted
-    /// within the [`TOKEN_REQUEST_COOLDOWN`] window. On acceptance the timestamp is
-    /// updated via the `entry()` API to hold the shard lock for the full
-    /// check-and-update.
-    #[cfg(test)]
-    fn check_token_request_rate(
-        &self,
-        account_pubkey: &PublicKey,
-        group_id: &GroupId,
-        leaf_index: u32,
-        kind: TokenRateKind,
-    ) -> bool {
-        let key = (*account_pubkey, group_id.clone(), leaf_index, kind);
-        let now = Instant::now();
-        let mut allowed = false;
-
-        self.shared
-            .token_request_timestamps
-            .entry(key)
-            .and_modify(|last| {
-                if now.duration_since(*last) >= TOKEN_REQUEST_COOLDOWN {
-                    *last = now;
-                    allowed = true;
-                }
-            })
-            .or_insert_with(|| {
-                allowed = true;
-                now
-            });
-
-        allowed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_pending_token_response(
-        &self,
-        account_pubkey: &PublicKey,
-        group_id: &GroupId,
-        request_event_id: &EventId,
-    ) -> bool {
-        self.shared
-            .pending_push_token_responses
-            .remove(&(*account_pubkey, group_id.clone(), *request_event_id))
-            .is_some()
-    }
-
-    #[cfg(test)]
-    fn schedule_pending_token_response(
-        &self,
-        account: Account,
-        group_id: GroupId,
-        request_event_id: EventId,
-    ) {
-        let key = (account.pubkey, group_id.clone(), request_event_id);
-
-        // If the key was already present, an identical request is already in-flight.
-        // Inserting again is a no-op (value is `()`), so we use the return value to
-        // detect duplicates atomically before touching the semaphore.
-        if self
-            .shared
-            .pending_push_token_responses
-            .insert(key.clone(), ())
-            .is_some()
-        {
-            return;
-        }
-
-        // Key is freshly owned by us; now enforce the concurrency cap.
-        // The permit is moved into the spawned task and held for the full
-        // duration (sleep + dispatch) so the cap applies to in-flight tasks,
-        // not just to the moment of scheduling.
-        let permit = match self
-            .shared
-            .token_response_semaphore
-            .clone()
-            .try_acquire_owned()
-        {
-            Ok(permit) => permit,
-            Err(_) => {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account.pubkey.to_hex(),
-                    group_id = %hex::encode(group_id.as_slice()),
-                    request_event_id = %request_event_id.to_hex(),
-                    "Dropping MIP-05 token-list response task: concurrency limit reached"
-                );
-                // Safe to remove: we are the ones who inserted this key above.
-                self.shared.pending_push_token_responses.remove(&key);
-                return;
-            }
-        };
-
-        let relay_control = Arc::clone(&self.shared.relay_control);
-        let pending = Arc::clone(&self.shared.pending_push_token_responses);
-        let config = self.config().clone();
-        let account_db_path =
-            crate::whitenoise::session::account_db_path(&config.data_dir, &account.pubkey);
-        #[cfg(not(test))]
-        let delay_ms = ::rand::rng().random_range(1_000..=3_000);
-        #[cfg(test)]
-        let delay_ms = 0u64;
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-            let dispatch_key = (account.pubkey, group_id.clone(), request_event_id);
-            if pending.remove(&dispatch_key).is_none() {
-                drop(permit);
-                return;
-            }
-
-            let mdk = match Account::create_mdk(
-                account.pubkey,
-                &config.data_dir,
-                &config.keyring_service_id,
-            ) {
-                Ok(mdk) => mdk,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "whitenoise::push_notifications",
-                        account = %account.pubkey.to_hex(),
-                        error = %error,
-                        "Failed to create MDK for delayed MIP-05 token-list response"
-                    );
-                    drop(permit);
-                    return;
-                }
-            };
-
-            let account_db = match crate::whitenoise::database::account_db::AccountDatabase::new(
-                account.pubkey,
-                account_db_path.clone(),
-            )
-            .await
-            {
-                Ok(db) => db,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "whitenoise::push_notifications",
-                        account = %account.pubkey.to_hex(),
-                        error = %error,
-                        "Failed to open account DB for delayed MIP-05 token-list response"
-                    );
-                    drop(permit);
-                    return;
-                }
-            };
-
-            if let Err(error) = respond_to_token_request_with(
-                &mdk,
-                &account_db.inner.pool,
-                &relay_control,
-                &account.pubkey,
-                &group_id,
-                request_event_id,
-            )
-            .await
-            {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account.pubkey.to_hex(),
-                    group_id = %hex::encode(group_id.as_slice()),
-                    request_event_id = %request_event_id.to_hex(),
-                    error = %error,
-                    "Failed to send delayed MIP-05 token-list response"
-                );
-            }
-
-            // Permit is held across the sleep + dispatch and released here,
-            // freeing a slot for the next waiting task.
-            drop(permit);
-        });
-    }
-
-    /// Returns `true` when push-gossip is allowed for the given group:
-    /// the MLS group must be active, the account must have an accepted
-    /// `AccountGroup` row, and the row must not be marked as removed.
-    async fn is_push_gossip_eligible(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        group_state: GroupState,
-    ) -> bool {
-        if group_state != GroupState::Active {
-            return false;
-        }
-        let session = match self.account_manager.get_session(&account.pubkey) {
-            Some(s) => s,
-            None => return false,
-        };
-        match AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            group_id,
-            &session.account_db.inner.pool,
-        )
-        .await
-        {
-            Ok(Some(ag)) => ag.is_accepted() && !ag.is_removed(),
-            Ok(None) => false,
-            Err(error) => {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account.pubkey.to_hex(),
-                    group = %hex::encode(group_id.as_slice()),
-                    error = %error,
-                    "Failed to check push gossip eligibility; treating as ineligible"
-                );
-                false
-            }
-        }
-    }
-
-    /// Publishes a push token request to a single group and updates the local
-    /// cache. Returns `Ok(())` if the group is ineligible (treated as a no-op)
-    /// or if both operations succeed. Returns `Err` with a descriptive message
-    /// on publish or cache-sync failure.
-    #[perf_instrument("push_notifications")]
-    async fn share_token_to_single_group(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        group_id: &GroupId,
-        group_state: GroupState,
-        token_tag: &TokenTag,
-    ) -> std::result::Result<(), String> {
-        if !self
-            .is_push_gossip_eligible(account, group_id, group_state)
-            .await
-        {
-            return Ok(());
-        }
-
-        let rumor = build_token_request_rumor(
-            account.pubkey,
-            nostr_sdk::Timestamp::now(),
-            vec![token_tag.clone()],
-        )
-        .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
-
-        publish_push_group_message_with(
-            mdk,
-            &self.shared.relay_control,
-            &account.pubkey,
-            group_id,
-            rumor,
-        )
-        .await
-        .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
-
-        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
-            .await
-            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))
-    }
-
-    async fn merge_token_request(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-        member_pubkey: PublicKey,
-        leaf_index: u32,
-        request: mdk_core::mip05::TokenRequest,
-    ) -> Result<()> {
-        let Some(token) = request.tokens.into_iter().next() else {
-            return Err(WhitenoiseError::InvalidEvent(
-                "MIP-05 token request must include at least one token".to_string(),
-            ));
-        };
-
-        let session = self.require_session(&account.pubkey)?;
-        GroupPushToken::upsert(
-            &account.pubkey,
-            mls_group_id,
-            &member_pubkey,
-            leaf_index,
-            &token.server_pubkey,
-            Some(&token.relay_hint),
-            &token.encrypted_token.to_base64(),
-            &session.account_db.inner.pool,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn merge_token_list_response(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        mls_group_id: &GroupId,
-        response: mdk_core::mip05::TokenListResponse,
-    ) -> Result<()> {
-        let active_leaf_map = mdk.group_leaf_map(mls_group_id)?;
-        let session = self.require_session(&account.pubkey)?;
-
-        GroupPushToken::upsert_active_token_list_response(
-            mls_group_id,
-            &active_leaf_map,
-            response.tokens,
-            &session.account_db.inner.pool,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn sync_local_group_push_token_cache(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        group_id: &GroupId,
-        token_tag: Option<&TokenTag>,
-    ) -> Result<()> {
-        let leaf_index = mdk.own_leaf_index(group_id)?;
-        let session = self.require_session(&account.pubkey)?;
-
-        match token_tag {
-            Some(token_tag) => {
-                GroupPushToken::upsert(
-                    &account.pubkey,
-                    group_id,
-                    &account.pubkey,
-                    leaf_index,
-                    &token_tag.server_pubkey,
-                    Some(&token_tag.relay_hint),
-                    &token_tag.encrypted_token.to_base64(),
-                    &session.account_db.inner.pool,
-                )
-                .await?;
-            }
-            None => {
-                GroupPushToken::delete(group_id, leaf_index, &session.account_db.inner.pool)
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
-
     #[perf_instrument("push_notifications")]
     async fn local_push_token_tag(&self, account: &Account) -> Result<Option<TokenTag>> {
         let session = self.require_session(&account.pubkey)?;
@@ -1143,6 +714,11 @@ impl PushRegistration {
 
         Ok(Some(TokenTag {
             encrypted_token,
+            platform: Some(plaintext.platform()),
+            token_fingerprint: Some(push_token_fingerprint(
+                plaintext.platform(),
+                plaintext.device_token(),
+            )),
             server_pubkey: self.server_pubkey,
             relay_hint,
         }))
@@ -1180,22 +756,28 @@ impl PushRegistration {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
-    use mdk_core::mip05::{EncryptedToken, TokenTag, parse_notification_request_rumor};
-    use mdk_core::prelude::message_types::MessageState;
-    use nostr_sdk::{Filter, Keys, Kind, RelayUrl, Tag, nips::nip59};
+    use async_trait::async_trait;
+    use cgka_traits::transport::TransportMessage;
+    use nostr_sdk::{EventId, Filter, Keys, Kind, RelayUrl, Tag, nips::nip59};
+    use transport_nostr_peeler::NostrTransportEvent;
 
     use super::*;
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
     use crate::relay_control::{
         ephemeral::{EphemeralPlane, EphemeralPlaneConfig},
         sessions::{RelaySessionAuthPolicy, RelaySessionReconnectPolicy},
     };
     use crate::whitenoise::group_information::GroupType;
     use crate::whitenoise::test_utils::{
-        count_published_events_for_account, create_mock_whitenoise, create_nostr_group_config_data,
-        setup_multiple_test_accounts, setup_two_member_group_with_accepted_account_groups,
-        setup_two_member_group_with_welcome_finalization, wait_for_exact_published_event_count,
+        ObsoleteMlsArtifacts, assert_obsolete_mls_artifacts_absent,
+        count_published_events_for_account, create_group_config, create_mock_whitenoise,
+        setup_multiple_test_accounts, wait_for_exact_published_event_count,
         wait_for_key_package_publication, wait_for_published_event_count,
     };
     use crate::whitenoise::{
@@ -1212,6 +794,155 @@ mod tests {
             .to_base64()
     }
 
+    fn obsolete_mls_artifacts_for_session(
+        session: &crate::whitenoise::session::AccountSession,
+    ) -> ObsoleteMlsArtifacts {
+        ObsoleteMlsArtifacts {
+            storage_path: crate::whitenoise::test_utils::obsolete_mls_storage_path(
+                &session.account_pubkey,
+                &session.shared.config.data_dir,
+            ),
+        }
+    }
+
+    fn assert_obsolete_mls_artifacts_absent_for_session(
+        session: &crate::whitenoise::session::AccountSession,
+    ) {
+        let artifacts = obsolete_mls_artifacts_for_session(session);
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    async fn create_projected_two_member_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        whitenoise
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(
+                vec![member_account.pubkey],
+                create_group_config(vec![admin_account.pubkey]),
+                None,
+            )
+            .await
+            .unwrap()
+            .mls_group_id
+    }
+
+    #[derive(Default)]
+    struct CapturingMarmotPublisher {
+        messages: Arc<Mutex<Vec<TransportMessage>>>,
+    }
+
+    impl CapturingMarmotPublisher {
+        fn messages(&self) -> Vec<TransportMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MarmotMessagePublisher for CapturingMarmotPublisher {
+        async fn publish(&self, message: TransportMessage) -> MarmotPublishOutcome {
+            self.messages.lock().unwrap().push(message);
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
+
+    async fn create_pending_projected_two_member_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        let publisher = CapturingMarmotPublisher::default();
+        let created_group = whitenoise
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                create_group_config(vec![admin_account.pubkey]),
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let welcome_message = publisher
+            .messages()
+            .into_iter()
+            .find(|message| {
+                matches!(
+                    message.envelope,
+                    cgka_traits::TransportEnvelope::Welcome { .. }
+                )
+            })
+            .expect("Darkmatter group creation should publish a welcome");
+        let giftwrap_event = NostrTransportEvent::from_transport_message(&welcome_message)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+
+        whitenoise
+            .handle_giftwrap(&member_session, member_account, giftwrap_event)
+            .await
+            .unwrap();
+
+        created_group.mls_group_id
+    }
+
+    async fn create_accepted_projected_two_member_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        let group_id =
+            create_pending_projected_two_member_group(whitenoise, admin_account, member_account)
+                .await;
+
+        whitenoise
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .membership()
+            .for_group(&group_id)
+            .accept()
+            .await
+            .unwrap();
+
+        group_id
+    }
+
+    async fn darkmatter_push_member_index_map(
+        whitenoise: &Whitenoise,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+    ) -> BTreeMap<u32, PublicKey> {
+        let session = whitenoise.require_session(account_pubkey).unwrap();
+        let marmot = session
+            .marmot
+            .as_ref()
+            .expect("test account should have a Marmot session")
+            .clone();
+        let marmot_group_id = cgka_traits::types::GroupId::new(group_id.as_slice().to_vec());
+
+        marmot
+            .lock()
+            .await
+            .push_member_index_map(&marmot_group_id)
+            .unwrap()
+    }
+
+    fn member_push_index(active_member_index: &BTreeMap<u32, PublicKey>, pubkey: PublicKey) -> u32 {
+        active_member_index
+            .iter()
+            .find_map(|(leaf_index, member_pubkey)| {
+                (*member_pubkey == pubkey).then_some(*leaf_index)
+            })
+            .expect("member should have a Darkmatter push index")
+    }
+
     fn test_group_push_token(
         account_pubkey: PublicKey,
         group_id: GroupId,
@@ -1226,6 +957,8 @@ mod tests {
             mls_group_id: group_id,
             member_pubkey,
             leaf_index,
+            platform: None,
+            token_fingerprint: None,
             server_pubkey,
             relay_hint,
             encrypted_token,
@@ -1239,20 +972,10 @@ mod tests {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
-        let ephemeral = whitenoise.shared.relay_control.ephemeral();
         let session = whitenoise.require_session(&account.pubkey)?;
-
-        publish_notification_requests_after_delivery_with(
-            whitenoise.config(),
-            &whitenoise.shared.database,
-            &session.account_db.inner.pool,
-            &whitenoise.shared.relay_control,
-            &whitenoise.shared.event_tracker,
-            &ephemeral,
-            account.pubkey,
-            group_id,
-        )
-        .await
+        crate::whitenoise::session::push::PushResponseContext::from_session(&session)
+            .publish_notification_requests_after_delivery(group_id)
+            .await
     }
 
     async fn wait_for_user_inbox_relays_on_network(
@@ -1536,48 +1259,45 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_group_push_debug_info_returns_count_and_latest_update_time() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let account_keys = Keys::generate();
+        let session = crate::whitenoise::session::test_helpers::test_session_with_marmot_keys(
+            account_keys.clone(),
+        )
+        .await;
         let group_id = GroupId::from_slice(&[42; 32]);
         let server_pubkey = Keys::generate().public_key();
         let member_one_pubkey = Keys::generate().public_key();
         let member_two_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
 
-        let account_pool = &whitenoise
-            .require_session(&account.pubkey)
-            .unwrap()
-            .account_db
-            .inner
-            .pool;
-        let first_token = GroupPushToken::upsert(
-            &account.pubkey,
-            &group_id,
-            &member_one_pubkey,
-            1,
-            &server_pubkey,
-            Some(&relay_hint),
-            "ciphertext-one",
-            account_pool,
-        )
-        .await
-        .unwrap();
-        let second_token = GroupPushToken::upsert(
-            &account.pubkey,
-            &group_id,
-            &member_two_pubkey,
-            2,
-            &server_pubkey,
-            Some(&relay_hint),
-            "ciphertext-two",
-            account_pool,
-        )
-        .await
-        .unwrap();
+        let first_token = session
+            .repos
+            .group_push_tokens
+            .upsert(
+                &group_id,
+                &member_one_pubkey,
+                1,
+                &server_pubkey,
+                Some(&relay_hint),
+                "ciphertext-one",
+            )
+            .await
+            .unwrap();
+        let second_token = session
+            .repos
+            .group_push_tokens
+            .upsert(
+                &group_id,
+                &member_two_pubkey,
+                2,
+                &server_pubkey,
+                Some(&relay_hint),
+                "ciphertext-two",
+            )
+            .await
+            .unwrap();
 
-        let debug_info = whitenoise
-            .require_session(&account.pubkey)
-            .unwrap()
+        let debug_info = session
             .push()
             .get_group_debug_info(&group_id)
             .await
@@ -1603,6 +1323,7 @@ mod tests {
                 local_token_cached: false,
             }
         );
+        assert_obsolete_mls_artifacts_absent_for_session(&session);
         assert_eq!(debug_info.tokens.len(), 2);
         assert!(debug_info.tokens.iter().all(|token| !token.active_leaf));
         assert!(
@@ -1743,6 +1464,8 @@ mod tests {
                     .unwrap(),
             )
             .unwrap(),
+            platform: None,
+            token_fingerprint: None,
             server_pubkey,
             relay_hint: RelayUrl::parse("wss://ignored-hint.example.com").unwrap(),
         }];
@@ -1785,12 +1508,8 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let group_id =
+            create_projected_two_member_group(&whitenoise, &admin_account, &member_account).await;
         publish_notification_requests_after_delivery_for_test(
             &whitenoise,
             &admin_account,
@@ -1824,12 +1543,8 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let group_id =
+            create_projected_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let server_inbox_relays = server_account
             .inbox_relays(&whitenoise.shared)
             .await
@@ -1852,17 +1567,10 @@ mod tests {
             .await
             .unwrap();
 
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let active_leaf_map = admin_mdk.group_leaf_map(&group_id).unwrap();
-        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
-        let member_leaf_index = active_leaf_map
-            .iter()
-            .find_map(|(leaf_index, pubkey)| {
-                (*pubkey == member_account.pubkey).then_some(*leaf_index)
-            })
-            .unwrap();
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &admin_account.pubkey, &group_id).await;
+        let admin_leaf_index = member_push_index(&active_member_index, admin_account.pubkey);
+        let member_leaf_index = member_push_index(&active_member_index, member_account.pubkey);
         let sender_token = encrypted_fcm_token_base64(&server_account.pubkey, "sender-own-device");
         let recipient_token = encrypt_push_token(
             &server_account.pubkey,
@@ -1923,9 +1631,9 @@ mod tests {
         let unwrapped = nip59::extract_rumor(&server_keys, &giftwraps[0])
             .await
             .unwrap();
-        let parsed = parse_notification_request_rumor(&unwrapped.rumor).unwrap();
+        let tokens = notification_request_tokens_for_test(&unwrapped.rumor);
 
-        assert_eq!(parsed.tokens, vec![recipient_token]);
+        assert_eq!(tokens, vec![recipient_token]);
     }
 
     #[tokio::test]
@@ -1938,12 +1646,8 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let group_id =
+            create_projected_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let server_inbox_relays = server_account
             .inbox_relays(&whitenoise.shared)
             .await
@@ -1984,17 +1688,10 @@ mod tests {
         )
         .await;
 
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let active_leaf_map = admin_mdk.group_leaf_map(&group_id).unwrap();
-        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
-        let member_leaf_index = active_leaf_map
-            .iter()
-            .find_map(|(leaf_index, pubkey)| {
-                (*pubkey == member_account.pubkey).then_some(*leaf_index)
-            })
-            .unwrap();
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &admin_account.pubkey, &group_id).await;
+        let admin_leaf_index = member_push_index(&active_member_index, admin_account.pubkey);
+        let member_leaf_index = member_push_index(&active_member_index, member_account.pubkey);
         let sender_token = encrypted_fcm_token_base64(&server_account.pubkey, "sender-own-device");
         let recipient_token = encrypt_push_token(
             &server_account.pubkey,
@@ -2053,9 +1750,9 @@ mod tests {
         let unwrapped = nip59::extract_rumor(&server_keys, &giftwraps[0])
             .await
             .unwrap();
-        let parsed = parse_notification_request_rumor(&unwrapped.rumor).unwrap();
+        let tokens = notification_request_tokens_for_test(&unwrapped.rumor);
 
-        assert_eq!(parsed.tokens, vec![recipient_token]);
+        assert_eq!(tokens, vec![recipient_token]);
     }
 
     #[tokio::test]
@@ -2088,7 +1785,7 @@ mod tests {
             .unwrap();
 
         let relay_hint = server_relay_urls[0].clone();
-        let token_tags: Vec<TokenTag> = (0..(mdk_core::mip05::MAX_NOTIFICATION_REQUEST_TOKENS + 1))
+        let token_tags: Vec<TokenTag> = (0..(MAX_NOTIFICATION_REQUEST_TOKENS + 1))
             .map(|index| TokenTag {
                 encrypted_token: encrypt_push_token(
                     &server_account.pubkey,
@@ -2099,6 +1796,8 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap(),
+                platform: None,
+                token_fingerprint: None,
                 server_pubkey: server_account.pubkey,
                 relay_hint: relay_hint.clone(),
             })
@@ -2130,8 +1829,7 @@ mod tests {
 
         for giftwrap in giftwraps {
             let unwrapped = nip59::extract_rumor(&server_keys, &giftwrap).await.unwrap();
-            let parsed = parse_notification_request_rumor(&unwrapped.rumor).unwrap();
-            received_tokens.extend(parsed.tokens);
+            received_tokens.extend(notification_request_tokens_for_test(&unwrapped.rumor));
         }
 
         assert_eq!(received_tokens.len(), token_tags.len());
@@ -2146,8 +1844,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member]).await;
 
-        let group_id =
-            setup_two_member_group_with_welcome_finalization(&whitenoise, &creator, &member).await;
+        let group_id = create_projected_two_member_group(&whitenoise, &creator, &member).await;
         let send_result = whitenoise
             .send_message_to_group(&creator, &group_id, "status isolation".to_string(), 9, None)
             .await
@@ -2161,12 +1858,9 @@ mod tests {
         )
         .await;
 
-        let creator_mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-        let active_leaf_map = creator_mdk.group_leaf_map(&group_id).unwrap();
-        let member_leaf_index = active_leaf_map
-            .iter()
-            .find_map(|(leaf_index, pubkey)| (*pubkey == member.pubkey).then_some(*leaf_index))
-            .unwrap();
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &creator.pubkey, &group_id).await;
+        let member_leaf_index = member_push_index(&active_member_index, member.pubkey);
         let unreachable_server_pubkey = Keys::generate().public_key();
         let unreachable_relay = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
 
@@ -2190,15 +1884,20 @@ mod tests {
         .unwrap();
         let ephemeral = test_ephemeral_plane(&whitenoise);
 
-        publish_notification_requests_after_delivery_with(
-            whitenoise.config(),
+        let cached_tokens =
+            GroupPushToken::find_by_account_and_group(&creator.pubkey, &group_id, creator_pool)
+                .await
+                .unwrap();
+
+        publish_notification_requests_after_delivery_from_cache(
             &whitenoise.shared.database,
-            creator_pool,
             &whitenoise.shared.relay_control,
             &whitenoise.shared.event_tracker,
             &ephemeral,
             creator.pubkey,
-            &group_id,
+            &cached_tokens,
+            &active_member_index,
+            &creator.pubkey,
         )
         .await
         .unwrap();
@@ -2355,12 +2054,8 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_accepted_account_groups(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let group_id =
+            create_projected_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let before_count = count_published_events_for_account(&whitenoise, &admin_account).await;
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
@@ -2383,11 +2078,9 @@ mod tests {
             wait_for_published_event_count(&whitenoise, &admin_account, before_count).await;
         assert!(after_count > before_count);
 
-        let own_leaf_index = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap()
-            .own_leaf_index(&group_id)
-            .unwrap();
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &admin_account.pubkey, &group_id).await;
+        let own_leaf_index = member_push_index(&active_member_index, admin_account.pubkey);
         let cached_tokens = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
             &group_id,
@@ -2417,12 +2110,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        setup_two_member_group_with_accepted_account_groups(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        create_projected_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
         let apns_hex_token = "22".repeat(32);
@@ -2461,6 +2149,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clear_push_registration_publishes_token_removal() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id =
+            create_projected_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        let before_share_count =
+            count_published_events_for_account(&whitenoise, &admin_account).await;
+        whitenoise
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
+                PushPlatform::Apns,
+                &"66".repeat(32),
+                &server_pubkey,
+                Some(&relay_hint),
+            )
+            .await
+            .unwrap();
+        let after_share_count =
+            wait_for_published_event_count(&whitenoise, &admin_account, before_share_count).await;
+
+        whitenoise
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .clear_registration()
+            .await
+            .unwrap();
+
+        let after_clear_count =
+            wait_for_published_event_count(&whitenoise, &admin_account, after_share_count).await;
+        assert!(after_clear_count > after_share_count);
+        assert!(
+            whitenoise
+                .session(&admin_account.pubkey)
+                .unwrap()
+                .push()
+                .registration()
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &admin_account.pubkey, &group_id).await;
+        let own_leaf_index = member_push_index(&active_member_index, admin_account.pubkey);
+        let admin_pool = &whitenoise
+            .require_session(&admin_account.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
+        let cached_after_clear =
+            GroupPushToken::find_by_account_and_group(&admin_account.pubkey, &group_id, admin_pool)
+                .await
+                .unwrap();
+        assert!(
+            cached_after_clear
+                .iter()
+                .all(|token| token.leaf_index != own_leaf_index),
+            "clearing a registration should remove the local cached push token"
+        );
+    }
+
+    #[tokio::test]
     async fn test_reconcile_group_push_tokens_prunes_cached_member_mismatch_for_active_leaf() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();
@@ -2469,22 +2231,12 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
-        let admin_leaf_index = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap()
-            .group_leaf_map(&group_id)
-            .unwrap()
-            .iter()
-            .find_map(|(leaf_index, pubkey)| {
-                (*pubkey == admin_account.pubkey).then_some(*leaf_index)
-            })
-            .expect("admin leaf should exist in member view");
+        let group_id =
+            create_pending_projected_two_member_group(&whitenoise, &admin_account, &member_account)
+                .await;
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &member_account.pubkey, &group_id).await;
+        let admin_leaf_index = member_push_index(&active_member_index, admin_account.pubkey);
         let fake_member_pubkey = Keys::generate().public_key();
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
@@ -2552,12 +2304,9 @@ mod tests {
             .await
             .unwrap();
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let group_id =
+            create_pending_projected_two_member_group(&whitenoise, &admin_account, &member_account)
+                .await;
 
         // The member's group invite is still pending — no token should be shared.
         let cached_tokens = GroupPushToken::find_by_account_and_group(
@@ -2590,18 +2339,8 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&first_member, &second_member]).await;
 
-        setup_two_member_group_with_accepted_account_groups(
-            &whitenoise,
-            &admin_account,
-            &first_member,
-        )
-        .await;
-        setup_two_member_group_with_accepted_account_groups(
-            &whitenoise,
-            &admin_account,
-            &second_member,
-        )
-        .await;
+        create_projected_two_member_group(&whitenoise, &admin_account, &first_member).await;
+        create_projected_two_member_group(&whitenoise, &admin_account, &second_member).await;
 
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
@@ -2650,12 +2389,8 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_accepted_account_groups(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let group_id =
+            create_projected_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
         let before_share_count =
@@ -2678,11 +2413,9 @@ mod tests {
             wait_for_published_event_count(&whitenoise, &admin_account, before_share_count).await;
         assert!(after_share_count > before_share_count);
 
-        let own_leaf_index = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap()
-            .own_leaf_index(&group_id)
-            .unwrap();
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &admin_account.pubkey, &group_id).await;
+        let own_leaf_index = member_push_index(&active_member_index, admin_account.pubkey);
         let admin_pool = &whitenoise
             .require_session(&admin_account.pubkey)
             .unwrap()
@@ -2755,6 +2488,8 @@ mod tests {
             mls_group_id: GroupId::from_slice(&[7; 32]),
             member_pubkey: Keys::generate().public_key(),
             leaf_index: 3,
+            platform: None,
+            token_fingerprint: None,
             server_pubkey: Keys::generate().public_key(),
             relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
             encrypted_token: "ciphertext-value".to_string(),
@@ -2867,12 +2602,9 @@ mod tests {
             .await
             .unwrap();
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let group_id =
+            create_pending_projected_two_member_group(&whitenoise, &admin_account, &member_account)
+                .await;
 
         // Before acceptance: no token cached for the member.
         let member_pool = &whitenoise
@@ -2906,11 +2638,9 @@ mod tests {
             .unwrap();
 
         // After acceptance: the member's own token should be cached.
-        let own_leaf_index = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap()
-            .own_leaf_index(&group_id)
-            .unwrap();
+        let active_member_index =
+            darkmatter_push_member_index_map(&whitenoise, &member_account.pubkey, &group_id).await;
+        let own_leaf_index = member_push_index(&active_member_index, member_account.pubkey);
         let cached_after = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
@@ -2936,7 +2666,7 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         // Create an accepted group (admin auto-accepts during creation).
-        let accepted_group_id = setup_two_member_group_with_accepted_account_groups(
+        let accepted_group_id = create_accepted_projected_two_member_group(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2944,12 +2674,9 @@ mod tests {
         .await;
 
         // Create a pending group (welcome finalized but not accepted by member).
-        let pending_group_id = setup_two_member_group_with_welcome_finalization(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
+        let pending_group_id =
+            create_pending_projected_two_member_group(&whitenoise, &admin_account, &member_account)
+                .await;
 
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
@@ -3031,7 +2758,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -3087,7 +2814,7 @@ mod tests {
             .unwrap();
 
         // Set up group with accepted account groups so the token gets shared.
-        let group_id = setup_two_member_group_with_accepted_account_groups(
+        let group_id = create_accepted_projected_two_member_group(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -3149,206 +2876,26 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_rate_limiter_allows_first_request() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let acct = Keys::generate().public_key();
-        let group_id = GroupId::from_slice(&[42; 32]);
-
-        assert!(
-            whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request),
-            "first request from a sender must be allowed"
-        );
+    fn assert_notification_rumor_only_carries_version_tag(rumor: &nostr_sdk::UnsignedEvent) {
+        assert_eq!(rumor.kind, Kind::Custom(446));
+        let tags: Vec<Vec<String>> = rumor
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        assert_eq!(tags, vec![vec!["v".to_string(), "mip05-v1".to_string()]]);
     }
 
-    #[tokio::test]
-    async fn test_rate_limiter_blocks_rapid_duplicate() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let acct = Keys::generate().public_key();
-        let group_id = GroupId::from_slice(&[42; 32]);
-
-        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
-        assert!(
-            !whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,),
-            "immediate second request from the same sender must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_allows_different_senders() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let acct = Keys::generate().public_key();
-        let group_id = GroupId::from_slice(&[42; 32]);
-
-        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
-        assert!(
-            whitenoise.check_token_request_rate(&acct, &group_id, 1, TokenRateKind::Request,),
-            "request from a different leaf index must be allowed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_allows_different_groups() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let acct = Keys::generate().public_key();
-        let group_a = GroupId::from_slice(&[42; 32]);
-        let group_b = GroupId::from_slice(&[43; 32]);
-
-        assert!(whitenoise.check_token_request_rate(&acct, &group_a, 0, TokenRateKind::Request,));
-        assert!(
-            whitenoise.check_token_request_rate(&acct, &group_b, 0, TokenRateKind::Request,),
-            "same leaf index in a different group must be allowed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_allows_different_accounts() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let acct_a = Keys::generate().public_key();
-        let acct_b = Keys::generate().public_key();
-        let group_id = GroupId::from_slice(&[42; 32]);
-
-        assert!(
-            whitenoise.check_token_request_rate(&acct_a, &group_id, 0, TokenRateKind::Request,)
-        );
-        assert!(
-            whitenoise.check_token_request_rate(&acct_b, &group_id, 0, TokenRateKind::Request,),
-            "same group+leaf from a different account must be allowed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_request_does_not_suppress_removal() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let acct = Keys::generate().public_key();
-        let group_id = GroupId::from_slice(&[42; 32]);
-
-        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
-        assert!(
-            whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Removal,),
-            "a request must not suppress a removal from the same sender"
-        );
-    }
-
-    /// Builds a minimal valid `TokenRequest` [`Message`] for use in push
-    /// notification handler tests. The `UnsignedEvent` inside carries a
-    /// properly-formatted `token` tag so that `parse_group_message` succeeds.
-    fn make_token_request_message(
-        sender: &Keys,
-        group_id: GroupId,
-    ) -> mdk_core::prelude::message_types::Message {
-        let token_tag = TokenTag {
-            encrypted_token: EncryptedToken::from_slice(&[0u8; 1084]).unwrap(),
-            server_pubkey: Keys::generate().public_key(),
-            relay_hint: RelayUrl::parse("wss://push.example.com").unwrap(),
-        };
-        let rumor = build_token_request_rumor(
-            sender.public_key(),
-            nostr_sdk::Timestamp::now(),
-            vec![token_tag],
-        )
-        .unwrap();
-
-        mdk_core::prelude::message_types::Message {
-            id: rumor.id.unwrap_or(nostr_sdk::EventId::all_zeros()),
-            pubkey: sender.public_key(),
-            kind: rumor.kind,
-            mls_group_id: group_id,
-            created_at: rumor.created_at,
-            processed_at: nostr_sdk::Timestamp::now(),
-            content: rumor.content.clone(),
-            tags: rumor.tags.clone(),
-            event: rumor,
-            wrapper_event_id: nostr_sdk::EventId::all_zeros(),
-            epoch: None,
-            state: MessageState::Processed,
-        }
-    }
-
-    /// Verifies the rate check is wired into the message handler, not just
-    /// that `check_token_request_rate` works in isolation.
-    ///
-    /// Two distinct `TokenRequest` messages from the same `(group, leaf_index)`
-    /// arrive back-to-back. Only the first should schedule a pending response;
-    /// the second must be silently dropped by the rate limiter.
-    #[tokio::test]
-    async fn test_rate_limiter_wires_into_message_handler() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
-
-        let sender = Keys::generate();
-        let group_id = GroupId::from_slice(&[77; 32]);
-        let leaf_index: u32 = 3;
-
-        // Two different messages from the same sender+group+leaf.
-        let msg1 = make_token_request_message(&sender, group_id.clone());
-        let msg2 = make_token_request_message(&sender, group_id.clone());
-        let event_id_1 = msg1.event.id;
-        let event_id_2 = msg2.event.id;
-
-        // First call — must be accepted.
-        let handled1 = whitenoise
-            .handle_received_push_group_message(&mdk, &account, &msg1, Some(leaf_index))
-            .await
-            .unwrap();
-        assert!(handled1, "first token request must be handled");
-
-        // Second call — must be rate-limited (same group+leaf within cooldown).
-        let handled2 = whitenoise
-            .handle_received_push_group_message(&mdk, &account, &msg2, Some(leaf_index))
-            .await
-            .unwrap();
-        assert!(
-            handled2,
-            "rate-limited request still returns true (it is a push message)"
-        );
-
-        // The first request must have scheduled a pending response.
-        if let Some(eid) = event_id_1 {
-            assert!(
-                whitenoise
-                    .shared
-                    .pending_push_token_responses
-                    .contains_key(&(account.pubkey, group_id.clone(), eid)),
-                "first request must have a pending response scheduled"
-            );
-        }
-
-        // The second request must NOT have scheduled a pending response — it
-        // was dropped before `schedule_pending_token_response` was reached.
-        if let Some(eid) = event_id_2 {
-            assert!(
-                !whitenoise
-                    .shared
-                    .pending_push_token_responses
-                    .contains_key(&(account.pubkey, group_id.clone(), eid)),
-                "rate-limited request must not schedule a pending response"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_allows_after_cooldown() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let acct = Keys::generate().public_key();
-        let group_id = GroupId::from_slice(&[42; 32]);
-
-        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
-
-        // Backdate the stored timestamp beyond the cooldown window.
-        let key = (acct, group_id.clone(), 0u32, TokenRateKind::Request);
-        let backdated = Instant::now()
-            .checked_sub(TOKEN_REQUEST_COOLDOWN + Duration::from_millis(1))
-            .expect("system uptime must exceed cooldown window");
-        whitenoise
-            .shared
-            .token_request_timestamps
-            .insert(key, backdated);
-
-        assert!(
-            whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,),
-            "request after cooldown has elapsed must be allowed"
-        );
+    fn notification_request_tokens_for_test(
+        rumor: &nostr_sdk::UnsignedEvent,
+    ) -> Vec<EncryptedToken> {
+        assert_notification_rumor_only_carries_version_tag(rumor);
+        let content = Base64::decode_vec(&rumor.content).unwrap();
+        assert!(!content.is_empty());
+        assert_eq!(content.len() % ENCRYPTED_TOKEN_LEN, 0);
+        content
+            .chunks_exact(ENCRYPTED_TOKEN_LEN)
+            .map(|chunk| EncryptedToken::from_slice(chunk).unwrap())
+            .collect()
     }
 }

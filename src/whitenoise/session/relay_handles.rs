@@ -5,6 +5,7 @@ use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::SharedSigner;
 use crate::RelayType;
+use crate::marmot::transport::MarmotSignedEventPublisher;
 use crate::nostr_manager::Result as NostrResult;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::ephemeral::EphemeralPlane;
@@ -16,6 +17,7 @@ use crate::whitenoise::error::{Result, WhitenoiseError};
 /// Carries this account's identity and signer reference. Delegates to shared
 /// warm relay connections internally. The API never exposes the pubkey or signer
 /// — they are baked in at construction time.
+#[derive(Clone)]
 pub(crate) struct AccountEphemeralHandle {
     account_pubkey: PublicKey,
     ephemeral: EphemeralPlane,
@@ -42,6 +44,20 @@ impl AccountEphemeralHandle {
             .await
             .clone()
             .ok_or(WhitenoiseError::SignerUnavailable(self.account_pubkey))
+    }
+
+    async fn validate_signer_pubkey(&self, signer: &Arc<dyn NostrSigner>) -> Result<()> {
+        let signer_pubkey = signer.get_public_key().await.map_err(|error| {
+            WhitenoiseError::Internal(format!("Failed to get signer pubkey: {error}"))
+        })?;
+        if signer_pubkey != self.account_pubkey {
+            return Err(WhitenoiseError::InvalidInput(format!(
+                "Signer pubkey mismatch: expected {}, got {}",
+                self.account_pubkey.to_hex(),
+                signer_pubkey.to_hex()
+            )));
+        }
+        Ok(())
     }
 
     // ── Publish helpers (signer baked in) ───────────────────────────
@@ -81,7 +97,6 @@ impl AccountEphemeralHandle {
             .await?)
     }
 
-    #[expect(dead_code, reason = "phase 5+")]
     pub(crate) async fn publish_relay_list(
         &self,
         relay_list: &[RelayUrl],
@@ -89,6 +104,20 @@ impl AccountEphemeralHandle {
         target_relays: &[RelayUrl],
     ) -> Result<()> {
         let signer = self.require_signer().await?;
+        Ok(self
+            .ephemeral
+            .publish_relay_list_with_signer(relay_list, relay_type, target_relays, signer)
+            .await?)
+    }
+
+    pub(crate) async fn publish_relay_list_with_signer(
+        &self,
+        relay_list: &[RelayUrl],
+        relay_type: RelayType,
+        target_relays: &[RelayUrl],
+        signer: Arc<dyn NostrSigner>,
+    ) -> Result<()> {
+        self.validate_signer_pubkey(&signer).await?;
         Ok(self
             .ephemeral
             .publish_relay_list_with_signer(relay_list, relay_type, target_relays, signer)
@@ -131,6 +160,29 @@ impl AccountEphemeralHandle {
             .await?)
     }
 
+    pub(crate) async fn publish_key_package_with_signer(
+        &self,
+        kind: Kind,
+        encoded_key_package: &str,
+        relays: &[RelayUrl],
+        tags: &[Tag],
+        custom_created_at: Option<Timestamp>,
+        signer: Arc<dyn NostrSigner>,
+    ) -> Result<Output<EventId>> {
+        self.validate_signer_pubkey(&signer).await?;
+        Ok(self
+            .ephemeral
+            .publish_key_package_with_signer(
+                kind,
+                encoded_key_package,
+                relays,
+                tags,
+                custom_created_at,
+                signer,
+            )
+            .await?)
+    }
+
     pub(crate) async fn publish_event_deletion(
         &self,
         event_ids: &[EventId],
@@ -157,19 +209,13 @@ impl AccountEphemeralHandle {
 
     /// Fetch all key package events for this account from the given relays.
     ///
-    /// Requests both the canonical Marmot kind (30443) and the legacy
-    /// nostr-sdk `Kind::MlsKeyPackage` (= 443). Relays may have either or
-    /// both depending on the publishing client; filtering for only one would
-    /// silently drop key packages from peers that publish the other.
+    /// Requests the canonical Marmot key-package kind (30443).
     pub(crate) async fn fetch_key_packages_from_relays(
         &self,
         relays: &[RelayUrl],
     ) -> Result<Vec<Event>> {
         let filter = Filter::new()
-            .kinds([
-                crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND,
-                crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY,
-            ])
+            .kind(crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND)
             .author(self.account_pubkey);
 
         let fetched = self.ephemeral.fetch_events_from(relays, filter).await?;
@@ -178,7 +224,6 @@ impl AccountEphemeralHandle {
 
     // ── Publish helpers (event already signed) ──────────────────────
 
-    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn publish_event(
         &self,
         event: Event,
@@ -247,6 +292,21 @@ impl AccountEphemeralHandle {
             .ephemeral
             .warm_relays_for_account(self.account_pubkey, relays)
             .await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl MarmotSignedEventPublisher for AccountEphemeralHandle {
+    type Error = crate::nostr_manager::NostrManagerError;
+
+    async fn publish_signed_event(
+        &self,
+        event: Event,
+        relays: &[RelayUrl],
+        required_acks: usize,
+    ) -> NostrResult<Output<EventId>> {
+        let quorum_threshold = (required_acks > 1).then_some(required_acks);
+        self.publish_event(event, relays, quorum_threshold).await
     }
 }
 

@@ -5,8 +5,11 @@
 
 use std::collections::HashMap;
 use std::time::SystemTime;
-use mdk_core::prelude::*;
+
+use nostr_sdk::Timestamp;
 use serde::{Deserialize, Serialize};
+
+use crate::marmot::GroupId;
 
 use super::types::{ChatMessage, GroupStatistics, AggregatorConfig};
 

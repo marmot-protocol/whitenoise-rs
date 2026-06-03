@@ -10,7 +10,7 @@ use tracing_subscriber::filter::LevelFilter;
 use crate::integration_tests::benchmarks::PerfTracingLayer;
 
 pub mod ffi;
-pub mod mdk;
+pub mod marmot;
 mod nostr_manager;
 pub mod perf;
 pub(crate) mod relay_control;
@@ -75,6 +75,7 @@ pub use whitenoise::drafts::Draft;
 pub use whitenoise::database::aggregated_messages::PaginationOptions;
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
 pub use whitenoise::media_files::{AudioMetadata, build_chat_media_imeta_tag};
+pub use whitenoise::media_processing::MediaProcessingOptions;
 
 // Mute list
 pub use whitenoise::database::mute_list::MuteListEntry;

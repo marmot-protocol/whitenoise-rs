@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use mdk_core::prelude::{GroupId, message_types::Message};
 use nostr_sdk::prelude::*;
 use sqlx::Row;
 
 use super::{Database, DatabaseError, retry_on_lock, utils::parse_timestamp};
+use crate::marmot::{GroupId, Message};
 use crate::perf_instrument;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
@@ -219,7 +219,7 @@ enum Direction {
 
 impl AggregatedMessage {
     /// Count ALL events (kind 9, 7, 5) in cache for a group
-    /// Used for sync checking: mdk.len() == cache.len()
+    /// Used for sync checking protocol message count against cache count.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn count_by_group(group_id: &GroupId, database: &Database) -> Result<usize> {
         let count: i64 =
@@ -3035,8 +3035,8 @@ mod tests {
         let parent_id = format!("{:0>64x}", 0xba186u64);
         let reaction_id = format!("{:0>64x}", 0xea186u64);
 
-        // Insert a reaction targeting the parent, using direct SQL since
-        // insert_reaction needs a Message struct from MDK
+        // Insert a reaction targeting the parent using direct SQL, so this
+        // test can focus on orphan lookup behavior.
         let tags_json = serde_json::to_string(&vec![vec!["e", &parent_id]]).unwrap();
         let empty_tokens =
             serde_json::to_string(&whitenoise_markdown::Document::default()).unwrap();

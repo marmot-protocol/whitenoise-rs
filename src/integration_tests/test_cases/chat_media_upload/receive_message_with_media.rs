@@ -216,10 +216,10 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
 
         tracing::info!("✓ Receiver's MediaFile metadata matches imeta tags");
 
-        // Verify nostr_key is None (chat media uses MDK, not key/nonce encryption)
+        // Verify nostr_key is None (chat media does not use key/nonce encryption)
         assert!(
             receiver_media.nostr_key.is_none(),
-            "chat_media should not have nostr_key (uses MDK encryption)"
+            "chat_media should not have nostr_key"
         );
 
         // Verify nonce was preserved from imeta 'n' field (MIP-04 v2 contract)

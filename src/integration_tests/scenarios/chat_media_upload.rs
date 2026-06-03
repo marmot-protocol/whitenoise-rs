@@ -32,7 +32,6 @@ impl Scenario for ChatMediaUploadScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Create a test group for media uploads
         CreateGroupTestCase::basic()
             .with_name("media_upload_test_group")
             .with_members("media_uploader", vec!["media_member"])

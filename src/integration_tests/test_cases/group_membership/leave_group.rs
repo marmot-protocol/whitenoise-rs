@@ -1,7 +1,7 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::marmot::GroupId;
 use async_trait::async_trait;
-use mdk_core::prelude::GroupId;
 
 /// Atomic test case for an account leaving a group via SelfRemove.
 ///

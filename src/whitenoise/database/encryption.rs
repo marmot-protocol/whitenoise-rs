@@ -2,20 +2,18 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
-use mdk_sqlite_storage::{EncryptionConfig, keyring};
 use sqlx::{ConnectOptions, Connection, Row, sqlite::SqliteConnectOptions};
 
 use super::DatabaseError;
+use super::keyring::{self, EncryptionConfig};
 
 pub(super) const WHITENOISE_DB_KEY_ID: &str = "whitenoise.db.key.v1";
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const MIGRATION_LOCK_STALE_SECS: u64 = 15 * 60;
-static APP_DB_KEY_ROTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseFileState {
@@ -327,23 +325,12 @@ fn create_fresh_key(
     keyring_service_id: &str,
     key_id: &str,
 ) -> Result<EncryptionConfig, DatabaseError> {
-    // This only protects the Whitenoise app database key lifecycle. Test and
-    // benchmark builds may override the key id for isolation, but those calls
-    // are still app database opens rather than a general key rotation API.
-    let lock = APP_DB_KEY_ROTATION_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().map_err(|e| {
-        DatabaseError::EncryptionKey(format!("Failed to acquire app DB key rotation lock: {e}"))
-    })?;
-
     tracing::debug!(
         target: "whitenoise::database",
         key_id,
         "Rotating stale database keyring entry before fresh database setup"
     );
-    keyring::delete_db_key(keyring_service_id, key_id)
-        .map_err(|e| DatabaseError::EncryptionKey(e.to_string()))?;
-    keyring::get_or_create_db_key(keyring_service_id, key_id)
-        .map_err(|e| DatabaseError::EncryptionKey(e.to_string()))
+    keyring::create_fresh_db_key(keyring_service_id, key_id)
 }
 
 fn database_file_state(db_path: &Path) -> Result<DatabaseFileState, DatabaseError> {

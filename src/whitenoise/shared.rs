@@ -6,12 +6,7 @@ use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{PublicKey, RelayUrl};
 use tokio::sync::Mutex;
 
-#[cfg(test)]
-use nostr_sdk::EventId;
-#[cfg(test)]
-use tokio::sync::Semaphore;
-
-use crate::mdk::GroupId;
+use crate::marmot::GroupId;
 use crate::perf_instrument;
 use crate::relay_control::RelayControlPlane;
 use crate::whitenoise::WhitenoiseConfig;
@@ -63,15 +58,6 @@ pub struct SharedServices {
         ),
         Instant,
     >,
-    /// In-memory coordination for delayed MIP-05 token-list responses.
-    /// Only used by deprecated `Whitenoise`-level test wrappers; the session
-    /// layer has its own `AccountSession::pending_push_token_responses`.
-    #[cfg(test)]
-    pub(crate) pending_push_token_responses: Arc<DashMap<(PublicKey, GroupId, EventId), ()>>,
-    /// Bounds the number of concurrently-active delayed MIP-05 token-list response tasks.
-    /// Only used by deprecated `Whitenoise`-level test wrappers.
-    #[cfg(test)]
-    pub(crate) token_response_semaphore: Arc<Semaphore>,
 }
 
 impl SharedServices {
@@ -106,12 +92,6 @@ impl SharedServices {
             external_signers: DashMap::new(),
             discovery_sync_worker: DiscoverySyncWorker::new(),
             token_request_timestamps: DashMap::new(),
-            #[cfg(test)]
-            pending_push_token_responses: Arc::new(DashMap::new()),
-            #[cfg(test)]
-            token_response_semaphore: Arc::new(Semaphore::new(
-                super::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,
-            )),
         }
     }
 

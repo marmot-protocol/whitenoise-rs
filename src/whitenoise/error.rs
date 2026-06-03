@@ -32,8 +32,11 @@ pub enum WhitenoiseError {
     #[error("Contact list error: {0}")]
     ContactList(String),
 
-    #[error("MDK SQLite storage error: {0}")]
-    MdkSqliteStorage(#[from] mdk_sqlite_storage::error::Error),
+    #[error("Marmot storage error: {0}")]
+    MarmotStorage(#[from] cgka_traits::storage::StorageError),
+
+    #[error("Marmot engine error: {0}")]
+    MarmotEngine(#[from] cgka_traits::error::EngineError),
 
     #[error("Group not found")]
     GroupNotFound,
@@ -86,11 +89,14 @@ pub enum WhitenoiseError {
     #[error("Signer unavailable for account {0} — external signer not yet registered")]
     SignerUnavailable(PublicKey),
 
-    #[error("MDK error: {0}")]
-    MdkCoreError(#[from] mdk_core::Error),
+    #[error("Marmot session unavailable for account {0}")]
+    MarmotSessionUnavailable(PublicKey),
+
+    #[error("Unsupported Marmot operation: {0}")]
+    UnsupportedMarmotOperation(String),
 
     #[error("MIP-05 error: {0}")]
-    Mip05(#[from] mdk_core::mip05::Mip05Error),
+    Mip05(#[from] crate::marmot::push::Mip05Error),
 
     #[error("Invalid event: {0}")]
     InvalidEvent(String),
@@ -155,12 +161,6 @@ pub enum WhitenoiseError {
     #[error("Blossom error: {0}")]
     Blossom(#[from] BlossomError),
 
-    #[error("MDK group image error: {0}")]
-    MdkGroupImage(#[from] mdk_core::extension::GroupImageError),
-
-    #[error("MDK encrypted media error: {0}")]
-    MdkEncryptedMedia(#[from] mdk_core::encrypted_media::EncryptedMediaError),
-
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -176,8 +176,23 @@ pub enum WhitenoiseError {
     #[error("Missing required encoding tag ['encoding','base64']")]
     MissingEncodingTag,
 
+    #[error("Darkmatter v2 key package must not include an encoding tag")]
+    UnexpectedEncodingTag,
+
     #[error("Missing required d tag for kind:30443 key package")]
     MissingKeyPackageDTag,
+
+    #[error("Missing required i tag for kind:30443 key package")]
+    MissingKeyPackageRefTag,
+
+    #[error("Invalid key package ref: expected {expected}, advertised {advertised}")]
+    InvalidKeyPackageRef {
+        expected: String,
+        advertised: String,
+    },
+
+    #[error("Key package identity mismatch: expected {expected}, got {got}")]
+    KeyPackageIdentityMismatch { expected: String, got: String },
 
     #[error("Invalid base64 key package content: {0}")]
     InvalidBase64(#[from] base64ct::Error),
@@ -197,19 +212,6 @@ pub enum WhitenoiseError {
     #[error("Missing required mls_proposals [{}]", missing.join(", "))]
     MissingMlsProposals { missing: Vec<String> },
 
-    /// The invitee's published key package does not advertise the SelfRemove
-    /// proposal that the existing group's `RequiredCapabilities` mandates.
-    ///
-    /// **Only `add_members_to_group`'s pre-validation produces this variant.**
-    /// `create_group` does not — see [`Self::IncompatibleKeyPackage`] for
-    /// genuine malformations and the `RequiredProposal::SelfRemove` LCD policy
-    /// in `whitenoise::groups::required_proposals` for the silent-downgrade
-    /// outcome.
-    #[error(
-        "Cannot add this user yet. Their key package was published by an older app version and does not advertise SelfRemove support. Ask them to update White Noise and open the app so it can publish a new key package."
-    )]
-    KeyPackageMissingSelfRemove { member_pubkey: PublicKey },
-
     #[error(
         "upgrade blocked: {} member(s) do not advertise the {proposal:?} proposal",
         blockers.len()
@@ -219,27 +221,6 @@ pub enum WhitenoiseError {
         blockers: Vec<PublicKey>,
     },
 
-    /// MDK or our pre-validation rejected an `add_members_to_group` invitee
-    /// because their published key package does not satisfy the group's
-    /// `RequiredCapabilities`.
-    ///
-    /// `member_pubkey` carries the offending member when the rejection comes
-    /// from WhiteNoise's per-member pre-check; it is `None` when the rejection
-    /// comes from MDK's defense-in-depth fallback
-    /// (`mdk_core::Error::InviteeMissingRequiredProposal`), which is a unit
-    /// variant carrying no attribution.
-    #[error(
-        "Group rejected member{}: {reason}",
-        match member_pubkey {
-            Some(pk) => format!(" {pk}"),
-            None => String::new(),
-        }
-    )]
-    GroupRejectedMember {
-        member_pubkey: Option<PublicKey>,
-        reason: String,
-    },
-
     #[error(
         "Cannot add this user yet. Their key package is incompatible with this app version ({reason}). Ask them to update White Noise and open the app so it can publish a new key package."
     )]
@@ -247,6 +228,15 @@ pub enum WhitenoiseError {
         member_pubkey: PublicKey,
         reason: String,
     },
+
+    #[error("Cannot invite member {member_pubkey}: unsupported key package format ({reason})")]
+    UnsupportedKeyPackageFormat {
+        member_pubkey: PublicKey,
+        reason: String,
+    },
+
+    #[error("Cannot invite member {member_pubkey}: no key package found")]
+    MemberKeyPackageNotFound { member_pubkey: PublicKey },
 
     #[error("Invalid timestamp")]
     InvalidTimestamp,
@@ -266,14 +256,11 @@ pub enum WhitenoiseError {
     #[error("Key package publish failed: {0}")]
     KeyPackagePublishFailed(String),
 
+    #[error("Marmot publish failed: {0}")]
+    MarmotPublishFailed(String),
+
     #[error("Key package delete failed: {0}")]
     KeyPackageDeleteFailed(String),
-
-    #[error("MLS message unprocessable: {0}")]
-    MlsMessageUnprocessable(String),
-
-    #[error("MLS message previously failed and cannot be reprocessed")]
-    MlsMessagePreviouslyFailed,
 
     #[error("Event publish failed: no relay accepted the event")]
     EventPublishNoRelayAccepted,

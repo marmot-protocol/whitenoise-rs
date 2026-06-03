@@ -7,12 +7,9 @@ members = [
 ]
 
 [workspace.dependencies]
-mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1", features = [
-    "mip04",
-    "mip05",
-] }
-mdk-sqlite-storage = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
-mdk-storage-traits = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
+cgka-engine = { path = "../darkmatter/crates/cgka-engine" }
+cgka-traits = { path = "../darkmatter/crates/traits" }
+marmot-forensics = { path = "../darkmatter/crates/marmot-forensics" }
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44", "nip47", "nip59"] }
 tokio = { version = "1.44", features = ["full"] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -22,6 +19,10 @@ chrono = { version = "0.4.40", features = ["serde"] }
 hex = "0.4"
 tracing = "0.1"
 tempfile = "3.19.1"
+transport-nostr-adapter = { path = "../darkmatter/crates/transport-nostr-adapter", features = [
+    "sdk",
+] }
+transport-nostr-peeler = { path = "../darkmatter/crates/transport-nostr-peeler" }
 whitenoise-markdown = { path = "crates/whitenoise-markdown" }
 
 [package]
@@ -40,26 +41,26 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 async-trait = "0.1.88"
+blurhash = "0.2"
+cgka-engine = { workspace = true }
+cgka-traits = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4.5.37", features = ["derive"], optional = true }
 dashmap = "6.1"
 hex = { workspace = true }
+getrandom = "0.3"
 image = "0.25"
 indexmap = { version = "2", features = ["serde"] }
 infer = "0.19"
 keyring-core = "1"
-mdk-core = { workspace = true }
-mdk-sqlite-storage = { workspace = true }
-mdk-storage-traits = { workspace = true }
+marmot-forensics = { workspace = true }
 
 nostr-blossom = "0.44"
 nostr-sdk = { workspace = true }
 once_cell = "1"
 openmls = { version = "0.8.1", default-features = false }
-
-# LOCAL MDK FOR DEVELOPMENT
-# mdk-core = { version = "0.8.0", path="../mdk/crates/mdk-core" }
-# mdk-sqlite-storage = { version = "0.8.0", path="../mdk/crates/mdk-sqlite-storage" }
+openmls_rust_crypto = "0.5.1"
+openmls_traits = { version = "~0.5", features = ["extensions-draft-08"] }
 
 # LOCAL RUST_NOSTR FOR DEVELOPMENT
 # nostr-blossom = { version = "0.43", path="../rust-nostr/rfs/nostr-blossom" }
@@ -78,6 +79,7 @@ reqwest = { version = "0.13.1", features = [
     "stream",
     "rustls-no-provider",
 ], default-features = false }
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 # Explicit TLS provider: reqwest 0.13 defaults to aws-lc-rs, but we use ring for
 # compatibility with nostr-blossom (which uses reqwest 0.12 with ring). Having both
 # providers enabled causes a runtime panic, so we use rustls-no-provider above and
@@ -86,6 +88,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
 sqlx = { version = "0.9.0-alpha.1", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
@@ -96,13 +100,19 @@ sqlx = { version = "0.9.0-alpha.1", default-features = false, features = [
     "json",
 ] }
 thiserror = { workspace = true }
+tls_codec = { version = "~0.4", features = ["std"] }
+transport-nostr-adapter = { workspace = true }
+transport-nostr-peeler = { workspace = true }
 unicode-normalization = "0.1"
 webpki-roots = "1.0.6"
 tokio = { workspace = true }
 futures = "0.3"
+fast-thumbhash = "0.2"
+kamadak-exif = "0.6"
 tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1.8"
 base64ct = "=1.7.3"
 whitenoise-macros = { path = "crates/whitenoise-macros" }
 whitenoise-markdown = { workspace = true }
@@ -137,7 +147,7 @@ linux-keyutils-keyring-store = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Keep the v0.5-and-earlier by-service layout for upgraded Android installs.
-# The v1 default Store uses named stores and cannot see existing MDK DB keys.
+# The v1 default Store uses named stores and cannot see existing historical DB keys.
 android-native-keyring-store = { version = "1", features = ["legacy"] }
 
 [dev-dependencies]
@@ -149,7 +159,7 @@ default = []
 # Retained for keyring store selection on macOS: CLI binaries are unsigned and must
 # use the regular Keychain store (not Protected Data). Enabled by whitenoise-cli.
 cli = []
-integration-tests = ["clap", "mdk-core/test-utils"]
+integration-tests = ["clap"]
 benchmark-tests = ["integration-tests", "indicatif"]
 
 [[bin]]
@@ -178,3 +188,16 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# OpenMLS 0.8.1 on crates.io declares an optional openmls_sqlite_storage
+# dependency that still resolves rusqlite 0.32 / libsqlite3-sys 0.30, which
+# conflicts with WhiteNoise's SQLCipher stack and current rusqlite 0.37.
+# This exact upstream commit keeps the public crate versions compatible while
+# carrying the OpenMLS fix that moves sqlite test dependencies out of the normal
+# extension feature path.
+[patch.crates-io]
+openmls = { git = "https://github.com/openmls/openmls", rev = "5dcd8cb386fae172eb06c7194f5acf3232b95c38" }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "5dcd8cb386fae172eb06c7194f5acf3232b95c38" }
+openmls_memory_storage = { git = "https://github.com/openmls/openmls", rev = "5dcd8cb386fae172eb06c7194f5acf3232b95c38" }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "5dcd8cb386fae172eb06c7194f5acf3232b95c38" }
+openmls_traits = { git = "https://github.com/openmls/openmls", rev = "5dcd8cb386fae172eb06c7194f5acf3232b95c38" }

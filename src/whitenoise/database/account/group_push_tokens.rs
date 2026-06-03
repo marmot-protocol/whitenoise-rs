@@ -7,10 +7,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use mdk_core::prelude::GroupId;
+use crate::marmot::GroupId;
 use nostr_sdk::{PublicKey, RelayUrl};
 
+use crate::marmot::push::LeafTokenTag;
 use crate::whitenoise::database::account_db::AccountDatabase;
+use crate::whitenoise::database::group_push_tokens::GroupPushTokenUpsert;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::push_notifications::GroupPushToken;
 
@@ -60,6 +62,18 @@ impl GroupPushTokensRepo {
         .await?)
     }
 
+    /// Insert or update a cached push token while preserving current
+    /// Darkmatter push-gossip metadata.
+    pub(crate) async fn upsert_with_metadata(
+        &self,
+        upsert: GroupPushTokenUpsert<'_>,
+    ) -> Result<GroupPushToken> {
+        Ok(
+            GroupPushToken::upsert_with_metadata(&self.account_pubkey, upsert, &self.db.inner.pool)
+                .await?,
+        )
+    }
+
     /// Delete the cached token for a specific leaf index in a group.
     pub async fn delete(&self, group_id: &GroupId, leaf_index: u32) -> Result<bool> {
         Ok(GroupPushToken::delete(group_id, leaf_index, &self.db.inner.pool).await?)
@@ -83,7 +97,7 @@ impl GroupPushTokensRepo {
         &self,
         group_id: &GroupId,
         active_leaf_map: &BTreeMap<u32, PublicKey>,
-        tokens: Vec<mdk_core::mip05::LeafTokenTag>,
+        tokens: Vec<LeafTokenTag>,
     ) -> Result<()> {
         Ok(GroupPushToken::upsert_active_token_list_response(
             group_id,
@@ -130,6 +144,11 @@ mod tests {
                 mls_group_id    BLOB NOT NULL,
                 member_pubkey   TEXT NOT NULL,
                 leaf_index      INTEGER NOT NULL CHECK (leaf_index >= 0),
+                platform        TEXT CHECK (platform IN ('apns', 'fcm')),
+                token_fingerprint TEXT CHECK (
+                    token_fingerprint IS NULL OR
+                    token_fingerprint GLOB 'sha256:[0-9a-f]*'
+                ),
                 server_pubkey   TEXT NOT NULL,
                 relay_hint      TEXT,
                 encrypted_token TEXT NOT NULL CHECK (

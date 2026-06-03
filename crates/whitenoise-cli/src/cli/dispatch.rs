@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use mdk_core::prelude::{GroupId, NostrGroupConfigData, NostrGroupDataUpdate, group_types};
 use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
@@ -8,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 use whitenoise::{
     KeyPackageStatus, Language, PaginationOptions, RelayType, RequiredProposal, ThemeMode,
     Whitenoise,
+    marmot::{GroupConfig, GroupDataUpdate, GroupId, group_types},
 };
 
 use super::protocol::{MuteDuration, Request, Response};
@@ -29,8 +29,8 @@ pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
             Err(resp) => resp,
         },
 
-        Request::DebugRatchetTree { account, group_id } => {
-            match debug_ratchet_tree(wn, &account, &group_id).await {
+        Request::DebugGroupForensics { account, group_id } => {
+            match debug_group_forensics(wn, &account, &group_id).await {
                 Ok(resp) => resp,
                 Err(resp) => resp,
             }
@@ -1024,7 +1024,7 @@ async fn create_group(
         .map(|s| parse_pubkey(s))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let config = NostrGroupConfigData::new(
+    let config = GroupConfig::new(
         name,
         description.unwrap_or_default(),
         None, // image_hash
@@ -1198,7 +1198,7 @@ async fn rename_group(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let update = NostrGroupDataUpdate::new().name(name);
+    let update = GroupDataUpdate::new().name(name);
     require_session(wn, &account.pubkey)?
         .groups()
         .update_group_data(&group_id, update)
@@ -2217,35 +2217,21 @@ async fn debug_health(wn: &Whitenoise, account_str: &str) -> Result<Response, Re
     })))
 }
 
-async fn debug_ratchet_tree(
+async fn debug_group_forensics(
     wn: &Whitenoise,
     account_str: &str,
     group_id_hex: &str,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let info = wn
-        .ratchet_tree_info(&account, &group_id)
+    let forensics = wn
+        .group_forensics(&account, &group_id)
+        .await
         .map_err(|e| Response::err(e.to_string()))?;
 
-    let leaf_nodes: Vec<serde_json::Value> = info
-        .leaf_nodes
-        .iter()
-        .map(|leaf| {
-            serde_json::json!({
-                "index": leaf.index,
-                "encryption_key": leaf.encryption_key,
-                "signature_key": leaf.signature_key,
-                "credential_identity": leaf.credential_identity,
-            })
-        })
-        .collect();
-
-    Ok(Response::ok(serde_json::json!({
-        "tree_hash": info.tree_hash,
-        "serialized_tree": info.serialized_tree,
-        "leaf_nodes": leaf_nodes,
-    })))
+    serde_json::to_value(forensics)
+        .map(Response::ok)
+        .map_err(|e| Response::err(format!("serialization error: {e}")))
 }
 
 async fn promote_admin(
@@ -2279,7 +2265,7 @@ async fn promote_admin(
     admins.push(target_pk);
 
     // Authorization (caller must be admin) is enforced by update_group_data.
-    let update = NostrGroupDataUpdate::new().admins(admins);
+    let update = GroupDataUpdate::new().admins(admins);
     session
         .groups()
         .update_group_data(&group_id, update)
@@ -2315,7 +2301,7 @@ async fn demote_admin(
     let admins: Vec<_> = admins.into_iter().filter(|pk| pk != &target_pk).collect();
 
     // Authorization (caller must be admin) is enforced by update_group_data.
-    let update = NostrGroupDataUpdate::new().admins(admins);
+    let update = GroupDataUpdate::new().admins(admins);
     session
         .groups()
         .update_group_data(&group_id, update)
@@ -2375,7 +2361,7 @@ async fn keys_delete_all(wn: &Whitenoise, account_str: &str) -> Result<Response,
     let account = find_account(wn, account_str).await?;
     let count = require_session(wn, &account.pubkey)?
         .key_packages()
-        .delete_legacy()
+        .delete_all(true)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "deleted_count": count })))

@@ -189,13 +189,12 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
 
     // Case 3: Check for expired packages (>30 days old)
     let our_expired_packages = find_expired_packages(&our_packages);
-
     if our_expired_packages.is_empty() {
-        if !has_live_canonical_key_package(&our_packages) {
+        if !has_required_live_key_package_set(&our_packages) {
             tracing::info!(
                 target: "whitenoise::scheduler::key_package_maintenance",
-                "Account {} has live legacy key package state but no live canonical kind:30443 event, publishing new pair",
-                account.pubkey.to_hex()
+                "Account {} has no live canonical key package, publishing new package",
+                account.pubkey.to_hex(),
             );
             return publish_new_key_package(whitenoise, account).await;
         }
@@ -210,10 +209,10 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
     }
 
     // Delete expired packages, publishing a replacement first if the state
-    // left after deletion would not include a live canonical kind:30443.
+    // left after deletion would not satisfy the current migration phase.
     let total_package_group_count = count_key_package_hash_groups(&our_packages);
     let non_expired_packages = find_non_expired_packages(&our_packages, &our_expired_packages);
-    let needs_replacement_before_delete = !has_live_canonical_key_package(&non_expired_packages);
+    let needs_replacement_before_delete = !has_required_live_key_package_set(&non_expired_packages);
     rotate_expired_packages(
         whitenoise,
         account,
@@ -286,6 +285,10 @@ fn has_live_canonical_key_package(packages: &[LivePublishedKeyPackage]) -> bool 
     packages
         .iter()
         .any(|package| package.event.kind == MLS_KEY_PACKAGE_KIND)
+}
+
+fn has_required_live_key_package_set(packages: &[LivePublishedKeyPackage]) -> bool {
+    has_live_canonical_key_package(packages)
 }
 
 fn find_non_expired_packages(
@@ -362,9 +365,9 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
 
 /// Deletes expired key packages, only publishing a replacement if needed.
 ///
-/// If the account would be left without a live canonical kind:30443 package after deletion, a new
-/// pair is published first to avoid a gap. Otherwise, only the expired packages are deleted without
-/// republishing, since the account already has a valid canonical package.
+/// If the account would be left without the live package set required by the current migration
+/// phase after deletion, a new pair is published first to avoid a gap. Otherwise, only the expired
+/// packages are deleted without republishing.
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn rotate_expired_packages(
     whitenoise: &Whitenoise,
@@ -393,10 +396,8 @@ async fn rotate_expired_packages(
         return MaintenanceResult::Skipped;
     };
 
-    // Publish a new pair if deleting the expired groups would leave no live
-    // canonical key package behind. The usual case is "all groups expired",
-    // but this also repairs legacy-only non-expired leftovers before deleting
-    // an expired canonical group.
+    // Publish a new canonical key package if deleting the expired groups would
+    // leave no live canonical key package behind.
     if needs_replacement_before_delete {
         if let Err(e) = session.key_packages().publish().await {
             match e {
@@ -436,9 +437,11 @@ async fn rotate_expired_packages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND_LEGACY, MLS_PROPOSALS_TAG_KEY};
+    use crate::whitenoise::key_packages::MLS_PROPOSALS_TAG_KEY;
     use crate::whitenoise::relays::Relay;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::test_utils::{
+        assert_obsolete_mls_artifacts_absent, create_mock_whitenoise, remove_obsolete_mls_artifacts,
+    };
     use nostr_sdk::prelude::*;
 
     fn live_package(event: Event, key_package_hash_ref: Vec<u8>) -> LivePublishedKeyPackage {
@@ -460,7 +463,8 @@ mod tests {
             Tag::custom(TagKind::Custom("encoding".into()), vec!["base64"]),
         ];
 
-        EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, content)
+        EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tag(Tag::identifier("maintenance-compatible-test"))
             .tags(tags)
             .sign_with_keys(&keys)
             .unwrap()
@@ -475,27 +479,42 @@ mod tests {
     #[test]
     fn test_has_live_canonical_key_package_requires_canonical_kind() {
         let canonical = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![1]);
-        let legacy = live_package(key_package_event(MLS_KEY_PACKAGE_KIND_LEGACY), vec![2]);
-        let legacy_only = std::slice::from_ref(&legacy);
+        let other_kind = live_package(key_package_event(Kind::TextNote), vec![2]);
+        let other_kind_only = std::slice::from_ref(&other_kind);
 
         assert!(!has_live_canonical_key_package(&[]));
-        assert!(!has_live_canonical_key_package(legacy_only));
-        assert!(has_live_canonical_key_package(&[legacy, canonical]));
+        assert!(!has_live_canonical_key_package(other_kind_only));
+        assert!(has_live_canonical_key_package(&[other_kind, canonical]));
+    }
+
+    #[test]
+    fn test_required_live_key_package_set_requires_canonical_package() {
+        let canonical = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![1]);
+        let other_kind = live_package(key_package_event(Kind::TextNote), vec![2]);
+
+        assert!(!has_required_live_key_package_set(&[]));
+        assert!(has_required_live_key_package_set(std::slice::from_ref(
+            &canonical
+        )));
+        assert!(!has_required_live_key_package_set(std::slice::from_ref(
+            &other_kind
+        )));
+        assert!(has_required_live_key_package_set(&[canonical, other_kind]));
     }
 
     #[test]
     fn test_find_non_expired_packages_filters_whole_expired_hash_groups() {
         let expired_canonical = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![1]);
-        let expired_legacy = live_package(key_package_event(MLS_KEY_PACKAGE_KIND_LEGACY), vec![1]);
+        let expired_sibling = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![1]);
         let fresh_canonical = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![2]);
-        let fresh_legacy = live_package(key_package_event(MLS_KEY_PACKAGE_KIND_LEGACY), vec![2]);
+        let fresh_sibling = live_package(key_package_event(MLS_KEY_PACKAGE_KIND), vec![2]);
         let packages = vec![
             expired_canonical.clone(),
-            expired_legacy.clone(),
+            expired_sibling.clone(),
             fresh_canonical.clone(),
-            fresh_legacy.clone(),
+            fresh_sibling.clone(),
         ];
-        let expired_packages = vec![expired_canonical, expired_legacy];
+        let expired_packages = vec![expired_canonical, expired_sibling];
 
         let non_expired = find_non_expired_packages(&packages, &expired_packages);
 
@@ -507,29 +526,26 @@ mod tests {
         );
     }
 
-    /// Publishes a key package without the encoding tag for testing outdated package rotation.
+    /// Publishes a malformed canonical key package event for testing outdated
+    /// package rotation. The event is intentionally not backed by local
+    /// key-package material; the scheduler should ignore relay events that are
+    /// not both compatible and locally tracked.
     async fn publish_outdated_key_package(
         whitenoise: &Whitenoise,
         account: &crate::whitenoise::accounts::Account,
         relays: &[Relay],
     ) -> Result<EventId, crate::whitenoise::error::WhitenoiseError> {
-        let key_package_data = whitenoise
-            .encoded_key_package(account, relays, None)
-            .await?;
-
         let nsec = whitenoise.export_account_nsec(account).await?;
         let secret_key =
             SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
         let keys = Keys::new(secret_key);
 
-        let tags_without_encoding: Vec<Tag> = key_package_data
-            .tags_443
-            .into_iter()
-            .filter(|tag| tag.kind() != TagKind::Custom("encoding".into()))
-            .collect();
-
-        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, &key_package_data.content)
-            .tags(tags_without_encoding)
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "outdated-key-package")
+            .tag(Tag::identifier("maintenance-outdated-test"))
+            .tag(Tag::custom(
+                TagKind::MlsCiphersuite,
+                vec![REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
             .sign_with_keys(&keys)
             .map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
 
@@ -547,11 +563,74 @@ mod tests {
         Ok(event_id)
     }
 
+    async fn mark_all_key_package_groups_deleted(
+        whitenoise: &Whitenoise,
+        account: &crate::whitenoise::accounts::Account,
+        events: &[Event],
+    ) {
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let mut seen_hash_refs = std::collections::HashSet::new();
+
+        for event in events {
+            let tracked = session
+                .repos
+                .published_key_packages
+                .find_by_event_id(&event.id.to_hex())
+                .await
+                .unwrap()
+                .unwrap();
+            if !seen_hash_refs.insert(tracked.key_package_hash_ref.clone()) {
+                continue;
+            }
+            session
+                .key_packages()
+                .delete_tracked_key_material(&tracked)
+                .await
+                .unwrap();
+            session
+                .repos
+                .published_key_packages
+                .mark_key_material_deleted_by_hash_ref(&tracked.key_package_hash_ref)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn mark_all_key_package_groups_consumed(
+        whitenoise: &Whitenoise,
+        account: &crate::whitenoise::accounts::Account,
+        events: &[Event],
+    ) {
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let mut seen_hash_refs = std::collections::HashSet::new();
+
+        for event in events {
+            let tracked = session
+                .repos
+                .published_key_packages
+                .find_by_event_id(&event.id.to_hex())
+                .await
+                .unwrap()
+                .unwrap();
+            if !seen_hash_refs.insert(tracked.key_package_hash_ref) {
+                continue;
+            }
+            session
+                .repos
+                .published_key_packages
+                .mark_consumed(&event.id.to_hex())
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn test_execute_republishes_when_local_key_material_is_missing() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let account = whitenoise.create_identity().await.unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise
@@ -563,28 +642,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             before.len(),
-            2,
-            "Should start with the canonical and legacy key package twins"
+            1,
+            "Darkmatter-only sessions should start with a canonical key package"
         );
 
-        let session = whitenoise.require_session(&account.pubkey).unwrap();
-        let tracked = session
-            .repos
-            .published_key_packages
-            .find_by_event_id(&before[0].id.to_hex())
-            .await
-            .unwrap()
-            .unwrap();
-
-        let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
-        mdk.delete_key_package_from_storage_by_hash_ref(&tracked.key_package_hash_ref)
-            .unwrap();
-        session
-            .repos
-            .published_key_packages
-            .mark_key_material_deleted_by_hash_ref(&tracked.key_package_hash_ref)
-            .await
-            .unwrap();
+        mark_all_key_package_groups_deleted(&whitenoise, &account, &before).await;
+        assert_obsolete_mls_artifacts_absent(&artifacts);
 
         // Validate the precondition for this regression: the relay event still
         // exists, but this device no longer has any live local state for it.
@@ -599,6 +662,7 @@ mod tests {
         let task = KeyPackageMaintenance;
         task.execute(whitenoise.clone()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_obsolete_mls_artifacts_absent(&artifacts);
 
         let after = whitenoise
             .require_session(&account.pubkey)
@@ -617,7 +681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_republishes_when_only_legacy_twin_has_live_tracking() {
+    async fn test_execute_republishes_when_canonical_key_package_is_missing() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let account = whitenoise.create_identity().await.unwrap();
@@ -627,8 +691,8 @@ mod tests {
         let before = session.key_packages().fetch_all().await.unwrap();
         assert_eq!(
             before.len(),
-            2,
-            "Should start with the canonical and legacy key package twins"
+            1,
+            "Darkmatter-only sessions should start with a canonical key package"
         );
 
         let canonical = before
@@ -645,33 +709,19 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let legacy_only = session.key_packages().fetch_all().await.unwrap();
+        let missing_canonical = session.key_packages().fetch_all().await.unwrap();
         assert!(
-            legacy_only
-                .iter()
-                .all(|event| event.kind != MLS_KEY_PACKAGE_KIND),
+            missing_canonical.is_empty(),
             "precondition: relay should have no canonical key package"
-        );
-        assert!(
-            legacy_only
-                .iter()
-                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
-            "precondition: relay should still have a legacy key package"
         );
 
         let live_before =
-            find_live_published_key_packages(&whitenoise, &account, legacy_only.clone())
+            find_live_published_key_packages(&whitenoise, &account, missing_canonical.clone())
                 .await
                 .unwrap();
         assert!(
-            !live_before.is_empty(),
-            "precondition: legacy key package should still have live local tracking"
-        );
-        assert!(
-            live_before
-                .iter()
-                .all(|package| package.event.kind != MLS_KEY_PACKAGE_KIND),
-            "precondition: live relay state should be legacy-only"
+            live_before.is_empty(),
+            "precondition: no relay key package should count as live"
         );
 
         let task = KeyPackageMaintenance;
@@ -686,13 +736,51 @@ mod tests {
             live_after
                 .iter()
                 .any(|package| package.event.kind == MLS_KEY_PACKAGE_KIND),
-            "Maintenance should not report legacy-only live state as fresh"
+            "Maintenance should republish the missing canonical key package"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_preserves_darkmatter_canonical_key_package() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        assert!(
+            session.has_marmot_session(),
+            "test precondition: local sessions publish Darkmatter v2 canonical packages"
+        );
+
+        let before = session.key_packages().fetch_all().await.unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "Darkmatter-only sessions should start with a canonical key package"
+        );
+
+        let canonical_only = session.key_packages().fetch_all().await.unwrap();
+        assert!(
+            canonical_only
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
+            "precondition: relay should still have a canonical key package"
+        );
+
+        let task = KeyPackageMaintenance;
+        task.execute(whitenoise.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let after = session.key_packages().fetch_all().await.unwrap();
+        let live_after = find_live_published_key_packages(&whitenoise, &account, after)
+            .await
+            .unwrap();
         assert!(
             live_after
                 .iter()
-                .any(|package| package.event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
-            "Maintenance republish should preserve the legacy twin"
+                .any(|package| package.event.kind == MLS_KEY_PACKAGE_KIND),
+            "Maintenance should preserve a live canonical key package"
         );
     }
 
@@ -712,18 +800,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             before.len(),
-            2,
-            "Should start with the canonical and legacy key package twins"
+            1,
+            "Darkmatter-only sessions should start with a canonical key package"
         );
 
-        whitenoise
-            .require_session(&account.pubkey)
-            .unwrap()
-            .repos
-            .published_key_packages
-            .mark_consumed(&before[0].id.to_hex())
-            .await
-            .unwrap();
+        mark_all_key_package_groups_consumed(&whitenoise, &account, &before).await;
 
         // Validate the precondition for this regression: the relay event still
         // exists, but the tracked package has already been consumed locally.
@@ -773,25 +854,13 @@ mod tests {
             .fetch_all()
             .await
             .unwrap();
-        // create_identity publishes canonical (30443) + legacy (443) twins,
-        // and the fetch filter requests both kinds. Phase 18c stopped
-        // silently dropping kind 30443 from this query.
         assert_eq!(
             before.len(),
-            2,
-            "Should start with canonical + legacy key package twins"
+            1,
+            "Darkmatter-only sessions should start with a canonical key package"
         );
 
-        // mark_consumed walks every twin sharing the hash_ref, so consuming
-        // either of the two fetched events covers both.
-        whitenoise
-            .require_session(&account.pubkey)
-            .unwrap()
-            .repos
-            .published_key_packages
-            .mark_consumed(&before[0].id.to_hex())
-            .await
-            .unwrap();
+        mark_all_key_package_groups_consumed(&whitenoise, &account, &before).await;
 
         publish_outdated_key_package(&whitenoise, &account, &kp_relays)
             .await
@@ -805,11 +874,10 @@ mod tests {
             .fetch_all()
             .await
             .unwrap();
-        // Original canonical (replaced — still 1) + original legacy + outdated legacy = 3.
         assert_eq!(
             packages.len(),
-            3,
-            "Should have canonical + original legacy + outdated legacy"
+            2,
+            "Should have canonical Darkmatter key package plus outdated canonical key package"
         );
 
         let live_before = find_live_published_key_packages(&whitenoise, &account, packages.clone())
@@ -866,13 +934,13 @@ mod tests {
 
         // Create an event with a timestamp 31 days in the past
         let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
-        let old_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old")
+        let old_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "old")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
 
         // Create an event with a fresh timestamp
-        let fresh_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh")
+        let fresh_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "fresh")
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -890,10 +958,10 @@ mod tests {
     fn test_find_expired_packages_returns_empty_when_all_fresh() {
         let keys = nostr_sdk::Keys::generate();
 
-        let fresh1 = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh1")
+        let fresh1 = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "fresh1")
             .sign_with_keys(&keys)
             .unwrap();
-        let fresh2 = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh2")
+        let fresh2 = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "fresh2")
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -909,15 +977,15 @@ mod tests {
     }
 
     #[test]
-    fn test_find_expired_packages_keeps_group_when_twin_is_fresh() {
+    fn test_find_expired_packages_keeps_group_when_sibling_is_fresh() {
         let keys = nostr_sdk::Keys::generate();
         let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
 
-        let old_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old")
+        let old_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "old")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
-        let fresh_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh")
+        let fresh_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "fresh")
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -929,7 +997,7 @@ mod tests {
 
         assert!(
             expired.is_empty(),
-            "A hash_ref group should not expire while any twin is fresh"
+            "A hash_ref group should not expire while any sibling is fresh"
         );
     }
 
@@ -938,11 +1006,11 @@ mod tests {
         let keys = nostr_sdk::Keys::generate();
         let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
 
-        let old_event_a = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old-a")
+        let old_event_a = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "old-a")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
-        let old_event_b = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old-b")
+        let old_event_b = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "old-b")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
@@ -961,12 +1029,12 @@ mod tests {
     }
 
     #[test]
-    fn test_count_key_package_hash_groups_deduplicates_twins() {
+    fn test_count_key_package_hash_groups_deduplicates_siblings() {
         let keys = nostr_sdk::Keys::generate();
         let canonical = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "canonical")
             .sign_with_keys(&keys)
             .unwrap();
-        let legacy = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "legacy")
+        let sibling = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "sibling")
             .sign_with_keys(&keys)
             .unwrap();
         let separate = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "separate")
@@ -975,7 +1043,7 @@ mod tests {
 
         let packages = vec![
             live_package(canonical, vec![1, 2, 3]),
-            live_package(legacy, vec![1, 2, 3]),
+            live_package(sibling, vec![1, 2, 3]),
             live_package(separate, vec![4, 5, 6]),
         ];
 
@@ -985,7 +1053,8 @@ mod tests {
     #[test]
     fn test_filter_compatible_key_packages_requires_self_remove() {
         let compatible = compatible_key_package_event("Y29tcGF0aWJsZQ==");
-        let incompatible = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "aW5jb21wYXRpYmxl")
+        let incompatible = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "aW5jb21wYXRpYmxl")
+            .tag(Tag::identifier("maintenance-incompatible-test"))
             .tags(vec![
                 Tag::custom(TagKind::MlsCiphersuite, vec![REQUIRED_MLS_CIPHERSUITE_TAG]),
                 Tag::custom(TagKind::MlsExtensions, vec!["0x000a", "0xf2ee"]),
@@ -1001,6 +1070,19 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].event.id, compatible.id);
+    }
+
+    #[tokio::test]
+    async fn test_filter_compatible_key_packages_accepts_darkmatter_v2() {
+        let keys = Keys::generate();
+        let event =
+            crate::marmot::key_packages::testsupport::adapter_key_package_event(&keys, None, false)
+                .await;
+
+        let filtered = filter_compatible_key_packages(vec![live_package(event.clone(), vec![1])]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event.id, event.id);
     }
 
     #[test]

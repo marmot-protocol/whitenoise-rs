@@ -17,12 +17,96 @@ use crate::perf_instrument;
 pub struct PublishedKeyPackage {
     pub id: i64,
     pub key_package_hash_ref: Vec<u8>,
+    pub key_package_ref: Option<Vec<u8>>,
+    pub key_package_content: Option<String>,
     pub event_id: String,
     pub kind: i64,
     pub d_tag: Option<String>,
+    pub app_components: Vec<String>,
+    pub package_version: i64,
+    pub package_role: PublishedKeyPackageRole,
     pub consumed_at: Option<i64>,
     pub key_material_deleted: bool,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublishedKeyPackageRole {
+    Legacy,
+    LastResort,
+    Rotated,
+}
+
+impl PublishedKeyPackageRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::LastResort => "last_resort",
+            Self::Rotated => "rotated",
+        }
+    }
+}
+
+impl TryFrom<&str> for PublishedKeyPackageRole {
+    type Error = String;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "last_resort" => Ok(Self::LastResort),
+            "rotated" => Ok(Self::Rotated),
+            other => Err(format!("unknown published key package role: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedKeyPackageProtocolData {
+    pub key_package_ref: Option<Vec<u8>>,
+    pub key_package_content: Option<String>,
+    pub app_components: Vec<String>,
+    pub package_version: i64,
+    pub package_role: PublishedKeyPackageRole,
+}
+
+impl PublishedKeyPackageProtocolData {
+    pub fn legacy() -> Self {
+        Self {
+            key_package_ref: None,
+            key_package_content: None,
+            app_components: Vec::new(),
+            package_version: 1,
+            package_role: PublishedKeyPackageRole::Legacy,
+        }
+    }
+
+    pub fn darkmatter_v2_last_resort(
+        key_package_ref: Vec<u8>,
+        key_package_content: String,
+        app_components: Vec<String>,
+    ) -> Self {
+        Self {
+            key_package_ref: Some(key_package_ref),
+            key_package_content: Some(key_package_content),
+            app_components,
+            package_version: 2,
+            package_role: PublishedKeyPackageRole::LastResort,
+        }
+    }
+
+    pub fn darkmatter_v2_rotated(
+        key_package_ref: Vec<u8>,
+        key_package_content: String,
+        app_components: Vec<String>,
+    ) -> Self {
+        Self {
+            key_package_ref: Some(key_package_ref),
+            key_package_content: Some(key_package_content),
+            app_components,
+            package_version: 2,
+            package_role: PublishedKeyPackageRole::Rotated,
+        }
+    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for PublishedKeyPackage
@@ -34,14 +118,35 @@ where
     Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     Option<String>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    Option<Vec<u8>>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
     fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
+        let app_components_json: String = row.try_get("app_components")?;
+        let app_components: Vec<String> =
+            serde_json::from_str(&app_components_json).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "app_components".to_string(),
+                source: Box::new(e),
+            })?;
+        let package_role_raw: String = row.try_get("package_role")?;
+        let package_role =
+            PublishedKeyPackageRole::try_from(package_role_raw.as_str()).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "package_role".to_string(),
+                    source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                }
+            })?;
+
         Ok(Self {
             id: row.try_get("id")?,
             key_package_hash_ref: row.try_get("key_package_hash_ref")?,
+            key_package_ref: row.try_get("key_package_ref")?,
+            key_package_content: row.try_get("key_package_content")?,
             event_id: row.try_get("event_id")?,
             kind: row.try_get("kind")?,
             d_tag: row.try_get("d_tag")?,
+            app_components,
+            package_version: row.try_get("package_version")?,
+            package_role,
             consumed_at: row.try_get("consumed_at")?,
             key_material_deleted: row.try_get("key_material_deleted")?,
             created_at: row.try_get("created_at")?,
@@ -52,8 +157,7 @@ where
 impl PublishedKeyPackage {
     /// Returns the event kind as a typed [`Kind`].
     ///
-    /// Published key package rows store custom Nostr kinds (`30443` and legacy
-    /// `443`).
+    /// Published key package rows store custom Nostr kinds.
     pub fn kind(&self) -> Kind {
         Kind::Custom(u16::try_from(self.kind).unwrap_or_default())
     }
@@ -67,15 +171,43 @@ impl PublishedKeyPackage {
         kind: Kind,
         d_tag: Option<&str>,
     ) -> Result<(), DatabaseError> {
+        Self::create_with_protocol_data(
+            db,
+            hash_ref,
+            event_id,
+            kind,
+            d_tag,
+            PublishedKeyPackageProtocolData::legacy(),
+        )
+        .await
+    }
+
+    /// Records a published key package with protocol-specific metadata.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn create_with_protocol_data(
+        db: &AccountDatabase,
+        hash_ref: &[u8],
+        event_id: &str,
+        kind: Kind,
+        d_tag: Option<&str>,
+        protocol_data: PublishedKeyPackageProtocolData,
+    ) -> Result<(), DatabaseError> {
+        let app_components = serde_json::to_string(&protocol_data.app_components)?;
         sqlx::query(
             "INSERT OR IGNORE INTO published_key_packages
-             (key_package_hash_ref, event_id, kind, d_tag)
-             VALUES (?, ?, ?, ?)",
+             (key_package_hash_ref, key_package_ref, key_package_content, event_id, kind, d_tag,
+              app_components, package_version, package_role)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(hash_ref)
+        .bind(protocol_data.key_package_ref)
+        .bind(protocol_data.key_package_content)
         .bind(event_id)
         .bind(i64::from(kind.as_u16()))
         .bind(d_tag)
+        .bind(app_components)
+        .bind(protocol_data.package_version)
+        .bind(protocol_data.package_role.as_str())
         .execute(&db.inner.pool)
         .await?;
 
@@ -95,7 +227,9 @@ impl PublishedKeyPackage {
         event_id: &str,
     ) -> Result<Option<Self>, DatabaseError> {
         let row = sqlx::query_as::<_, Self>(
-            "SELECT id, key_package_hash_ref, event_id, kind, d_tag,
+            "SELECT id, key_package_hash_ref, key_package_ref, key_package_content,
+                    event_id, kind, d_tag,
+                    app_components, package_version, package_role,
                     consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE event_id = ?",
@@ -112,10 +246,9 @@ impl PublishedKeyPackage {
     /// Single query that covers both NIP-33 canonical-slot needs:
     /// - `d_tag` — reuse the previously-published addressable-slot
     ///   identifier so the next publish replaces the prior canonical event
-    ///   on relays instead of landing in a fresh slot. MDK generates a
-    ///   fresh random `d` tag every call to `create_key_package_for_event`
-    ///   and the MDK docs say "Callers SHOULD store and reuse this value
-    ///   when rotating the KeyPackage."
+    ///   on relays instead of landing in a fresh slot. Without that reuse,
+    ///   rotations can leave older key packages discoverable as current
+    ///   relay state.
     /// - `created_at` (the row's SQLite `unixepoch()` insert timestamp,
     ///   not the Nostr event's `created_at`) — use as a lower bound when
     ///   computing a strictly-monotonic event `created_at` for the next
@@ -130,7 +263,9 @@ impl PublishedKeyPackage {
         kind: Kind,
     ) -> Result<Option<Self>, DatabaseError> {
         let row = sqlx::query_as::<_, Self>(
-            "SELECT id, key_package_hash_ref, event_id, kind, d_tag,
+            "SELECT id, key_package_hash_ref, key_package_ref, key_package_content,
+                    event_id, kind, d_tag,
+                    app_components, package_version, package_role,
                     consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE kind = ?
@@ -151,7 +286,9 @@ impl PublishedKeyPackage {
         hash_ref: &[u8],
     ) -> Result<Vec<Self>, DatabaseError> {
         let rows = sqlx::query_as::<_, Self>(
-            "SELECT id, key_package_hash_ref, event_id, kind, d_tag,
+            "SELECT id, key_package_hash_ref, key_package_ref, key_package_content,
+                    event_id, kind, d_tag,
+                    app_components, package_version, package_role,
                     consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE key_package_hash_ref = ?
@@ -164,12 +301,28 @@ impl PublishedKeyPackage {
         Ok(rows)
     }
 
+    #[cfg(feature = "integration-tests")]
+    pub(crate) async fn find_consumed(db: &AccountDatabase) -> Result<Vec<Self>, DatabaseError> {
+        let rows = sqlx::query_as::<_, Self>(
+            "SELECT id, key_package_hash_ref, key_package_ref, key_package_content,
+                    event_id, kind, d_tag,
+                    app_components, package_version, package_role,
+                    consumed_at, key_material_deleted, created_at
+             FROM published_key_packages
+             WHERE consumed_at IS NOT NULL
+             ORDER BY consumed_at DESC, id DESC",
+        )
+        .fetch_all(&db.inner.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Marks a published key package as consumed (used by a Welcome).
     ///
-    /// Updates `consumed_at` for all rows that share the same `key_package_hash_ref`
-    /// as the given event, so canonical (kind:30443) and legacy (kind:443) twins
-    /// are marked together. Returns `false` if no matching row exists or key
-    /// material is already deleted.
+    /// Updates `consumed_at` for all rows that share the same
+    /// `key_package_hash_ref` as the given event. Returns `false` if no
+    /// matching row exists or key material is already deleted.
     #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn mark_consumed(
         db: &AccountDatabase,
@@ -208,7 +361,9 @@ impl PublishedKeyPackage {
         quiet_period_secs: i64,
     ) -> Result<Vec<Self>, DatabaseError> {
         let rows = sqlx::query_as::<_, Self>(
-            "SELECT id, key_package_hash_ref, event_id, kind, d_tag,
+            "SELECT id, key_package_hash_ref, key_package_ref, key_package_content,
+                    event_id, kind, d_tag,
+                    app_components, package_version, package_role,
                     consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE consumed_at IS NOT NULL
@@ -250,8 +405,8 @@ impl PublishedKeyPackage {
 
     /// Marks all rows sharing a key package hash as deleted.
     ///
-    /// Dual-published kind:30443/kind:443 events point at the same local MLS
-    /// key material, so cleanup must update the whole hash group together.
+    /// Multiple published rows can point at the same local MLS key material,
+    /// so cleanup must update the whole hash group together.
     #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn mark_key_material_deleted_by_hash_ref(
         db: &AccountDatabase,
@@ -317,11 +472,13 @@ impl PublishedKeyPackage {
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::Keys;
+    use nostr_sdk::{Keys, Kind};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
+
+    const OTHER_KEY_PACKAGE_KIND: Kind = Kind::Custom(30000);
 
     async fn setup() -> (AccountDatabase, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -337,9 +494,15 @@ mod tests {
             "CREATE TABLE published_key_packages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key_package_hash_ref BLOB NOT NULL,
+                key_package_ref BLOB NULL,
+                key_package_content TEXT NULL,
                 event_id TEXT NOT NULL UNIQUE,
-                kind INTEGER NOT NULL DEFAULT 443,
+                kind INTEGER NOT NULL DEFAULT 30443,
                 d_tag TEXT NULL,
+                app_components TEXT NOT NULL DEFAULT '[]',
+                package_version INTEGER NOT NULL DEFAULT 1,
+                package_role TEXT NOT NULL DEFAULT 'legacy'
+                    CHECK (package_role IN ('legacy', 'last_resort', 'rotated')),
                 consumed_at INTEGER,
                 key_material_deleted INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -356,7 +519,7 @@ mod tests {
     async fn test_create_and_find_by_event_id() {
         let (db, _dir) = setup().await;
 
-        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND, Some("d-tag"))
             .await
             .unwrap();
 
@@ -365,8 +528,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pkg.event_id, "evt");
-        assert_eq!(pkg.kind, 443);
-        assert!(pkg.d_tag.is_none());
+        assert_eq!(pkg.kind, 30443);
+        assert_eq!(pkg.d_tag.as_deref(), Some("d-tag"));
         assert!(pkg.consumed_at.is_none());
         assert!(!pkg.key_material_deleted);
     }
@@ -375,10 +538,10 @@ mod tests {
     async fn test_create_duplicate_event_id_ignored() {
         let (db, _dir) = setup().await;
 
-        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND, Some("d-tag"))
             .await
             .unwrap();
-        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND, Some("d-tag"))
             .await
             .unwrap();
 
@@ -423,14 +586,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_consumed_updates_timestamp_for_twins() {
+    async fn create_stores_darkmatter_v2_metadata_separately_from_slot() {
+        let (db, _dir) = setup().await;
+        let key_package_ref = vec![0xAB; 32];
+        let app_components = vec![
+            "0x8001".to_string(),
+            "0x8003".to_string(),
+            "0x8004".to_string(),
+        ];
+
+        PublishedKeyPackage::create_with_protocol_data(
+            &db,
+            &[0xCD; 32],
+            "darkmatter-event",
+            MLS_KEY_PACKAGE_KIND,
+            Some("stable-slot"),
+            PublishedKeyPackageProtocolData::darkmatter_v2_last_resort(
+                key_package_ref.clone(),
+                "base64-key-package".to_string(),
+                app_components.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let pkg = PublishedKeyPackage::find_by_event_id(&db, "darkmatter-event")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(pkg.event_id, "darkmatter-event");
+        assert_eq!(pkg.d_tag.as_deref(), Some("stable-slot"));
+        assert_eq!(
+            pkg.key_package_ref.as_deref(),
+            Some(key_package_ref.as_slice())
+        );
+        assert_eq!(
+            pkg.key_package_content.as_deref(),
+            Some("base64-key-package")
+        );
+        assert_eq!(pkg.app_components, app_components);
+        assert_eq!(pkg.package_version, 2);
+        assert_eq!(pkg.package_role, PublishedKeyPackageRole::LastResort);
+    }
+
+    #[tokio::test]
+    async fn test_mark_consumed_updates_timestamp_for_hash_ref_siblings() {
         let (db, _dir) = setup().await;
         let hash = vec![1, 2, 3];
 
         PublishedKeyPackage::create(&db, &hash, "canonical", MLS_KEY_PACKAGE_KIND, Some("d-tag"))
             .await
             .unwrap();
-        PublishedKeyPackage::create(&db, &hash, "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+        PublishedKeyPackage::create(&db, &hash, "sibling", MLS_KEY_PACKAGE_KIND, Some("d-tag-2"))
             .await
             .unwrap();
 
@@ -444,12 +652,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let legacy = PublishedKeyPackage::find_by_event_id(&db, "legacy")
+        let sibling = PublishedKeyPackage::find_by_event_id(&db, "sibling")
             .await
             .unwrap()
             .unwrap();
         assert!(canonical.consumed_at.is_some());
-        assert_eq!(canonical.consumed_at, legacy.consumed_at);
+        assert_eq!(canonical.consumed_at, sibling.consumed_at);
     }
 
     #[tokio::test]
@@ -466,7 +674,7 @@ mod tests {
     async fn test_mark_consumed_returns_false_when_already_deleted() {
         let (db, _dir) = setup().await;
 
-        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+        PublishedKeyPackage::create(&db, &[1, 2, 3], "evt", MLS_KEY_PACKAGE_KIND, Some("d-tag"))
             .await
             .unwrap();
         PublishedKeyPackage::mark_consumed(&db, "evt")
@@ -487,9 +695,15 @@ mod tests {
     async fn test_find_eligible_respects_quiet_period() {
         let (db, _dir) = setup().await;
 
-        PublishedKeyPackage::create(&db, &[1, 2, 3], "recent", MLS_KEY_PACKAGE_KIND_LEGACY, None)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &db,
+            &[1, 2, 3],
+            "recent",
+            MLS_KEY_PACKAGE_KIND,
+            Some("d-tag"),
+        )
+        .await
+        .unwrap();
         PublishedKeyPackage::mark_consumed(&db, "recent")
             .await
             .unwrap();
@@ -524,8 +738,8 @@ mod tests {
 
     /// The outer `WHERE key_material_deleted = 0` filter prevents re-returning
     /// rows the cleanup task has already processed. Without it, the scheduler
-    /// would re-attempt MDK deletion every tick for a hash_ref that's already
-    /// been cleared — wasteful and noisy.
+    /// would re-attempt key-material deletion every tick for a hash_ref that's
+    /// already been cleared.
     #[tokio::test]
     async fn test_find_eligible_excludes_already_deleted_rows() {
         let (db, _dir) = setup().await;
@@ -555,9 +769,15 @@ mod tests {
     async fn test_has_consumed_since_respects_quiet_period() {
         let (db, _dir) = setup().await;
 
-        PublishedKeyPackage::create(&db, &[1, 2, 3], "recent", MLS_KEY_PACKAGE_KIND_LEGACY, None)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &db,
+            &[1, 2, 3],
+            "recent",
+            MLS_KEY_PACKAGE_KIND,
+            Some("d-tag"),
+        )
+        .await
+        .unwrap();
         PublishedKeyPackage::mark_consumed(&db, "recent")
             .await
             .unwrap();
@@ -582,9 +802,15 @@ mod tests {
     async fn test_has_consumed_since_ignores_deleted_key_material() {
         let (db, _dir) = setup().await;
 
-        PublishedKeyPackage::create(&db, &[1, 2, 3], "recent", MLS_KEY_PACKAGE_KIND_LEGACY, None)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &db,
+            &[1, 2, 3],
+            "recent",
+            MLS_KEY_PACKAGE_KIND,
+            Some("d-tag"),
+        )
+        .await
+        .unwrap();
         PublishedKeyPackage::mark_consumed(&db, "recent")
             .await
             .unwrap();
@@ -643,12 +869,12 @@ mod tests {
             .await
             .unwrap();
 
-        // A legacy row inserted later must not bleed into the canonical lookup.
-        PublishedKeyPackage::create(&db, &[3, 3, 3], "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+        // A different kind inserted later must not bleed into the canonical lookup.
+        PublishedKeyPackage::create(&db, &[3, 3, 3], "other", OTHER_KEY_PACKAGE_KIND, None)
             .await
             .unwrap();
         sqlx::query("UPDATE published_key_packages SET created_at = 999 WHERE event_id = ?")
-            .bind("legacy")
+            .bind("other")
             .execute(&db.inner.pool)
             .await
             .unwrap();
@@ -661,24 +887,24 @@ mod tests {
         assert_eq!(canonical.d_tag.as_deref(), Some("d-new"));
         assert_eq!(canonical.created_at, 200);
 
-        let legacy = PublishedKeyPackage::find_latest_by_kind(&db, MLS_KEY_PACKAGE_KIND_LEGACY)
+        let other = PublishedKeyPackage::find_latest_by_kind(&db, OTHER_KEY_PACKAGE_KIND)
             .await
             .unwrap()
-            .expect("legacy row must exist");
-        assert_eq!(legacy.event_id, "legacy");
-        assert_eq!(legacy.created_at, 999);
-        assert!(legacy.d_tag.is_none());
+            .expect("other-kind row must exist");
+        assert_eq!(other.event_id, "other");
+        assert_eq!(other.created_at, 999);
+        assert!(other.d_tag.is_none());
     }
 
     #[tokio::test]
-    async fn test_mark_key_material_deleted_by_hash_ref_marks_twins() {
+    async fn test_mark_key_material_deleted_by_hash_ref_marks_siblings() {
         let (db, _dir) = setup().await;
         let hash = vec![1, 2, 3];
 
         PublishedKeyPackage::create(&db, &hash, "canonical", MLS_KEY_PACKAGE_KIND, Some("d-tag"))
             .await
             .unwrap();
-        PublishedKeyPackage::create(&db, &hash, "legacy", MLS_KEY_PACKAGE_KIND_LEGACY, None)
+        PublishedKeyPackage::create(&db, &hash, "sibling", MLS_KEY_PACKAGE_KIND, Some("d-tag-2"))
             .await
             .unwrap();
 
@@ -687,7 +913,7 @@ mod tests {
             .unwrap();
         assert_eq!(affected, 2);
 
-        for evt in &["canonical", "legacy"] {
+        for evt in &["canonical", "sibling"] {
             let pkg = PublishedKeyPackage::find_by_event_id(&db, evt)
                 .await
                 .unwrap()

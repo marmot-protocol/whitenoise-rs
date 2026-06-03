@@ -20,16 +20,20 @@ pub use self::push::PushOps;
 pub use self::settings::SettingsOps;
 pub use self::social::SocialOps;
 
-use std::sync::{Arc, Weak};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
+use crate::marmot::GroupId;
 use dashmap::DashMap;
-use mdk_core::prelude::{GroupId, MDK};
-use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::NostrSigner;
-use nostr_sdk::{EventId, PublicKey, RelayUrl};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use nostr_sdk::{EventId, Keys, PublicKey, RelayUrl};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio::task::JoinHandle;
 
+use crate::marmot::session::MarmotSession;
+use crate::marmot::storage::WhitenoiseMarmotStorage;
 use crate::nostr_manager::Result as NostrResult;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::account_inbox::AccountInboxPlane;
@@ -75,7 +79,69 @@ impl AccountInboxState {
     }
 }
 
-/// A per-account session holding the account's MDK instance and signer.
+/// Blocks destructive logout cleanup until account-scoped work has released
+/// the session runtimes and storage handles it borrowed.
+#[derive(Default)]
+struct SessionLifecycle {
+    closing: AtomicBool,
+    active_operations: AtomicUsize,
+    idle: Notify,
+}
+
+impl SessionLifecycle {
+    fn enter(self: &Arc<Self>) -> Option<SessionOperationGuard> {
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+
+        self.active_operations.fetch_add(1, Ordering::AcqRel);
+        if self.closing.load(Ordering::Acquire) {
+            self.exit();
+            return None;
+        }
+
+        Some(SessionOperationGuard {
+            lifecycle: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        self.closing.store(true, Ordering::Release);
+        if self.active_operations.load(Ordering::Acquire) == 0 {
+            self.idle.notify_waiters();
+        }
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.active_operations.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn exit(&self) {
+        let previous = self.active_operations.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        if previous == 1 && self.closing.load(Ordering::Acquire) {
+            self.idle.notify_waiters();
+        }
+    }
+}
+
+pub(crate) struct SessionOperationGuard {
+    lifecycle: Arc<SessionLifecycle>,
+}
+
+impl Drop for SessionOperationGuard {
+    fn drop(&mut self) {
+        self.lifecycle.exit();
+    }
+}
+
+/// A per-account session holding account-scoped protocol runtimes and signer.
 ///
 /// `signer` is `None` for restored external-signer accounts whose platform
 /// signer has not yet been re-registered. Operations requiring signing should
@@ -83,7 +149,8 @@ impl AccountInboxState {
 /// `register_external_signer()` fills the slot.
 pub struct AccountSession {
     pub account_pubkey: PublicKey,
-    pub mdk: Arc<MDK<MdkSqliteStorage>>,
+    pub(crate) marmot: Option<Arc<Mutex<MarmotSession>>>,
+    pub(crate) marmot_storage: WhitenoiseMarmotStorage,
     pub(crate) shared: Arc<crate::whitenoise::shared::SharedServices>,
     /// Weak back-reference to the owning `Whitenoise`. Held weakly to avoid a
     /// reference cycle (`Whitenoise` → `AccountManager` → `AccountSession`).
@@ -99,6 +166,7 @@ pub struct AccountSession {
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
+    lifecycle: Arc<SessionLifecycle>,
     pub(crate) ephemeral: relay_handles::AccountEphemeralHandle,
     pub(crate) group_handle: relay_handles::AccountGroupHandle,
     /// Owned inbox plane, `None` until first activation.
@@ -123,10 +191,10 @@ pub struct AccountSession {
 impl AccountSession {
     pub(crate) async fn new(
         account_pubkey: PublicKey,
-        mdk: MDK<MdkSqliteStorage>,
         shared: Arc<crate::whitenoise::shared::SharedServices>,
         whitenoise: Weak<Whitenoise>,
         signer: Option<Arc<dyn NostrSigner>>,
+        marmot_keys: Option<Keys>,
     ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
         let signer: SharedSigner = Arc::new(RwLock::new(signer));
@@ -137,6 +205,29 @@ impl AccountSession {
         );
         let group_handle =
             relay_handles::AccountGroupHandle::new(account_pubkey, shared.relay_control.clone());
+        let marmot_storage_path =
+            Account::marmot_storage_path(&account_pubkey, &shared.config.data_dir);
+        let marmot_db_key_id = Account::marmot_db_key_id(&account_pubkey);
+        let marmot_storage = WhitenoiseMarmotStorage::open_for_account(
+            marmot_storage_path,
+            &shared.config.keyring_service_id,
+            &marmot_db_key_id,
+        )?;
+        let (marmot, marmot_self_id) = match marmot_keys {
+            Some(keys) => {
+                let marmot_session =
+                    MarmotSession::open_local(account_pubkey, marmot_storage.clone(), keys)?;
+                let self_id = marmot_session.self_id();
+                let session_account_pubkey = marmot_session.account_pubkey();
+                if session_account_pubkey != account_pubkey {
+                    return Err(WhitenoiseError::InvalidInput(
+                        "Marmot session account pubkey does not match account session".to_string(),
+                    ));
+                }
+                (Some(Arc::new(Mutex::new(marmot_session))), Some(self_id))
+            }
+            None => (None, None),
+        };
 
         let db_path = account_db_path(&shared.config.data_dir, &account_pubkey);
         let account_db = Arc::new(AccountDatabase::new(account_pubkey, db_path).await?);
@@ -148,9 +239,10 @@ impl AccountSession {
             AccountRepositories::new(account_pubkey, shared.database.clone(), account_db.clone())
                 .await?;
 
-        Ok(Self {
+        let session = Self {
             account_pubkey,
-            mdk: Arc::new(mdk),
+            marmot,
+            marmot_storage,
             shared,
             whitenoise,
             repos,
@@ -158,6 +250,7 @@ impl AccountSession {
             signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
             cancellation,
+            lifecycle: Arc::new(SessionLifecycle::default()),
             ephemeral,
             group_handle,
             inbox: RwLock::new(None),
@@ -167,24 +260,43 @@ impl AccountSession {
             token_response_semaphore: Arc::new(Semaphore::new(
                 crate::whitenoise::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,
             )),
-        })
+        };
+        tracing::debug!(
+            target: "whitenoise::session",
+            account_pubkey = %session.account_pubkey,
+            marmot_initialized = session.marmot.is_some(),
+            marmot_self_id = marmot_self_id.as_ref().map(ToString::to_string).as_deref(),
+            "Account session initialized"
+        );
+
+        Ok(session)
     }
 
-    /// Build a session from a persisted account, loading MDK and (for local
-    /// accounts) the signer from the secrets store.
+    /// Build a session from a persisted account.
+    ///
+    /// Legacy MLS storage is intentionally not opened during restore. Active
+    /// protocol state is loaded from Marmot storage only.
     pub(crate) async fn from_account(account: &Account, wn: &Arc<Whitenoise>) -> Result<Self> {
-        let mdk = wn.create_mdk_for_account(account.pubkey)?;
         let signer = if account.has_local_key() {
             Some(wn.get_signer_for_account(account)?)
         } else {
             None
         };
+        let marmot_keys = if account.has_local_key() {
+            Some(
+                wn.shared
+                    .secrets_store
+                    .get_nostr_keys_for_pubkey(&account.pubkey)?,
+            )
+        } else {
+            None
+        };
         Self::new(
             account.pubkey,
-            mdk,
             wn.shared.clone(),
             Arc::downgrade(wn),
             signer,
+            marmot_keys,
         )
         .await
     }
@@ -215,6 +327,10 @@ impl AccountSession {
         self.signer.try_read().ok().and_then(|g| g.clone())
     }
 
+    pub(crate) fn has_marmot_session(&self) -> bool {
+        self.marmot.is_some()
+    }
+
     /// Subscribe to the cancellation channel.
     pub fn subscribe_cancellation(&self) -> watch::Receiver<bool> {
         self.cancellation.subscribe()
@@ -222,7 +338,16 @@ impl AccountSession {
 
     /// Signal cancellation to all background tasks associated with this session.
     pub(crate) fn cancel(&self) {
+        self.lifecycle.close();
         let _ = self.cancellation.send(true);
+    }
+
+    pub(crate) fn begin_operation(&self) -> Option<SessionOperationGuard> {
+        self.lifecycle.enter()
+    }
+
+    pub(crate) async fn wait_for_operations(&self) {
+        self.lifecycle.wait_until_idle().await;
     }
 
     /// Return a lightweight view for message read/search operations.
@@ -302,8 +427,6 @@ impl AccountSession {
 
         use rand::Rng;
 
-        use crate::whitenoise::push_notifications::respond_to_token_request_with;
-
         let key = (group_id.clone(), request_event_id);
         if self
             .pending_push_token_responses
@@ -328,10 +451,9 @@ impl AccountSession {
             }
         };
 
-        let mdk = Arc::clone(&self.mdk);
-        let account_db = Arc::clone(&self.account_db);
+        let response_context = push::PushResponseContext::from_session(self);
         let pending = Arc::clone(&self.pending_push_token_responses);
-        let relay_control = Arc::clone(self.group_handle.relay_control());
+        let lifecycle = Arc::clone(&self.lifecycle);
         let account_pubkey = self.account_pubkey;
         let delay_ms = ::rand::rng().random_range(1_000u64..=3_000);
         let mut cancel_rx = self.cancellation.subscribe();
@@ -351,15 +473,13 @@ impl AccountSession {
                 return;
             }
 
-            if let Err(error) = respond_to_token_request_with(
-                &mdk,
-                &account_db.inner.pool,
-                &relay_control,
-                &account_pubkey,
-                &group_id,
-                request_event_id,
-            )
-            .await
+            let Some(_operation) = lifecycle.enter() else {
+                return;
+            };
+
+            if let Err(error) = response_context
+                .respond_to_token_request(&group_id, request_event_id)
+                .await
             {
                 tracing::warn!(
                     target: "whitenoise::push_notifications",
@@ -631,11 +751,15 @@ impl AccountManager {
         };
 
         let mut ok_count = 0usize;
+        let mut marmot_count = 0usize;
         let mut err_count = 0usize;
 
         for account in &accounts {
             match AccountSession::from_account(account, wn).await {
                 Ok(session) => {
+                    if session.has_marmot_session() {
+                        marmot_count += 1;
+                    }
                     self.insert_session(Arc::new(session));
                     ok_count += 1;
                 }
@@ -653,8 +777,9 @@ impl AccountManager {
 
         tracing::info!(
             target: "whitenoise::session",
-            "Restored {} sessions ({} failed)",
+            "Restored {} sessions ({} Marmot-ready, {} failed)",
             ok_count,
+            marmot_count,
             err_count,
         );
 
@@ -714,7 +839,6 @@ pub(crate) mod test_helpers {
 
     use super::*;
     use crate::relay_control::RelayControlPlane;
-    use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
     use crate::whitenoise::event_tracker::WhitenoiseEventTracker;
     use crate::whitenoise::message_aggregator::MessageAggregator;
@@ -740,7 +864,8 @@ pub(crate) mod test_helpers {
 
     /// Build a minimal `AccountSession` for tests that don't exercise relay handles.
     pub async fn test_session(pubkey: PublicKey) -> Arc<AccountSession> {
-        let mdk = create_mdk(pubkey);
+        Whitenoise::initialize_mock_keyring_store();
+
         let db = test_db().await;
 
         // Insert the account row so AccountFollowsRepo can resolve the account id.
@@ -748,9 +873,31 @@ pub(crate) mod test_helpers {
 
         let shared = test_shared(db).await;
         Arc::new(
-            AccountSession::new(pubkey, mdk, shared, Weak::new(), None)
+            AccountSession::new(pubkey, shared, Weak::new(), None, None)
                 .await
                 .expect("create test session"),
+        )
+    }
+
+    pub async fn test_session_with_marmot_keys(keys: Keys) -> Arc<AccountSession> {
+        Whitenoise::initialize_mock_keyring_store();
+
+        let pubkey = keys.public_key();
+        let db = test_db().await;
+
+        insert_test_account(&db, &pubkey).await;
+
+        let shared = test_shared(db).await;
+        Arc::new(
+            AccountSession::new(
+                pubkey,
+                shared,
+                Weak::new(),
+                Some(Arc::new(keys.clone())),
+                Some(keys),
+            )
+            .await
+            .expect("create test session"),
         )
     }
 
@@ -793,15 +940,20 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Arc;
 
-    use mdk_core::prelude::GroupId;
+    use crate::marmot::GroupId;
     use nostr_sdk::{EventId, Keys};
 
     use super::AccountManager;
+    use super::AccountSession;
+    use super::SessionLifecycle;
     use super::test_helpers::test_session;
+    use crate::whitenoise::accounts::Account;
     use crate::whitenoise::accounts::DiscoveredRelayLists;
     use crate::whitenoise::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS;
+    use crate::whitenoise::test_utils::create_mock_whitenoise;
 
     fn test_pubkey() -> nostr_sdk::PublicKey {
         Keys::generate().public_key()
@@ -813,6 +965,90 @@ mod tests {
             inbox: None,
             key_package: None,
         }
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_waits_until_active_operation_finishes() {
+        let lifecycle = Arc::new(SessionLifecycle::default());
+        let operation = lifecycle.enter().unwrap();
+
+        lifecycle.close();
+
+        let wait = lifecycle.wait_until_idle();
+        tokio::pin!(wait);
+        tokio::select! {
+            biased;
+            _ = &mut wait => panic!("lifecycle reported idle while an operation was active"),
+            _ = std::future::ready(()) => {}
+        }
+
+        drop(operation);
+        wait.await;
+    }
+
+    #[test]
+    fn session_lifecycle_rejects_operations_after_close() {
+        let lifecycle = Arc::new(SessionLifecycle::default());
+
+        lifecycle.close();
+
+        assert!(lifecycle.enter().is_none());
+    }
+
+    #[tokio::test]
+    async fn from_account_does_not_create_obsolete_mls_artifacts_when_absent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let (account, _) = Account::new(&whitenoise, Some(keys.clone())).await.unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
+        let obsolete_storage_path = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+            &account.pubkey,
+            &whitenoise.config().data_dir,
+        );
+
+        assert!(!obsolete_storage_path.exists());
+
+        let _session = AccountSession::from_account(&account, &whitenoise)
+            .await
+            .unwrap();
+
+        assert!(
+            !obsolete_storage_path.exists(),
+            "restoring a Darkmatter-capable account must not create obsolete MLS storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_account_does_not_open_obsolete_mls_storage_on_restore() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let (account, _) = Account::new(&whitenoise, Some(keys.clone())).await.unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
+        let obsolete_storage_path = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+            &account.pubkey,
+            &whitenoise.config().data_dir,
+        );
+
+        fs::create_dir_all(&obsolete_storage_path).unwrap();
+
+        AccountSession::from_account(&account, &whitenoise)
+            .await
+            .unwrap();
+
+        assert!(
+            obsolete_storage_path.exists(),
+            "restoring a Darkmatter-capable account must not mutate obsolete MLS storage"
+        );
     }
 
     // ── AccountManager: session CRUD ─────────────────────────────────

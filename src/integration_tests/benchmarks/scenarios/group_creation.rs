@@ -15,7 +15,7 @@ const DEFAULT_MEMBERS_PER_GROUP: usize = 2;
 ///
 /// This scenario benchmarks the MLS group creation flow, which includes:
 /// - Fetching key packages for each member from relays
-/// - Creating the MLS group via MDK
+/// - Creating the MLS group through the WhiteNoise group service
 /// - Publishing welcome messages to each member's inbox relays
 /// - Creating group information and account-group records
 /// - Refreshing account subscriptions

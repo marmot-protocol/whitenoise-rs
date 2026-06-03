@@ -328,8 +328,8 @@ async fn drain_notifications(
 
 #[cfg(test)]
 mod tests {
+    use crate::marmot::GroupId;
     use chrono::Utc;
-    use mdk_core::prelude::GroupId;
     use nostr_sdk::Keys;
 
     use super::*;

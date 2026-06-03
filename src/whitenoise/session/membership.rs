@@ -5,8 +5,8 @@
 //! acceptance/decline, read markers, pinning, archiving, muting, departure
 //! tracking, DM peer lookup, and chat clearing.
 
+use crate::marmot::GroupId;
 use chrono::Utc;
-use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
 use sqlx::SqlitePool;
 
@@ -15,6 +15,7 @@ use crate::whitenoise::accounts_groups::{AccountGroup, MuteDuration};
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
 use crate::whitenoise::database::Database;
+use crate::whitenoise::database::marmot_messages::MarmotMessageProjection;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::group_state_streaming::GroupStateUpdate;
 
@@ -427,11 +428,10 @@ impl<'a> MembershipOpsForGroup<'a> {
             );
         }
 
-        // Delete MDK message state (best-effort).
-        if let Err(e) = self.session.mdk.delete_messages_for_group(self.group_id) {
+        if let Err(e) = MarmotMessageProjection::delete_by_group(self.group_id, self.db()).await {
             tracing::warn!(
                 target: "whitenoise::session::membership",
-                "Failed to delete MDK messages during clear_chat: {e}"
+                "Failed to delete Marmot message projections during clear_chat: {e}"
             );
         }
 

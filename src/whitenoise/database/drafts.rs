@@ -3,8 +3,8 @@
 //! Lives in the per-account SQLite file. The owning account is implicit —
 //! it's whichever account owns the file.
 
+use crate::marmot::GroupId;
 use chrono::Utc;
-use mdk_core::prelude::GroupId;
 use nostr_sdk::EventId;
 
 use super::DatabaseError;

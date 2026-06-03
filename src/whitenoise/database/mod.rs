@@ -3,7 +3,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use mdk_sqlite_storage::EncryptionConfig;
 use sqlx::{
     ConnectOptions, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -12,7 +11,6 @@ use thiserror::Error;
 
 pub mod account;
 pub mod account_db;
-mod encryption;
 
 pub mod account_settings;
 pub mod accounts;
@@ -22,8 +20,11 @@ pub mod app_settings;
 pub mod cached_graph_users;
 pub mod content_search;
 pub mod drafts;
+mod encryption;
 pub mod group_information;
 pub mod group_push_tokens;
+pub(crate) mod keyring;
+pub(crate) mod marmot_messages;
 pub mod media_files;
 pub mod mute_list;
 pub mod processed_events;
@@ -40,6 +41,9 @@ pub mod users;
 pub mod utils;
 
 pub mod rust_migrations;
+
+use self::keyring::EncryptionConfig;
+use crate::marmot::GroupId;
 
 pub(crate) const WHITENOISE_DB_KEY_ID: &str = encryption::WHITENOISE_DB_KEY_ID;
 
@@ -349,7 +353,7 @@ impl Database {
     /// deleted.
     pub(crate) async fn try_cleanup_cleared_messages(
         &self,
-        mls_group_id: &mdk_core::prelude::GroupId,
+        mls_group_id: &GroupId,
         cleared_at_ms: Option<i64>,
     ) -> Result<u64, DatabaseError> {
         let Some(threshold) = cleared_at_ms else {
@@ -360,7 +364,7 @@ impl Database {
 
     async fn try_cleanup_cleared_messages_inner(
         &self,
-        mls_group_id: &mdk_core::prelude::GroupId,
+        mls_group_id: &GroupId,
         threshold: i64,
     ) -> Result<u64, DatabaseError> {
         let result = sqlx::query(
@@ -384,7 +388,7 @@ impl Database {
     /// cascading off it inside the shared DB).
     pub(crate) async fn delete_shared_group_data(
         &self,
-        mls_group_id: &mdk_core::prelude::GroupId,
+        mls_group_id: &GroupId,
         is_last_account: bool,
     ) -> Result<(), DatabaseError> {
         if is_last_account {
@@ -396,7 +400,7 @@ impl Database {
 
     async fn delete_shared_group_data_inner(
         &self,
-        mls_group_id: &mdk_core::prelude::GroupId,
+        mls_group_id: &GroupId,
     ) -> Result<(), DatabaseError> {
         sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
             .bind(mls_group_id.as_slice())
@@ -454,9 +458,9 @@ mod tests {
         },
     };
 
-    use mdk_sqlite_storage::keyring;
     use tempfile::TempDir;
 
+    use super::keyring;
     use super::rust_migrations;
     use crate::whitenoise::Whitenoise;
 
@@ -830,6 +834,11 @@ mod tests {
             .await
             .expect("Failed to run migrations");
         setup_account(&db, &pubkey).await;
+        sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&db.pool)
+            .await
+            .expect("Failed to checkpoint encrypted database");
+        db.pool.close().await;
         drop(db);
         fs::rename(&db_path, &temp_path).expect("Failed to move encrypted database to temp");
 
@@ -1354,7 +1363,7 @@ mod tests {
     }
 
     /// Sets up a group_information row so FK constraints are satisfied.
-    async fn setup_group(db: &Database, group_id: &mdk_core::prelude::GroupId) {
+    async fn setup_group(db: &Database, group_id: &GroupId) {
         let now = chrono::Utc::now().timestamp_millis();
         sqlx::query(
             "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
@@ -1400,7 +1409,7 @@ mod tests {
     /// Inserts a minimal aggregated_messages row.
     async fn setup_message(
         db: &Database,
-        group_id: &mdk_core::prelude::GroupId,
+        group_id: &GroupId,
         message_id_hex: &str,
         created_at_ms: i64,
     ) {
@@ -1421,7 +1430,7 @@ mod tests {
     }
 
     /// Returns the message count for a group.
-    async fn message_count(db: &Database, group_id: &mdk_core::prelude::GroupId) -> i64 {
+    async fn message_count(db: &Database, group_id: &GroupId) -> i64 {
         let (count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM aggregated_messages WHERE mls_group_id = ?")
                 .bind(group_id.as_slice())
@@ -1434,7 +1443,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_cleanup_cleared_messages_deletes_when_all_accounts_cleared() {
         let (db, _temp) = create_test_db().await;
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[1; 32]);
+        let group_id = GroupId::from_slice(&[1; 32]);
 
         setup_group(&db, &group_id).await;
         setup_aggregated_messages_table(&db).await;
@@ -1455,7 +1464,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_cleanup_cleared_messages_respects_min() {
         let (db, _temp) = create_test_db().await;
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[2; 32]);
+        let group_id = GroupId::from_slice(&[2; 32]);
 
         setup_group(&db, &group_id).await;
         setup_aggregated_messages_table(&db).await;
@@ -1478,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_cleanup_cleared_messages_noop_when_not_all_cleared() {
         let (db, _temp) = create_test_db().await;
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[3; 32]);
+        let group_id = GroupId::from_slice(&[3; 32]);
 
         setup_group(&db, &group_id).await;
         setup_aggregated_messages_table(&db).await;
@@ -1499,7 +1508,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_shared_group_data_last_account() {
         let (db, _temp) = create_test_db().await;
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[4; 32]);
+        let group_id = GroupId::from_slice(&[4; 32]);
 
         setup_group(&db, &group_id).await;
 
@@ -1521,7 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_shared_group_data_not_last_account() {
         let (db, _temp) = create_test_db().await;
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[5; 32]);
+        let group_id = GroupId::from_slice(&[5; 32]);
 
         setup_group(&db, &group_id).await;
 

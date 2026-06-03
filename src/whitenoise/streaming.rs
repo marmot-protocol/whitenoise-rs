@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use nostr_sdk::PublicKey;
 use tokio::sync::broadcast;
 
+use crate::marmot::GroupId;
 use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
@@ -43,7 +44,7 @@ impl Whitenoise {
     pub async fn subscribe_to_group_messages(
         &self,
         account_pubkey: &nostr_sdk::PublicKey,
-        group_id: &mdk_core::prelude::GroupId,
+        group_id: &GroupId,
         limit: Option<u32>,
     ) -> Result<message_streaming::GroupMessageSubscription> {
         // 1. Subscribe FIRST to capture any concurrent updates that arrive during the fetch.
@@ -161,7 +162,7 @@ impl Whitenoise {
     pub async fn subscribe_to_group_state(
         &self,
         account_pubkey: &PublicKey,
-        group_id: &mdk_core::prelude::GroupId,
+        group_id: &GroupId,
     ) -> Result<group_state_streaming::GroupStateSubscription> {
         let session = self.require_session(account_pubkey)?;
         AccountGroup::find_by_account_and_group(
@@ -291,11 +292,10 @@ impl Whitenoise {
             .active()
             .await?;
 
-        let mut items_map: HashMap<mdk_core::prelude::GroupId, chat_list::ChatListItem> =
-            fetched_items
-                .into_iter()
-                .map(|item| (item.mls_group_id.clone(), item))
-                .collect();
+        let mut items_map: HashMap<GroupId, chat_list::ChatListItem> = fetched_items
+            .into_iter()
+            .map(|item| (item.mls_group_id.clone(), item))
+            .collect();
 
         // Drain updates that arrived during fetch. A ChatArchiveChanged update could
         // land here with archived_at set — filter it out so only active items remain.
@@ -351,11 +351,10 @@ impl Whitenoise {
             .archived()
             .await?;
 
-        let mut items_map: HashMap<mdk_core::prelude::GroupId, chat_list::ChatListItem> =
-            fetched_items
-                .into_iter()
-                .map(|item| (item.mls_group_id.clone(), item))
-                .collect();
+        let mut items_map: HashMap<GroupId, chat_list::ChatListItem> = fetched_items
+            .into_iter()
+            .map(|item| (item.mls_group_id.clone(), item))
+            .collect();
 
         // Drain updates that arrived during fetch. A ChatArchiveChanged update could
         // land here with archived_at cleared — filter it out so only archived items remain.

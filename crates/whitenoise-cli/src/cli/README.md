@@ -57,8 +57,8 @@ need explicit setup for `gnome-keyring-daemon` and the user D-Bus environment.
 Other Secret Service providers can work if they own `org.freedesktop.secrets`.
 KeePassXC works when the app and database are running and Secret Service
 integration is enabled. KWallet/KSecretService is not recommended for Whitenoise
-yet because current MDK database keys are binary secrets, and KWallet-backed
-Secret Service implementations can require UTF-8 encoded values.
+yet because database keys are binary secrets, and KWallet-backed Secret Service
+implementations can require UTF-8 encoded values.
 
 ## Commands
 

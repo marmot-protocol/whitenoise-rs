@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 
-use mdk_core::prelude::message_types::Message;
 use nostr_sdk::prelude::*;
 
 use super::emoji_utils;
 use super::types::{AggregatorConfig, ChatMessage, EmojiReaction, ProcessingError, UserReaction};
+use crate::marmot::Message;
 
 /// Process a reaction message and update the target message's reaction summary
 pub fn process_reaction(
@@ -159,11 +159,10 @@ pub(crate) fn add_reaction_to_message(
 
 #[cfg(test)]
 mod tests {
-    use mdk_core::prelude::GroupId;
-    use mdk_core::prelude::message_types::{Message, MessageState};
     use nostr_sdk::UnsignedEvent;
 
     use super::*;
+    use crate::marmot::{GroupId, Message, MessageState};
     use crate::whitenoise::message_aggregator::types::ReactionSummary;
 
     fn create_chat_message(id: &str) -> ChatMessage {

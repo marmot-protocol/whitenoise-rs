@@ -42,8 +42,8 @@ impl Default for ChatListStreamManager {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::marmot::GroupId;
     use chrono::Utc;
-    use mdk_core::prelude::GroupId;
     use nostr_sdk::Keys;
 
     use super::*;

@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::benchmarks::test_cases::AddMembersBenchmark;
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkScenario, BenchmarkTestCase};
 use crate::integration_tests::core::ScenarioContext;
+use crate::marmot::GroupConfig;
 
 /// Number of members added per iteration.
 const MEMBERS_PER_ITERATION: usize = 1;
@@ -73,7 +73,7 @@ impl BenchmarkScenario for AddMembersPerformanceBenchmark {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Create the group
-        let group_config = NostrGroupConfigData::new(
+        let group_config = GroupConfig::new(
             "Add Members Benchmark Group".to_string(),
             "Benchmark group for add_members_to_group performance".to_string(),
             None,

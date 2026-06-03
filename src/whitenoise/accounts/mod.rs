@@ -4,15 +4,13 @@ mod login_multistep;
 mod setup;
 
 use chrono::{DateTime, Utc};
-use mdk_core::prelude::*;
-use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::RelayType;
@@ -29,8 +27,6 @@ use crate::whitenoise::shared::SharedServices;
 use crate::whitenoise::user_streaming::{UserUpdate, UserUpdateTrigger};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
-
-static MDK_STORAGE_INIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// The type of account authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -67,8 +63,10 @@ impl FromStr for AccountType {
 /// The status of a login attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum LoginStatus {
-    /// Login completed successfully. Account is fully activated with relay lists,
-    /// subscriptions, and a published key package.
+    /// Login completed successfully. Account is activated with relay lists and
+    /// subscriptions. Key package publication is attempted as part of login,
+    /// but external-signer accounts may defer it until account-proof signing is
+    /// supported by the signer backend.
     Complete,
     /// Relay lists were not found on the network. The account exists in a partial
     /// state and the caller must resolve relay lists before login can complete.
@@ -223,14 +221,8 @@ pub enum AccountError {
     #[error("Failed to initialize Nostr manager: {0}")]
     NostrManagerError(#[from] NostrManagerError),
 
-    #[error("Nostr MLS error: {0}")]
-    NostrMlsError(#[from] mdk_core::Error),
-
-    #[error("Nostr MLS SQLite storage error: {0}")]
-    NostrMlsSqliteStorageError(#[from] mdk_sqlite_storage::error::Error),
-
-    #[error("Nostr MLS not initialized")]
-    NostrMlsNotInitialized,
+    #[error("Filesystem error: {0}")]
+    Filesystem(#[from] std::io::Error),
 
     #[error("Whitenoise not initialized")]
     WhitenoiseNotInitialized,
@@ -556,46 +548,15 @@ impl Account {
         Ok(descriptor.url.to_string())
     }
 
-    pub(crate) fn create_mdk(
-        pubkey: PublicKey,
-        data_dir: &Path,
-        keyring_service_id: &str,
-    ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
-        let mls_storage_dir = Self::mdk_storage_path(&pubkey, data_dir);
-        let db_key_id = Self::mdk_db_key_id(&pubkey);
-        let storage = {
-            let _storage_init_guard = MDK_STORAGE_INIT_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            MdkSqliteStorage::new(mls_storage_dir, keyring_service_id, &db_key_id)?
-        };
-        Ok(MDK::new(storage))
+    pub(crate) fn marmot_storage_path(pubkey: &PublicKey, data_dir: &Path) -> PathBuf {
+        data_dir
+            .join("marmot")
+            .join(pubkey.to_hex())
+            .join("session.sqlite")
     }
 
-    pub(crate) fn mdk_storage_path(pubkey: &PublicKey, data_dir: &Path) -> PathBuf {
-        data_dir.join("mls").join(pubkey.to_hex())
-    }
-
-    pub(crate) fn mdk_db_key_id(pubkey: &PublicKey) -> String {
-        format!("mdk.db.key.{}", pubkey.to_hex())
-    }
-}
-
-#[cfg(test)]
-pub mod test_utils {
-    use mdk_core::MDK;
-    use mdk_sqlite_storage::MdkSqliteStorage;
-    use nostr_sdk::PublicKey;
-    use std::path::PathBuf;
-    use tempfile::TempDir;
-
-    pub fn data_dir() -> PathBuf {
-        TempDir::new().unwrap().path().to_path_buf()
-    }
-
-    pub fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
-        super::super::Whitenoise::initialize_mock_keyring_store();
-        super::Account::create_mdk(pubkey, &data_dir(), "com.whitenoise.test").unwrap()
+    pub(crate) fn marmot_db_key_id(pubkey: &PublicKey) -> String {
+        format!("marmot.db.key.{}", pubkey.to_hex())
     }
 }
 
@@ -607,8 +568,6 @@ mod tests {
     use crate::whitenoise::user_streaming::UserUpdateTrigger;
     use nostr_sdk::prelude::*;
     use nostr_sdk::{Metadata, RelayUrl};
-    use std::sync::Arc;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_effective_inbox_relays_returns_inbox_when_present() {
@@ -1266,53 +1225,6 @@ mod tests {
             .unwrap();
         assert_eq!(all_nip65.len(), 1);
         assert_eq!(all_nip65[0].url, url1);
-    }
-
-    #[test]
-    fn test_create_mdk_success() {
-        crate::whitenoise::Whitenoise::initialize_mock_keyring_store();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let pubkey = nostr_sdk::Keys::generate().public_key();
-        let result = Account::create_mdk(pubkey, temp_dir.path(), "com.whitenoise.test");
-        assert!(result.is_ok(), "create_mdk failed: {:?}", result.err());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_create_mdk_for_multiple_accounts_does_not_deadlock() {
-        crate::whitenoise::Whitenoise::initialize_mock_keyring_store();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let data_dir = Arc::new(temp_dir.path().to_path_buf());
-
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let data_dir = Arc::clone(&data_dir);
-            let pubkey = nostr_sdk::Keys::generate().public_key();
-            handles.push(tokio::task::spawn_blocking(move || {
-                Account::create_mdk(pubkey, data_dir.as_path(), "com.whitenoise.test.concurrent")
-                    .map(|_| ())
-                    .map_err(|err| err.to_string())
-            }));
-        }
-
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
-            for handle in handles {
-                handle.await.unwrap().unwrap();
-            }
-        })
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "concurrent create_mdk calls timed out; possible deadlock"
-        );
-    }
-
-    #[test]
-    fn test_create_mdk_with_invalid_path() {
-        let pubkey = nostr_sdk::Keys::generate().public_key();
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let result = Account::create_mdk(pubkey, file.path(), "test.service");
-        assert!(result.is_err());
     }
 
     #[tokio::test]

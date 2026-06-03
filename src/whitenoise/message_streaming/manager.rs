@@ -2,7 +2,7 @@
 //!
 //! Thin wrapper around [`BroadcastHub`] keyed by group ID.
 
-use mdk_core::prelude::GroupId;
+use crate::marmot::GroupId;
 use tokio::sync::broadcast;
 
 use super::types::MessageUpdate;

@@ -1,7 +1,7 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::marmot::GroupConfig;
 use async_trait::async_trait;
-use mdk_core::prelude::*;
 
 /// Creates a DirectMessage group between two accounts.
 /// DM groups have an empty name and both participants are admins.
@@ -46,7 +46,7 @@ impl TestCase for CreateDmTestCase {
             .groups()
             .create_group(
                 vec![other.pubkey],
-                NostrGroupConfigData::new(
+                GroupConfig::new(
                     String::new(),
                     String::new(),
                     None,

@@ -36,7 +36,7 @@ const NETWORK_FETCH_RETRIES: usize = 3;
 /// fetches each group's member list from the local MLS store, and returns a
 /// deduplicated set of member pubkeys (excluding the searcher).
 ///
-/// This is purely local data (MLS/MDK) — no network fetch required.
+/// This is purely local account and group data; no network fetch is required.
 #[perf_instrument("user_search")]
 pub(super) async fn get_group_co_member_pubkeys(
     whitenoise: &Whitenoise,
@@ -633,6 +633,7 @@ async fn fetch_events_with_retries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::marmot::GroupId;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
     use nostr_sdk::{EventBuilder, Keys, Tag, Timestamp};
 
@@ -1192,7 +1193,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // Insert a pending group (user_confirmation = None)
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[1, 2, 3]);
+        let group_id = GroupId::from_slice(&[1, 2, 3]);
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         AccountGroup::find_or_create(
             &account.pubkey,
@@ -1214,7 +1215,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // Insert and decline a group
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[4, 5, 6]);
+        let group_id = GroupId::from_slice(&[4, 5, 6]);
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let (ag, _) = AccountGroup::find_or_create(
             &account.pubkey,
@@ -1240,7 +1241,7 @@ mod tests {
 
         // Insert and accept a group — group_members() will fail because
         // mock whitenoise has no MLS infrastructure, exercising the error branch
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[7, 8, 9]);
+        let group_id = GroupId::from_slice(&[7, 8, 9]);
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let (ag, _) = AccountGroup::find_or_create(
             &account.pubkey,

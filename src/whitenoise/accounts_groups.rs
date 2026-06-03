@@ -1,17 +1,22 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::marmot::GroupId;
+use cgka_traits::types::GroupId as MarmotGroupId;
 use chrono::{DateTime, Duration, Utc};
-use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-
-use crate::perf_instrument;
 use sqlx::SqlitePool;
 
+use crate::perf_instrument;
+
 use crate::whitenoise::{
-    Whitenoise, accounts::Account, chat_list_streaming::ChatListUpdateTrigger,
-    database::media_files::MediaFile, error::WhitenoiseError, group_information::GroupInformation,
+    Whitenoise,
+    accounts::Account,
+    chat_list_streaming::ChatListUpdateTrigger,
+    database::{marmot_messages::MarmotMessageProjection, media_files::MediaFile},
+    error::WhitenoiseError,
+    group_information::GroupInformation,
     push_notifications::GroupPushToken,
 };
 
@@ -284,7 +289,7 @@ impl AccountGroup {
     /// Finds the latest DM group between the given account and peer.
     ///
     /// Uses the persisted `dm_peer_pubkey` column for an efficient single-query
-    /// lookup without requiring MLS/MDK calls. Returns the group ID of the most
+    /// lookup without requiring protocol runtime calls. Returns the group ID of the most
     /// recently created visible DM group with this peer, or `None` if none exists.
     #[perf_instrument("account_groups")]
     pub async fn find_latest_dm_group_with_peer(
@@ -416,8 +421,7 @@ impl Whitenoise {
             return Err(WhitenoiseError::GroupNotFound);
         };
 
-        // 3. Pre-build the ChatListItem while data still exists
-        //    (MDK state and DB data are needed to build the item)
+        // 3. Pre-build the ChatListItem while account DB data still exists.
         let chat_list_item = session.chat_list().build_item(group_id).await;
 
         // 4. Delete per-account accounts_groups row
@@ -432,6 +436,7 @@ impl Whitenoise {
             &session.account_db.inner,
         )
         .await?;
+        MarmotMessageProjection::delete_by_group(group_id, &session.account_db.inner).await?;
 
         // 4a. Check if any other account still has this group.
         // We can only inspect active sessions, not every persisted account.
@@ -485,22 +490,20 @@ impl Whitenoise {
             );
         }
 
-        // 5. Delete MDK group state for this account (best-effort)
-        match self.create_mdk_for_account(account.pubkey) {
-            Ok(mdk) => {
-                if let Err(e) = mdk.delete_group(group_id) {
-                    tracing::warn!(
-                        target: "whitenoise::accounts_groups",
-                        "Failed to delete MDK group during delete_chat: {}",
-                        e
-                    );
-                }
-            }
-            Err(e) => {
+        // 5. Delete local Marmot protocol state for this account.
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        match session
+            .marmot_storage
+            .delete_group_state_if_exists(&marmot_group_id)
+        {
+            Ok(_) => {}
+            Err(error) => {
                 tracing::warn!(
                     target: "whitenoise::accounts_groups",
-                    "Failed to create MDK for delete_chat group cleanup: {}",
-                    e
+                    account = %account.pubkey.to_hex(),
+                    group = %hex::encode(group_id.as_slice()),
+                    error = %error,
+                    "Failed to delete Marmot group state during delete_chat"
                 );
             }
         }
@@ -554,18 +557,6 @@ impl Whitenoise {
                 continue;
             }
 
-            let mdk = match self.create_mdk_for_account(session.account_pubkey) {
-                Ok(mdk) => mdk,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::accounts_groups",
-                        "Failed to create MDK for account {}: {}",
-                        session.account_pubkey, e
-                    );
-                    continue;
-                }
-            };
-
             for group_id in candidates {
                 // Filter to DM groups using shared DB
                 let is_dm = GroupInformation::is_dm(&group_id, &self.shared.database).await?;
@@ -573,34 +564,39 @@ impl Whitenoise {
                     continue;
                 }
 
-                let members = match mdk.get_members(&group_id) {
-                    Ok(m) => m,
-                    Err(e) => {
+                let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+                if let Some(projection) = session
+                    .marmot_storage
+                    .find_group_projection(&marmot_group_id)?
+                {
+                    let peer = projection
+                        .member_pubkeys
+                        .iter()
+                        .find(|pubkey| **pubkey != session.account_pubkey);
+                    if let Some(peer_pubkey) = peer
+                        && let Err(e) = AccountGroup::update_dm_peer_pubkey(
+                            &group_id,
+                            peer_pubkey,
+                            &session.account_db.inner.pool,
+                        )
+                        .await
+                    {
                         tracing::warn!(
                             target: "whitenoise::accounts_groups",
-                            group = %hex::encode(group_id.as_slice()),
-                            "get_members failed during DM peer backfill: {e}"
+                            "Failed to backfill dm_peer_pubkey for group {}: {}",
+                            hex::encode(group_id.as_slice()),
+                            e
                         );
-                        continue;
                     }
-                };
-
-                let peer = members.iter().find(|pk| **pk != session.account_pubkey);
-                if let Some(peer_pubkey) = peer
-                    && let Err(e) = AccountGroup::update_dm_peer_pubkey(
-                        &group_id,
-                        peer_pubkey,
-                        &session.account_db.inner.pool,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::accounts_groups",
-                        "Failed to backfill dm_peer_pubkey for group {}: {}",
-                        hex::encode(group_id.as_slice()),
-                        e
-                    );
+                    continue;
                 }
+
+                tracing::debug!(
+                    target: "whitenoise::accounts_groups",
+                    account = %session.account_pubkey.to_hex(),
+                    group = %hex::encode(group_id.as_slice()),
+                    "Skipping DM peer backfill for unprojected group without Marmot projection"
+                );
             }
         }
 
@@ -610,11 +606,36 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use async_trait::async_trait;
+    use cgka_traits::storage::GroupStorage;
+    use cgka_traits::transport::TransportMessage;
+    use nostr_sdk::RelayUrl;
+
     use super::*;
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
+    use crate::marmot::{
+        GroupConfig, Message as MarmotMessage, MessageState as MarmotMessageState,
+    };
     use crate::whitenoise::aggregated_message::AggregatedMessage;
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::group_state_streaming::GroupStateUpdate;
-    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
+    use crate::whitenoise::session::messages::create_unsigned_nostr_event;
+    use crate::whitenoise::test_utils::{
+        create_group_config, create_mock_whitenoise, wait_for_key_package_publication,
+    };
+
+    #[derive(Clone, Default)]
+    struct RecordingMarmotPublisher;
+
+    #[async_trait]
+    impl MarmotMessagePublisher for RecordingMarmotPublisher {
+        async fn publish(&self, _message: TransportMessage) -> MarmotPublishOutcome {
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
 
     /// Helper to get the per-account pool from a Whitenoise instance + account pubkey.
     fn account_pool(whitenoise: &Whitenoise, pubkey: &PublicKey) -> SqlitePool {
@@ -625,6 +646,26 @@ mod tests {
             .inner
             .pool
             .clone()
+    }
+
+    fn remove_obsolete_mls_artifacts(account: &Account, data_dir: &Path) -> PathBuf {
+        let obsolete_mls_storage_path = obsolete_mls_artifacts(account, data_dir);
+
+        if obsolete_mls_storage_path.is_dir() {
+            fs::remove_dir_all(&obsolete_mls_storage_path).unwrap();
+        } else if obsolete_mls_storage_path.exists() {
+            fs::remove_file(&obsolete_mls_storage_path).unwrap();
+        }
+
+        obsolete_mls_storage_path
+    }
+
+    fn obsolete_mls_artifacts(account: &Account, data_dir: &Path) -> PathBuf {
+        crate::whitenoise::test_utils::obsolete_mls_storage_path(&account.pubkey, data_dir)
+    }
+
+    fn assert_obsolete_mls_artifacts_absent(obsolete_mls_storage_path: &Path) {
+        assert!(!obsolete_mls_storage_path.exists());
     }
 
     #[tokio::test]
@@ -1535,7 +1576,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let group = whitenoise
             .require_session(&creator.pubkey)
@@ -1557,13 +1598,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_backfill_dm_peer_pubkeys_repairs_darkmatter_dm_without_legacy_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let config = GroupConfig::new(
+            String::new(),
+            "Darkmatter DM missing peer backfill".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = whitenoise
+            .require_session(&creator.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member.pubkey], config, Some(GroupType::DirectMessage))
+            .await
+            .unwrap();
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let obsolete_mls_storage_path =
+            obsolete_mls_artifacts(&creator, &whitenoise.config().data_dir);
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
+
+        sqlx::query(
+            "UPDATE accounts_groups
+             SET dm_peer_pubkey = NULL
+             WHERE mls_group_id = ?",
+        )
+        .bind(group.mls_group_id.as_slice())
+        .execute(&session.account_db.inner.pool)
+        .await
+        .unwrap();
+
+        let before = AccountGroup::find_by_account_and_group(
+            &creator.pubkey,
+            &group.mls_group_id,
+            &session.account_db.inner.pool,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(before.dm_peer_pubkey.is_none());
+
+        whitenoise.backfill_dm_peer_pubkeys().await.unwrap();
+
+        let after = AccountGroup::find_by_account_and_group(
+            &creator.pubkey,
+            &group.mls_group_id,
+            &session.account_db.inner.pool,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(after.dm_peer_pubkey, Some(member.pubkey));
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
+    }
+
+    #[tokio::test]
+    async fn test_dm_peer_backfill_skips_unprojected_dm_without_obsolete_mls_storage() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[0x51; 32]);
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+
+        GroupInformation::create_for_group(
+            &whitenoise,
+            &group_id,
+            Some(GroupType::DirectMessage),
+            "",
+        )
+        .await
+        .unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        let obsolete_mls_storage_path = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
+
+        whitenoise.backfill_dm_peer_pubkeys().await.unwrap();
+
+        assert!(
+            !obsolete_mls_storage_path.exists(),
+            "DM peer backfill must not create obsolete MLS storage for unprojected rows without an existing legacy store"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_dm_group_with_peer_ignores_regular_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
         // Create a regular group (not a DM) with the same member
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -1590,7 +1727,7 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         // Create first DM
-        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config1 = create_group_config(vec![creator.pubkey, member.pubkey]);
         config1.name = String::new();
         let _older_group = whitenoise
             .require_session(&creator.pubkey)
@@ -1604,7 +1741,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Create second DM with the same peer
-        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config2 = create_group_config(vec![creator.pubkey, member.pubkey]);
         config2.name = String::new();
         let newer_group = whitenoise
             .require_session(&creator.pubkey)
@@ -1631,7 +1768,7 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         let group = whitenoise
             .require_session(&creator.pubkey)
@@ -1669,7 +1806,7 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
         let stranger = whitenoise.create_identity().await.unwrap();
 
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
         whitenoise
             .require_session(&creator.pubkey)
@@ -2983,6 +3120,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clear_chat_deletes_darkmatter_message_projections() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "clear darkmatter group".to_string(),
+            "clear_chat must remove local Marmot messages".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher,
+            )
+            .await
+            .unwrap();
+        let obsolete_mls_storage_path =
+            obsolete_mls_artifacts(&creator, &whitenoise.config().data_dir);
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
+        let marmot_group_id = MarmotGroupId::new(group.mls_group_id.as_slice().to_vec());
+        assert!(
+            session.marmot_storage.get_group(&marmot_group_id).is_ok(),
+            "test setup must create Darkmatter protocol group state"
+        );
+
+        let (inner_event, _) =
+            create_unsigned_nostr_event(&creator.pubkey, "stored Marmot message", 9, None).unwrap();
+        let wrapper_event_id = EventId::from_hex(&format!("{:0>64}", "ca7")).unwrap();
+        let message = MarmotMessage::from_unsigned_app_event(
+            group.mls_group_id.clone(),
+            inner_event,
+            wrapper_event_id,
+            Some(0),
+            MarmotMessageState::Processed,
+        )
+        .unwrap();
+        MarmotMessageProjection::upsert(&message, &session.account_db.inner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            MarmotMessageProjection::list_by_group(&group.mls_group_id, &session.account_db.inner)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        session
+            .membership()
+            .for_group(&group.mls_group_id)
+            .clear_chat()
+            .await
+            .unwrap();
+
+        assert!(
+            MarmotMessageProjection::list_by_group(&group.mls_group_id, &session.account_db.inner)
+                .await
+                .unwrap()
+                .is_empty(),
+            "clear_chat must clear the account DB Marmot message projection"
+        );
+        assert!(
+            session.marmot_storage.get_group(&marmot_group_id).is_ok(),
+            "clear_chat must preserve Darkmatter protocol group state"
+        );
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
+    }
+
+    #[tokio::test]
     async fn test_clear_chat_idempotent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
@@ -3083,6 +3301,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_chat_skips_obsolete_mls_storage_creation_for_unprojected_group() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[0x5d; 32]);
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+
+        let obsolete_mls_storage_path = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
+
+        whitenoise.delete_chat(&account, &group_id).await.unwrap();
+
+        assert!(
+            !obsolete_mls_storage_path.exists(),
+            "delete_chat must not create obsolete MLS storage when deleting an unprojected row without an existing legacy store"
+        );
+    }
+
+    #[tokio::test]
     async fn test_delete_chat_hidden_from_visible_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
@@ -3107,6 +3350,66 @@ mod tests {
             !group_ids.contains(&group_id),
             "deleted group must not appear in visible groups"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_removes_darkmatter_group_state_without_obsolete_mls_storage() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "delete darkmatter group".to_string(),
+            "delete_chat must remove local Marmot group state".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher,
+            )
+            .await
+            .unwrap();
+
+        let obsolete_mls_storage_path =
+            obsolete_mls_artifacts(&creator, &whitenoise.config().data_dir);
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
+
+        whitenoise
+            .delete_chat(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            creator_session.groups().get(&group.mls_group_id),
+            Err(WhitenoiseError::GroupNotFound)
+        ));
+
+        let marmot_group_id =
+            cgka_traits::types::GroupId::new(group.mls_group_id.as_slice().to_vec());
+        assert!(matches!(
+            creator_session.marmot_storage.get_group(&marmot_group_id),
+            Err(cgka_traits::storage::StorageError::NotFound)
+        ));
+        assert!(
+            creator_session
+                .marmot_storage
+                .find_group_projection(&marmot_group_id)
+                .unwrap()
+                .is_none(),
+            "delete_chat must remove the WhiteNoise Marmot group projection"
+        );
+        assert_obsolete_mls_artifacts_absent(&obsolete_mls_storage_path);
     }
 
     #[tokio::test]

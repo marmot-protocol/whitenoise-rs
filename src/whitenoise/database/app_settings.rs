@@ -170,7 +170,7 @@ mod tests {
             "CREATE TABLE app_settings (
                 id INTEGER PRIMARY KEY,
                 theme_mode TEXT NOT NULL,
-                language TEXT NOT NULL DEFAULT 'en',
+                language TEXT NOT NULL DEFAULT 'system',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )",

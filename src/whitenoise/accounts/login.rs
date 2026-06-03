@@ -195,7 +195,7 @@ impl Whitenoise {
             target: "whitenoise::accounts",
             "Publishing MLS key package"
         );
-        self.publish_key_package_for_account_with_signer(&account, signer)
+        self.publish_external_signer_key_package_if_supported(&account, signer)
             .await?;
 
         tracing::info!(
@@ -238,12 +238,19 @@ impl Whitenoise {
         // guard) see the flag, but keep the session visible until subscription
         // teardown completes — handlers that check get_session() during teardown
         // need the entry to exist.
-        if let Some(session) = self.account_manager.get_session(pubkey) {
+        let active_session = self.account_manager.get_session(pubkey);
+        if let Some(session) = &active_session {
             session.cancel();
             session.deactivate_subscriptions().await;
         }
 
-        self.account_manager.remove_session(pubkey);
+        let removed_session = self
+            .account_manager
+            .remove_session(pubkey)
+            .or(active_session);
+        if let Some(session) = removed_session {
+            session.wait_for_operations().await;
+        }
 
         // Evict rate-limiter entries for this account to prevent unbounded growth.
         // Runs after subscription teardown to minimise the repopulation window.
@@ -267,7 +274,7 @@ impl Whitenoise {
 
         // Delete the account from the database
         account.delete(&self.shared.database).await?;
-        self.delete_mdk_storage_for_account(pubkey).await?;
+        self.delete_marmot_storage_for_account(pubkey).await?;
 
         // Sync discovery subscriptions with remaining accounts (tears down on last logout)
         if let Err(e) = self.sync_discovery_subscriptions().await {
@@ -330,12 +337,11 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use mdk_sqlite_storage::keyring;
     use nostr_sdk::prelude::*;
 
     use crate::RelayType;
     use crate::whitenoise::accounts::Account;
-    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
     use crate::whitenoise::{Whitenoise, WhitenoiseConfig};
@@ -440,12 +446,6 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
             "Account should publish a canonical key package (kind 30443)"
-        );
-        assert!(
-            key_package_events
-                .iter()
-                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
-            "Account should publish a legacy key package twin (kind 443)"
         );
     }
 
@@ -891,40 +891,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_logout_removes_mdk_storage_and_key() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, keys) = create_test_account(&whitenoise).await;
-        account.save(&whitenoise.shared.database).await.unwrap();
-        whitenoise
-            .shared
-            .secrets_store
-            .store_private_key(&keys)
-            .unwrap();
-
-        let mls_storage_dir =
-            Account::mdk_storage_path(&account.pubkey, &whitenoise.config().data_dir);
-        tokio::fs::create_dir_all(&mls_storage_dir).await.unwrap();
-        tokio::fs::write(mls_storage_dir.join("storage.sqlite"), b"test")
-            .await
-            .unwrap();
-
-        let keyring_service_id = whitenoise.keyring_service_id().to_string();
-        let db_key_id = Account::mdk_db_key_id(&account.pubkey);
-        keyring::get_or_create_db_key(&keyring_service_id, &db_key_id)
-            .expect("Failed to create MDK database key");
-
-        whitenoise.logout(&account.pubkey).await.unwrap();
-
-        assert!(!mls_storage_dir.exists());
-        assert!(
-            keyring::get_db_key(&keyring_service_id, &db_key_id)
-                .unwrap()
-                .is_none(),
-            "Account logout should remove the account-scoped MDK database key"
-        );
-    }
-
-    #[tokio::test]
     async fn test_logout_external_account_cleans_stale_keys() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
@@ -1037,8 +1003,8 @@ mod tests {
     /// while preserving entries for other accounts.
     #[tokio::test]
     async fn test_logout_evicts_rate_limiter_entries() {
+        use crate::marmot::GroupId;
         use crate::whitenoise::push_notifications::TokenRateKind;
-        use mdk_core::prelude::GroupId;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 

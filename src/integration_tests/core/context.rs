@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::marmot::group_types::Group;
 use crate::whitenoise::media_files::MediaFile;
 use crate::{Account, Whitenoise, WhitenoiseError};
-use mdk_core::prelude::group_types::Group;
 use nostr_sdk::prelude::RelayUrl;
 use std::collections::HashMap;
 

@@ -2,12 +2,10 @@ use std::collections::BTreeSet;
 
 use nostr_sdk::PublicKey;
 
-mod self_update_group_leaf;
 mod upgrade_required_proposals;
 mod verify_required_proposals;
 mod verify_upgrade_status;
 
-pub use self_update_group_leaf::SelfUpdateGroupLeafTestCase;
 pub use upgrade_required_proposals::UpgradeRequiredProposalsTestCase;
 pub use verify_required_proposals::VerifyRequiredProposalsTestCase;
 pub use verify_upgrade_status::VerifyRequiredProposalUpgradeStatusTestCase;

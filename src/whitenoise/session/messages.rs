@@ -1,10 +1,23 @@
-use mdk_core::prelude::*;
-use nostr_sdk::prelude::*;
+use std::sync::Arc;
 
+use cgka_traits::{GroupId as MarmotGroupId, MessageId as MarmotMessageId, StorageError};
+use nostr_sdk::prelude::*;
+use tokio::sync::Mutex;
+
+use crate::marmot::GroupId;
+use crate::marmot::Message as MarmotMessage;
+use crate::marmot::MessageState as MarmotMessageState;
+use crate::marmot::message::{app_payload_from_unsigned_event, event_id_from_message_id};
+use crate::marmot::publish::{MarmotPublishOutcome, MarmotPublishedEffects, publish_effects};
+use crate::marmot::session::{MarmotSession, MarmotSessionEffects, PublishWork};
+use crate::marmot::transport::{
+    MarmotGroupPublishRoute, MarmotPublishRoutes, MarmotRelayControlPublisher,
+};
 use crate::types::MessageWithTokens;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
+use crate::whitenoise::database::marmot_messages::MarmotMessageProjection;
 use crate::whitenoise::database::{Database, DatabaseError, retry_on_lock};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::message_aggregator::processor::{
@@ -14,8 +27,8 @@ use crate::whitenoise::message_aggregator::{
     ChatMessage, DeliveryStatus, SearchResult, emoji_utils, reaction_handler,
 };
 use crate::whitenoise::message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger};
-use crate::whitenoise::push_notifications::publish_notification_requests_after_delivery_with;
 use crate::whitenoise::session::AccountSession;
+use crate::whitenoise::session::push::PushResponseContext;
 
 /// Account-scoped message view. Constructed via [`AccountSession::messages()`].
 pub struct MessageOps<'a> {
@@ -69,6 +82,18 @@ pub struct MessageOpsForGroup<'a> {
     group_id: &'a GroupId,
 }
 
+struct MarmotPublishTask {
+    marmot_session: Arc<Mutex<MarmotSession>>,
+    effects: MarmotSessionEffects,
+    group_route: MarmotGroupPublishRoute,
+    application_message_id: MarmotMessageId,
+    event_id: EventId,
+    kind: u16,
+    tags: Tags,
+    author: PublicKey,
+    content: String,
+}
+
 impl<'a> MessageOpsForGroup<'a> {
     fn pubkey(&self) -> &PublicKey {
         &self.session.account_pubkey
@@ -89,18 +114,34 @@ impl<'a> MessageOpsForGroup<'a> {
             .emit(self.group_id, MessageUpdate { trigger, message });
     }
 
+    fn marmot_group_id(&self) -> MarmotGroupId {
+        MarmotGroupId::new(self.group_id.as_slice().to_vec())
+    }
+
+    fn has_marmot_group_projection(&self) -> Result<bool> {
+        Ok(self
+            .session
+            .marmot_storage
+            .find_group_projection(&self.marmot_group_id())?
+            .is_some())
+    }
+
     // ── Read operations ────────────────────────────────────────────
 
-    /// Fetch raw MLS messages from MDK storage with parsed Markdown AST.
+    /// Fetch raw MLS messages with parsed Markdown AST.
     pub async fn fetch(&self) -> Result<Vec<MessageWithTokens>> {
-        let messages = self.session.mdk.get_messages(self.group_id, None)?;
-        Ok(messages
-            .iter()
-            .map(|m| MessageWithTokens {
-                message: m.clone(),
-                tokens: whitenoise_markdown::parse(&m.content),
-            })
-            .collect())
+        if self.has_marmot_group_projection()? {
+            let messages = MarmotMessageProjection::list_by_group(self.group_id, self.db()).await?;
+            return Ok(messages
+                .into_iter()
+                .map(|message| {
+                    let tokens = whitenoise_markdown::parse(&message.content);
+                    MessageWithTokens { message, tokens }
+                })
+                .collect());
+        }
+
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Fetch aggregated messages with cursor-based pagination (oldest-first).
@@ -191,7 +232,7 @@ impl<'a> MessageOpsForGroup<'a> {
     ) -> Result<SendResult> {
         let tags_vec = tags.unwrap_or_default();
 
-        // Validate kind + tag invariants before any MDK/DB writes.
+        // Validate kind + tag invariants before any protocol or DB writes.
         // Reactions require an e-tag (target message), deletions require at
         // least one e-tag (target messages/reactions).
         match kind {
@@ -220,38 +261,89 @@ impl<'a> MessageOpsForGroup<'a> {
         let (inner_event, event_id) =
             create_unsigned_nostr_event(self.pubkey(), &message, kind, Some(tags_vec))?;
 
-        let mdk = &self.session.mdk;
-
-        let group_relays: Vec<RelayUrl> = mdk.get_relays(self.group_id)?.into_iter().collect();
-        if group_relays.is_empty() {
-            return Err(WhitenoiseError::GroupMissingRelays);
+        if let Some(result) = self
+            .try_send_marmot_message(inner_event.clone(), event_id, kind)
+            .await?
+        {
+            return Ok(result);
         }
 
-        let message_event = mdk.create_message(self.group_id, inner_event, None)?;
-        let mdk_message =
-            mdk.get_message(self.group_id, &event_id)?
-                .ok_or(WhitenoiseError::MdkCoreError(
-                    mdk_core::error::Error::MessageNotFound,
-                ))?;
+        if self.has_marmot_group_projection()? {
+            return Err(WhitenoiseError::MarmotSessionUnavailable(*self.pubkey()));
+        }
 
-        let tokens = whitenoise_markdown::parse(&mdk_message.content);
+        Err(WhitenoiseError::GroupNotFound)
+    }
+
+    async fn try_send_marmot_message(
+        &self,
+        inner_event: UnsignedEvent,
+        event_id: EventId,
+        kind: u16,
+    ) -> Result<Option<SendResult>> {
+        let Some(marmot_session) = self.session.marmot.clone() else {
+            return Ok(None);
+        };
+
+        let marmot_group_id = MarmotGroupId::new(self.group_id.as_slice().to_vec());
+        let payload = app_payload_from_unsigned_event(&inner_event, event_id)?;
+        let (effects, group_route, epoch) = {
+            let mut session = marmot_session.lock().await;
+            let group_route = match session.group_publish_route(&marmot_group_id) {
+                Ok(group_route) => group_route,
+                Err(error) if is_missing_marmot_group_error(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let epoch = session.group_epoch(&marmot_group_id)?;
+            let effects = session.send_app_message(marmot_group_id, payload).await?;
+            (effects, group_route, epoch)
+        };
+        let application_message_id = application_message_id_from_effects(&effects)?;
+        let wrapper_event_id = event_id_from_marmot_message_id(&application_message_id)?;
+        let marmot_message = MarmotMessage::from_unsigned_app_event(
+            self.group_id.clone(),
+            inner_event,
+            wrapper_event_id,
+            Some(epoch),
+            MarmotMessageState::Created,
+        )?;
+
+        let tokens = whitenoise_markdown::parse(&marmot_message.content);
 
         let mut last_message_deleted = false;
         match kind {
-            9 => self.process_and_emit_outgoing_message(&mdk_message).await?,
-            7 => self.cache_and_apply_outgoing_reaction(&mdk_message).await?,
+            9 => {
+                self.process_and_emit_outgoing_message(&marmot_message)
+                    .await?
+            }
+            7 => {
+                self.cache_and_apply_outgoing_reaction(&marmot_message)
+                    .await?
+            }
             5 => {
-                last_message_deleted = self.cache_and_apply_outgoing_deletion(&mdk_message).await?
+                last_message_deleted = self
+                    .cache_and_apply_outgoing_deletion(&marmot_message)
+                    .await?
             }
             _ => unreachable!("validated above"),
         }
 
-        self.spawn_publish_task(message_event, group_relays, event_id, kind, &mdk_message);
+        self.spawn_marmot_publish_task(MarmotPublishTask {
+            marmot_session,
+            effects,
+            group_route,
+            application_message_id,
+            event_id,
+            kind,
+            tags: marmot_message.tags.clone(),
+            author: marmot_message.pubkey,
+            content: marmot_message.content.clone(),
+        });
 
-        Ok(SendResult {
-            message: MessageWithTokens::new(mdk_message, tokens),
+        Ok(Some(SendResult {
+            message: MessageWithTokens::new(marmot_message, tokens),
             last_message_deleted,
-        })
+        }))
     }
 
     /// Retry publishing a failed message.
@@ -303,80 +395,86 @@ impl<'a> MessageOpsForGroup<'a> {
 
     // ── Private helpers ────────────────────────────────────────────
 
-    // TODO(durable-task-runtime): Move spawn to caller. Views should not call
-    // tokio::spawn internally per the session-projection architecture rules.
-    // Blocked on the durable task runtime that replaces fire-and-forget publishing.
-    fn spawn_publish_task(
-        &self,
-        message_event: Event,
-        group_relays: Vec<RelayUrl>,
-        event_id: EventId,
-        kind: u16,
-        mdk_message: &mdk_core::prelude::message_types::Message,
-    ) {
-        let ephemeral = self.session.ephemeral.clone_inner();
+    // TODO(durable-task-runtime): Move spawn to caller once the durable task
+    // runtime owns background publish work.
+    fn spawn_marmot_publish_task(&self, task: MarmotPublishTask) {
+        let Some(session_operation) = self.session.begin_operation() else {
+            tracing::debug!(
+                target: "whitenoise::session::messages",
+                account = %self.pubkey().to_hex(),
+                group_id = %hex::encode(self.group_id.as_slice()),
+                "Skipping Marmot publish task because account session is closing"
+            );
+            return;
+        };
+        let ephemeral = self.session.ephemeral.clone();
         let account_pubkey = *self.pubkey();
         let shared = self.session.shared.clone();
         let account_db = self.session.account_db.clone();
         let group_id = self.group_id.clone();
-        let event_id_str = event_id.to_string();
-        let tags = mdk_message.tags.clone();
-        let author = mdk_message.pubkey;
-        let content = mdk_message.content.clone();
+        let event_id_str = task.event_id.to_string();
+        let push_context = PushResponseContext::from_session(self.session);
 
         tokio::spawn(async move {
-            let ok = ephemeral
-                .publish_message_event(
-                    message_event,
-                    &account_pubkey,
-                    &group_relays,
-                    &event_id_str,
-                    &group_id,
-                    &account_db.inner,
-                    &shared.message_stream_manager,
-                )
-                .await
-                .succeeded();
+            let _session_operation = session_operation;
+            let routes = MarmotPublishRoutes::new().with_group_publish_route(task.group_route);
+            let publisher = MarmotRelayControlPublisher::new(&ephemeral, routes);
+            let publish_result =
+                publish_effects(task.marmot_session, &publisher, task.effects).await;
 
-            if ok {
-                if let Err(e) = publish_notification_requests_after_delivery_with(
-                    &shared.config,
-                    &shared.database,
-                    &account_db.inner.pool,
-                    &shared.relay_control,
-                    &shared.event_tracker,
-                    &ephemeral,
-                    account_pubkey,
-                    &group_id,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::push_notifications",
-                        account = %account_pubkey.to_hex(),
-                        error = %e,
-                        "Best-effort push notification failed after delivery"
-                    );
+            match marmot_delivery_status(&task.application_message_id, publish_result) {
+                MarmotDeliveryStatus::Sent { accepted_count } => {
+                    update_and_emit_delivery_status(
+                        &event_id_str,
+                        &group_id,
+                        &account_pubkey,
+                        &DeliveryStatus::Sent(accepted_count),
+                        &account_db.inner,
+                        &shared.message_stream_manager,
+                    )
+                    .await;
+
+                    if let Err(e) = push_context
+                        .publish_notification_requests_after_delivery(&group_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "whitenoise::push_notifications",
+                            account = %account_pubkey.to_hex(),
+                            error = %e,
+                            "Best-effort push notification failed after Marmot delivery"
+                        );
+                    }
                 }
-            } else {
-                cascade_delivery_failure(
-                    kind,
-                    &event_id_str,
-                    &tags,
-                    &author,
-                    &content,
-                    &group_id,
-                    &account_db.inner,
-                    &shared.message_stream_manager,
-                )
-                .await;
+                MarmotDeliveryStatus::Failed { reason } => {
+                    update_and_emit_delivery_status(
+                        &event_id_str,
+                        &group_id,
+                        &account_pubkey,
+                        &DeliveryStatus::Failed(reason),
+                        &account_db.inner,
+                        &shared.message_stream_manager,
+                    )
+                    .await;
+                    cascade_delivery_failure(
+                        task.kind,
+                        &event_id_str,
+                        &task.tags,
+                        &task.author,
+                        &task.content,
+                        &group_id,
+                        &account_db.inner,
+                        &shared.message_stream_manager,
+                    )
+                    .await;
+                }
             }
         });
     }
 
     async fn process_and_emit_outgoing_message(
         &self,
-        mdk_message: &mdk_core::prelude::message_types::Message,
+        marmot_message: &MarmotMessage,
     ) -> Result<()> {
         let media_files = crate::whitenoise::media_files::MediaFile::find_by_group(
             &self.session.account_db.inner.pool,
@@ -390,7 +488,7 @@ impl<'a> MessageOpsForGroup<'a> {
             .session
             .shared
             .message_aggregator
-            .process_single_message(mdk_message, media_files)
+            .process_single_message(marmot_message, media_files)
             .await
             .map(|mut msg| {
                 msg.delivery_status = Some(DeliveryStatus::Sending);
@@ -399,6 +497,7 @@ impl<'a> MessageOpsForGroup<'a> {
 
         AggregatedMessage::insert_message(&chat_message, self.group_id, self.pubkey(), self.db())
             .await?;
+        MarmotMessageProjection::upsert(marmot_message, self.db()).await?;
 
         self.emit(UpdateTrigger::NewMessage, chat_message);
         Ok(())
@@ -406,11 +505,12 @@ impl<'a> MessageOpsForGroup<'a> {
 
     async fn cache_and_apply_outgoing_reaction(
         &self,
-        mdk_message: &mdk_core::prelude::message_types::Message,
+        marmot_message: &MarmotMessage,
     ) -> Result<()> {
-        AggregatedMessage::insert_reaction(mdk_message, self.group_id, self.db()).await?;
+        AggregatedMessage::insert_reaction(marmot_message, self.group_id, self.db()).await?;
+        MarmotMessageProjection::upsert(marmot_message, self.db()).await?;
         AggregatedMessage::insert_delivery_status(
-            &mdk_message.id.to_string(),
+            &marmot_message.id.to_string(),
             self.group_id,
             self.pubkey(),
             &DeliveryStatus::Sending,
@@ -418,13 +518,13 @@ impl<'a> MessageOpsForGroup<'a> {
         )
         .await?;
 
-        if let Ok(target_id) = extract_reaction_target_id(&mdk_message.tags)
+        if let Ok(target_id) = extract_reaction_target_id(&marmot_message.tags)
             && let Some(mut target) =
                 AggregatedMessage::find_by_id(&target_id, self.group_id, self.pubkey(), self.db())
                     .await?
         {
             let emoji = emoji_utils::validate_and_normalize_reaction(
-                &mdk_message.content,
+                &marmot_message.content,
                 self.session
                     .shared
                     .message_aggregator
@@ -433,10 +533,10 @@ impl<'a> MessageOpsForGroup<'a> {
             )?;
             reaction_handler::add_reaction_to_message(
                 &mut target,
-                &mdk_message.pubkey,
+                &marmot_message.pubkey,
                 &emoji,
-                mdk_message.created_at,
-                mdk_message.id,
+                marmot_message.created_at,
+                marmot_message.id,
             );
             AggregatedMessage::update_reactions(
                 &target.id,
@@ -454,11 +554,12 @@ impl<'a> MessageOpsForGroup<'a> {
     /// Returns `true` if the deletion removed the last message in the group.
     async fn cache_and_apply_outgoing_deletion(
         &self,
-        mdk_message: &mdk_core::prelude::message_types::Message,
+        marmot_message: &MarmotMessage,
     ) -> Result<bool> {
-        AggregatedMessage::insert_deletion(mdk_message, self.group_id, self.db()).await?;
+        AggregatedMessage::insert_deletion(marmot_message, self.group_id, self.db()).await?;
+        MarmotMessageProjection::upsert(marmot_message, self.db()).await?;
         AggregatedMessage::insert_delivery_status(
-            &mdk_message.id.to_string(),
+            &marmot_message.id.to_string(),
             self.group_id,
             self.pubkey(),
             &DeliveryStatus::Sending,
@@ -475,18 +576,18 @@ impl<'a> MessageOpsForGroup<'a> {
         .and_then(|v| v.into_iter().next())
         .map(|s| s.message_id.to_hex());
 
-        let deletion_id = mdk_message.id.to_string();
-        let target_ids = extract_deletion_target_ids(&mdk_message.tags);
+        let deletion_id = marmot_message.id.to_string();
+        let target_ids = extract_deletion_target_ids(&marmot_message.tags);
         let mut deleted_last_message = false;
 
         for target_id in &target_ids {
             if let Some(reaction) =
                 AggregatedMessage::find_reaction_by_id(target_id, self.group_id, self.db()).await?
             {
-                if reaction.author != mdk_message.pubkey {
+                if reaction.author != marmot_message.pubkey {
                     tracing::warn!(
                         target: "whitenoise::session::messages",
-                        deletion_author = %mdk_message.pubkey.to_hex(),
+                        deletion_author = %marmot_message.pubkey.to_hex(),
                         target_author = %reaction.author.to_hex(),
                         target_id = %target_id,
                         "Ignoring outgoing deletion whose author does not match reaction author"
@@ -528,10 +629,10 @@ impl<'a> MessageOpsForGroup<'a> {
                 AggregatedMessage::find_by_id(target_id, self.group_id, self.pubkey(), self.db())
                     .await?
             {
-                if msg.author != mdk_message.pubkey {
+                if msg.author != marmot_message.pubkey {
                     tracing::warn!(
                         target: "whitenoise::session::messages",
-                        deletion_author = %mdk_message.pubkey.to_hex(),
+                        deletion_author = %marmot_message.pubkey.to_hex(),
                         target_author = %msg.author.to_hex(),
                         target_id = %target_id,
                         "Ignoring outgoing deletion whose author does not match message author"
@@ -566,7 +667,125 @@ pub struct SendResult {
     pub last_message_deleted: bool,
 }
 
+enum MarmotDeliveryStatus {
+    Sent { accepted_count: usize },
+    Failed { reason: String },
+}
+
 // ── Free functions ─────────────────────────────────────────────────
+
+fn is_missing_marmot_group_error(error: &WhitenoiseError) -> bool {
+    matches!(
+        error,
+        WhitenoiseError::MarmotEngine(cgka_traits::EngineError::UnknownGroup(_))
+            | WhitenoiseError::MarmotStorage(StorageError::NotFound)
+    )
+}
+
+fn application_message_id_from_effects(effects: &MarmotSessionEffects) -> Result<MarmotMessageId> {
+    let mut application_messages = effects.publish.iter().filter_map(|work| match work {
+        PublishWork::ApplicationMessage { msg } => Some(msg.id.clone()),
+        _ => None,
+    });
+
+    match (application_messages.next(), application_messages.next()) {
+        (Some(message_id), None) => Ok(message_id),
+        (None, _) if !effects.queued.is_empty() => Err(WhitenoiseError::Internal(
+            "Marmot app message send was queued; queued outgoing message projection is not implemented"
+                .to_string(),
+        )),
+        (None, _) => Err(WhitenoiseError::Internal(
+            "Marmot app message send produced no application transport message".to_string(),
+        )),
+        (Some(_), Some(_)) => Err(WhitenoiseError::Internal(
+            "Marmot app message send produced multiple application transport messages"
+                .to_string(),
+        )),
+    }
+}
+
+fn event_id_from_marmot_message_id(message_id: &MarmotMessageId) -> Result<EventId> {
+    event_id_from_message_id(message_id)
+}
+
+fn marmot_delivery_status(
+    message_id: &MarmotMessageId,
+    publish_result: Result<MarmotPublishedEffects>,
+) -> MarmotDeliveryStatus {
+    let published = match publish_result {
+        Ok(published) => published,
+        Err(error) => {
+            return MarmotDeliveryStatus::Failed {
+                reason: error.to_string(),
+            };
+        }
+    };
+
+    if let Some(failure) = published
+        .failures
+        .iter()
+        .find(|failure| failure.message_id == *message_id)
+        .or_else(|| published.failures.first())
+    {
+        return MarmotDeliveryStatus::Failed {
+            reason: failure.reason.clone(),
+        };
+    }
+
+    match published
+        .reports
+        .iter()
+        .find(|report| report.message_id == *message_id)
+        .map(|report| &report.outcome)
+    {
+        Some(MarmotPublishOutcome::Published { accepted_count }) => MarmotDeliveryStatus::Sent {
+            accepted_count: *accepted_count,
+        },
+        Some(MarmotPublishOutcome::Failed { reason }) => MarmotDeliveryStatus::Failed {
+            reason: reason.clone(),
+        },
+        None => MarmotDeliveryStatus::Failed {
+            reason: "Marmot publish produced no report for application message".to_string(),
+        },
+    }
+}
+
+async fn update_and_emit_delivery_status(
+    event_id: &str,
+    group_id: &GroupId,
+    account_pubkey: &PublicKey,
+    status: &DeliveryStatus,
+    database: &Database,
+    stream_manager: &MessageStreamManager,
+) {
+    match AggregatedMessage::update_delivery_status_with_retry(
+        event_id,
+        group_id,
+        account_pubkey,
+        status,
+        database,
+    )
+    .await
+    {
+        Ok(updated_msg) => {
+            stream_manager.emit(
+                group_id,
+                MessageUpdate {
+                    trigger: UpdateTrigger::DeliveryStatusChanged,
+                    message: updated_msg,
+                },
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "whitenoise::messages::delivery",
+                "Failed to update delivery status for message {}: {}",
+                event_id,
+                error
+            );
+        }
+    }
+}
 
 pub(crate) fn create_unsigned_nostr_event(
     pubkey: &PublicKey,
@@ -771,4 +990,146 @@ async fn cascade_deletion_failure(
         target: "whitenoise::messages::delivery",
         "Cascaded deletion failure: unmarked targets of deletion {event_id}",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex, Weak};
+
+    use async_trait::async_trait;
+    use cgka_traits::app_components::NostrRoutingV1;
+    use cgka_traits::transport::TransportMessage;
+    use cgka_traits::types::GroupId as MarmotGroupId;
+    use nostr_sdk::{Keys, RelayUrl};
+
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
+    use crate::marmot::{GroupConfig, MarmotCreatedGroupProjection};
+    use crate::whitenoise::Whitenoise;
+    use crate::whitenoise::error::WhitenoiseError;
+    use crate::whitenoise::session::AccountSession;
+    use crate::whitenoise::session::test_helpers::{test_db, test_shared};
+    use crate::whitenoise::test_utils::insert_test_account;
+    use crate::whitenoise::test_utils::{
+        assert_obsolete_mls_artifacts_absent, create_mock_whitenoise,
+        remove_obsolete_mls_artifacts, wait_for_key_package_publication,
+    };
+
+    #[derive(Clone, Default)]
+    struct CapturingMarmotPublisher {
+        messages: Arc<Mutex<Vec<TransportMessage>>>,
+    }
+
+    #[async_trait]
+    impl MarmotMessagePublisher for CapturingMarmotPublisher {
+        async fn publish(&self, message: TransportMessage) -> MarmotPublishOutcome {
+            self.messages.lock().unwrap().push(message);
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_raw_message_projection_for_darkmatter_group() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "darkmatter messages".to_string(),
+            "message projection without obsolete MLS storage".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://darkmatter-message-fetch.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &CapturingMarmotPublisher::default(),
+            )
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&creator_account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let sent = creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .send("hello from Darkmatter".to_string(), 9, None)
+            .await
+            .unwrap();
+        let fetched = creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .fetch()
+            .await
+            .unwrap();
+
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].message.id, sent.message.message.id);
+        assert_eq!(fetched[0].message.content, "hello from Darkmatter");
+        assert_eq!(
+            fetched[0].message.wrapper_event_id,
+            sent.message.message.wrapper_event_id
+        );
+        assert_eq!(fetched[0].message.epoch, sent.message.message.epoch);
+        assert_eq!(fetched[0].tokens, sent.message.tokens);
+    }
+
+    #[tokio::test]
+    async fn send_to_projected_darkmatter_group_without_live_session_does_not_fall_back_to_obsolete_mls_storage()
+     {
+        Whitenoise::initialize_mock_keyring_store();
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let db = test_db().await;
+        insert_test_account(&db, &pubkey).await;
+
+        let shared = test_shared(db).await;
+        let session = AccountSession::new(pubkey, shared, Weak::new(), Some(Arc::new(keys)), None)
+            .await
+            .unwrap();
+
+        let marmot_group_id = MarmotGroupId::new(vec![7; 32]);
+        let group_id = crate::marmot::GroupId::from(&marmot_group_id);
+        session
+            .marmot_storage
+            .put_group_projection(&MarmotCreatedGroupProjection {
+                group_id: marmot_group_id,
+                name: "projected".to_string(),
+                description: "projected without live session".to_string(),
+                epoch: 1,
+                routing: NostrRoutingV1::new(
+                    [9; 32],
+                    vec!["wss://projected-darkmatter.example".to_string()],
+                )
+                .unwrap(),
+                admin_pubkeys: BTreeSet::from([pubkey]),
+                member_pubkeys: BTreeSet::from([pubkey]),
+                self_update_completed_at_secs: 1,
+                disappearing_message_secs: None,
+            })
+            .unwrap();
+
+        let result = session
+            .messages()
+            .for_group(&group_id)
+            .send("must use Darkmatter".to_string(), 9, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MarmotSessionUnavailable(account_pubkey))
+                if account_pubkey == pubkey
+        ));
+    }
 }

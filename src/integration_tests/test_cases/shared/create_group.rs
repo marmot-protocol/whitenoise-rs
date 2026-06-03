@@ -1,8 +1,8 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::marmot::GroupConfig;
 use async_trait::async_trait;
-use mdk_core::prelude::*;
-use nostr_sdk::PublicKey;
+use nostr_sdk::prelude::*;
 
 pub struct CreateGroupTestCase {
     group_name: String,
@@ -46,25 +46,23 @@ impl TestCase for CreateGroupTestCase {
             .collect::<Result<Vec<_>, _>>()?;
         let admin_pubkeys = vec![creator.pubkey];
 
+        let config = GroupConfig::new(
+            self.group_name.clone(),
+            self.group_description.clone(),
+            None, // image_hash
+            None, // image_key
+            None, // image_nonce
+            context.default_account_relay_urls(),
+            admin_pubkeys,
+            None,
+        );
+
         let test_group = context
             .whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
             .groups()
-            .create_group(
-                member_pubkeys,
-                NostrGroupConfigData::new(
-                    self.group_name.clone(),
-                    self.group_description.clone(),
-                    None, // image_hash
-                    None, // image_key
-                    None, // image_nonce
-                    context.default_account_relay_urls(),
-                    admin_pubkeys,
-                    None,
-                ),
-                None,
-            )
+            .create_group(member_pubkeys, config, None)
             .await?;
 
         // Give some time for MLS group synchronization

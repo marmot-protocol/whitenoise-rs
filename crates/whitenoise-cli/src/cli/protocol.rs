@@ -307,8 +307,8 @@ pub enum Request {
     DebugRelayControlState,
     #[serde(rename = "debug_health")]
     DebugHealth { account: String },
-    #[serde(rename = "debug_ratchet_tree")]
-    DebugRatchetTree { account: String, group_id: String },
+    #[serde(rename = "debug_group_forensics", alias = "debug_ratchet_tree")]
+    DebugGroupForensics { account: String, group_id: String },
 
     // Reset
     #[serde(rename = "delete_all_data")]
@@ -463,6 +463,37 @@ mod tests {
         assert!(matches!(
             parsed,
             Request::GroupStateSubscribe { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn debug_group_forensics_roundtrip_uses_current_method_name() {
+        let req = Request::DebugGroupForensics {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"method":"debug_group_forensics","params":{"account":"npub1abc","group_id":"abcd1234"}}"#
+        );
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::DebugGroupForensics { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn debug_group_forensics_accepts_legacy_ratchet_tree_method_name() {
+        let wire = r#"{"method":"debug_ratchet_tree","params":{"account":"npub1abc","group_id":"abcd1234"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::DebugGroupForensics { account, group_id }
             if account == "npub1abc" && group_id == "abcd1234"
         ));
     }

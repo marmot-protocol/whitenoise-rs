@@ -280,11 +280,45 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
 
-        self.publish_key_package_for_account_with_signer(account, signer)
-            .await
-            .map_err(LoginError::from)?;
+        self.publish_external_signer_key_package_if_supported(account, signer)
+            .await?;
 
         Ok(())
+    }
+
+    /// Publishes the external-signer account key package when the current
+    /// protocol backend can support it.
+    ///
+    /// Fresh external-signer accounts cannot produce Darkmatter v2 key packages
+    /// yet: Darkmatter requires a raw account identity proof signature, while
+    /// WhiteNoise's external signer abstraction exposes Nostr event signing.
+    /// Do not recreate obsolete MLS storage to paper over that gap. External
+    /// signer accounts complete login without a key package until the signer
+    /// contract is upgraded.
+    pub(crate) async fn publish_external_signer_key_package_if_supported<S>(
+        &self,
+        account: &Account,
+        signer: S,
+    ) -> core::result::Result<(), LoginError>
+    where
+        S: NostrSigner + Clone + 'static,
+    {
+        match self
+            .publish_key_package_for_account_with_signer(account, signer)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(WhitenoiseError::MarmotSessionUnavailable(pubkey)) if pubkey == account.pubkey => {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    account = %account.pubkey,
+                    "External signer login completed without key package publication because \
+                     Darkmatter account-proof signing is not available for this signer"
+                );
+                Ok(())
+            }
+            Err(error) => Err(LoginError::from(error)),
+        }
     }
 
     /// Create/update an external signer account record without setting up relays.

@@ -207,11 +207,11 @@ impl Whitenoise {
     ///
     /// Returns true when:
     /// 1. The inbox plane and group plane both have connected relays, AND
-    /// 2. The number of groups in the group plane matches MDK's active groups.
+    /// 2. The number of groups in the group plane matches active Marmot groups.
     ///
-    /// The group count parity check catches groups that were added to MDK
-    /// (e.g. via `accept_welcome`) but never made it into the group plane
-    /// (e.g. because the background subscription setup failed on mobile).
+    /// The group count parity check catches groups that were added to local
+    /// Marmot state but never made it into the group plane, for example because
+    /// background subscription setup failed on mobile.
     #[perf_instrument("whitenoise")]
     pub async fn is_account_subscriptions_operational(&self, account: &Account) -> Result<bool> {
         let Some(session) = self.session(&account.pubkey) else {
@@ -225,20 +225,20 @@ impl Whitenoise {
             return Ok(false);
         }
 
-        let mdk_count = self.active_group_count(account)?;
+        let runtime_group_count = self.active_group_count(account).await?;
         let plane_count = session.group_handle.group_count().await;
 
-        if mdk_count != plane_count {
+        if runtime_group_count != plane_count {
             tracing::info!(
                 target: "whitenoise::is_account_subscriptions_operational",
                 account = %account.pubkey.to_hex(),
-                mdk_groups = mdk_count,
+                runtime_groups = runtime_group_count,
                 plane_groups = plane_count,
-                "Group count mismatch between MDK and group plane",
+                "Group count mismatch between Marmot runtime and group plane",
             );
         }
 
-        Ok(mdk_count == plane_count)
+        Ok(runtime_group_count == plane_count)
     }
 
     /// Checks if global subscriptions are operational without refreshing.

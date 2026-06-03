@@ -1,50 +1,67 @@
 use std::sync::Arc;
 
-use mdk_core::prelude::group_types::GroupState;
-use mdk_core::prelude::message_types::Message;
-use mdk_core::prelude::{GroupId, MessageProcessingOutcome, MessageProcessingResult};
-use mdk_sqlite_storage::MdkSqliteStorage;
+use cgka_traits::{
+    TransportEndpoint,
+    engine::GroupEvent,
+    ingest::{IngestOutcome, StaleReason},
+    transport::{TransportEnvelope, TransportMessage},
+    types::{GroupId as MarmotGroupId, MemberId},
+};
 use nostr_sdk::prelude::*;
+use transport_nostr_peeler::NostrTransportEvent;
 
+use crate::marmot::{
+    GroupId, Message as MarmotMessage, MessageState,
+    publish::{
+        MarmotMessagePublisher, MarmotPendingResolution, MarmotPublishedEffects, publish_effects,
+    },
+    session::{MarmotIngestEffects, MarmotSessionEffects, PublishWork},
+    transport::{MarmotPublishRoutes, MarmotRelayControlPublisher},
+};
 #[cfg(test)]
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::{
-    perf_instrument, perf_span,
+    perf_instrument,
     whitenoise::{
         Whitenoise,
         accounts::Account,
         accounts_groups::AccountGroup,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
+        database::marmot_messages::MarmotMessageProjection,
         error::{Result, WhitenoiseError},
-        media_files::MediaFile,
+        media_files::{MediaFile, MediaFiles},
         message_aggregator::processor::{extract_deletion_target_ids, extract_reaction_target_id},
         message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
         message_streaming::{MessageUpdate, UpdateTrigger},
         push_notifications::is_push_group_message_kind,
+        relays::Relay,
         session::AccountSession,
+        users::User,
     },
 };
-#[cfg(test)]
-use crate::{
-    relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
-    types::EventSource,
-};
+fn marmot_transport_message_from_event(event: &Event) -> Result<TransportMessage> {
+    let transport_event = NostrTransportEvent::from_nostr_event(event).map_err(|error| {
+        WhitenoiseError::InvalidEvent(format!("invalid Darkmatter Nostr event: {error}"))
+    })?;
+    transport_event.to_transport_message().map_err(|error| {
+        WhitenoiseError::InvalidEvent(format!("invalid Darkmatter transport event: {error}"))
+    })
+}
 
-/// Extracts the group ID from a `MessageProcessingResult`, if present.
-///
-/// Every variant except `PreviouslyFailed` carries an `mls_group_id`.
-fn extract_group_id(result: &MessageProcessingResult) -> Option<&GroupId> {
-    match result {
-        MessageProcessingResult::ApplicationMessage(msg) => Some(&msg.mls_group_id),
-        MessageProcessingResult::Commit { mls_group_id }
-        | MessageProcessingResult::PendingProposal { mls_group_id }
-        | MessageProcessingResult::ExternalJoinProposal { mls_group_id }
-        | MessageProcessingResult::Unprocessable { mls_group_id } => Some(mls_group_id),
-        MessageProcessingResult::IgnoredProposal { mls_group_id, .. } => Some(mls_group_id),
-        MessageProcessingResult::Proposal(update_result) => Some(&update_result.mls_group_id),
-        MessageProcessingResult::PreviouslyFailed => None,
-    }
+enum MarmotMlsIngestDecision {
+    Processed(MarmotIngestEffects),
+    Ignored,
+}
+
+fn ignore_darkmatter_route_miss(event_id: EventId, reason: &str) -> MarmotMlsIngestDecision {
+    tracing::debug!(
+        target: "whitenoise::event_processor::handle_mls_message",
+        event_id = %event_id.to_hex(),
+        reason,
+        "Ignoring Darkmatter MLS message with no local route"
+    );
+    MarmotMlsIngestDecision::Ignored
 }
 
 impl Whitenoise {
@@ -73,150 +90,572 @@ impl Whitenoise {
           account.pubkey.to_hex()
         );
 
-        let mdk = &*session.mdk;
-        let _mls_proc = perf_span!("event_handlers::mls_process_message");
-        let outcome = match mdk.process_message_with_context(&event) {
-            Ok(outcome) => {
-                tracing::debug!(
-                  target: "whitenoise::event_processor::handle_mls_message",
-                  "MLS message {} processed - Result variant: {}",
-                  event.id.to_hex(),
-                  match &outcome.result {
-                      mdk_core::prelude::MessageProcessingResult::ApplicationMessage(_) => "ApplicationMessage",
-                      mdk_core::prelude::MessageProcessingResult::Commit { .. } => "Commit",
-                      mdk_core::prelude::MessageProcessingResult::Proposal(_) => "Proposal",
-                      mdk_core::prelude::MessageProcessingResult::PendingProposal { .. } => "PendingProposal",
-                      mdk_core::prelude::MessageProcessingResult::IgnoredProposal { .. } => "IgnoredProposal",
-                      mdk_core::prelude::MessageProcessingResult::ExternalJoinProposal { .. } => "ExternalJoinProposal",
-                      mdk_core::prelude::MessageProcessingResult::Unprocessable { .. } => "Unprocessable",
-                      mdk_core::prelude::MessageProcessingResult::PreviouslyFailed => "PreviouslyFailed",
-                  }
-                );
-                outcome
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "whitenoise::event_processor::handle_mls_message",
-                    "MLS message handling failed for account {}: {}",
-                    account.pubkey.to_hex(),
-                    e
-                );
-                return Err(WhitenoiseError::MdkCoreError(e));
-            }
+        self.try_handle_marmot_mls_message(session, account, &event)
+            .await?;
+        Ok(())
+    }
+
+    async fn try_handle_marmot_mls_message(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        event: &Event,
+    ) -> Result<()> {
+        let ingested = match self.ingest_marmot_mls_message(session, event).await? {
+            MarmotMlsIngestDecision::Processed(ingested) => ingested,
+            MarmotMlsIngestDecision::Ignored => return Ok(()),
         };
-        drop(_mls_proc);
 
-        // Guard: skip outcome handling if no AccountGroup exists for this group.
-        // MDK has already processed the message (updating MLS state), but we
-        // must not write application-level data for a group the user deleted.
-        if let Some(group_id) = extract_group_id(&outcome.result) {
-            let has_account_group = AccountGroup::find_by_account_and_group(
-                &account.pubkey,
-                group_id,
-                &session.account_db.inner.pool,
-            )
-            .await?
-            .is_some();
-
-            if !has_account_group {
-                tracing::info!(
-                    target: "whitenoise::event_processor::event_handlers::handle_mls_message",
-                    group_id = %hex::encode(group_id.as_slice()),
-                    account = %account.pubkey.to_hex(),
-                    "Skipping outcome handling: no AccountGroup exists \
-                     (group may have been deleted)"
-                );
-                return Ok(());
-            }
-        }
-
-        if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome) {
-            self.handle_application_message_outcome(
-                session,
-                account,
-                mdk,
-                &outcome,
-                group_id,
-                inner_event,
-                message,
-            )
+        let routes = self
+            .marmot_publish_routes_for_session_effects(session, account, &ingested.effects)
             .await?;
-        }
-
-        self.handle_non_application_outcome(session, account, mdk, outcome.result)
-            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&session.ephemeral, routes);
+        self.finish_marmot_mls_message_with_publisher(
+            session, account, event.id, ingested, &publisher,
+        )
+        .await?;
 
         Ok(())
     }
 
-    #[perf_instrument("event_handlers")]
-    async fn handle_application_message_outcome(
+    #[cfg(test)]
+    async fn try_handle_marmot_mls_message_with_publisher<P>(
         &self,
         session: &Arc<AccountSession>,
         account: &Account,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
-        outcome: &MessageProcessingOutcome,
-        group_id: GroupId,
-        inner_event: UnsignedEvent,
-        message: Message,
+        event: &Event,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let ingested = match self.ingest_marmot_mls_message(session, event).await? {
+            MarmotMlsIngestDecision::Processed(ingested) => ingested,
+            MarmotMlsIngestDecision::Ignored => return Ok(()),
+        };
+
+        self.finish_marmot_mls_message_with_publisher(
+            session, account, event.id, ingested, publisher,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn ingest_marmot_mls_message(
+        &self,
+        session: &Arc<AccountSession>,
+        event: &Event,
+    ) -> Result<MarmotMlsIngestDecision> {
+        let transport_message = match marmot_transport_message_from_event(event) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::handle_mls_message",
+                    event_id = %event.id.to_hex(),
+                    error = %error,
+                    "Event is not a Darkmatter Nostr transport message"
+                );
+                return Err(error);
+            }
+        };
+        let marmot_session =
+            session
+                .marmot
+                .clone()
+                .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                    session.account_pubkey,
+                ))?;
+
+        let ingested = {
+            let mut marmot = marmot_session.lock().await;
+            if !marmot.recognizes_transport_message(&transport_message)? {
+                return Ok(ignore_darkmatter_route_miss(
+                    event.id,
+                    "unrecognized transport route",
+                ));
+            }
+            marmot.ingest(transport_message).await?
+        };
+
+        match &ingested.outcome {
+            IngestOutcome::Stale {
+                reason:
+                    reason @ (StaleReason::UnknownGroup
+                    | StaleReason::PeelFailed
+                    | StaleReason::NotForThisClient),
+            } => {
+                return Ok(ignore_darkmatter_route_miss(
+                    event.id,
+                    &format!("{reason:?}"),
+                ));
+            }
+            IngestOutcome::Stale { reason } => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::handle_mls_message",
+                    event_id = %event.id.to_hex(),
+                    reason = ?reason,
+                    "Darkmatter classified MLS message as stale"
+                );
+            }
+            IngestOutcome::Buffered { group_id, epoch } => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::handle_mls_message",
+                    event_id = %event.id.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    epoch = epoch.0,
+                    "Darkmatter buffered MLS message until the group returns to stable"
+                );
+            }
+            IngestOutcome::Processed => {}
+        }
+
+        Ok(MarmotMlsIngestDecision::Processed(ingested))
+    }
+
+    async fn finish_marmot_mls_message_with_publisher<P>(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        wrapper_event_id: EventId,
+        ingested: MarmotIngestEffects,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let marmot_session =
+            session
+                .marmot
+                .clone()
+                .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                    session.account_pubkey,
+                ))?;
+        let published = publish_effects(marmot_session, publisher, ingested.effects).await?;
+        Self::ensure_marmot_inbound_publish_succeeded(&published)?;
+
+        for failure in &published.failures {
+            tracing::warn!(
+                target: "whitenoise::event_processor::handle_mls_message",
+                account = %account.pubkey.to_hex(),
+                message_id = %hex::encode(failure.message_id.as_slice()),
+                reason = %failure.reason,
+                "Darkmatter inbound auxiliary publish failed after confirmed state transition"
+            );
+        }
+
+        for event_effect in published.events {
+            self.handle_marmot_group_event(session, account, wrapper_event_id, event_effect)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn ensure_marmot_inbound_publish_succeeded(
+        published: &MarmotPublishedEffects,
     ) -> Result<()> {
-        if is_push_group_message_kind(message.kind) {
-            if let Err(error) = session
-                .push()
-                .handle_received_push_group_message(&message, outcome.context.sender_leaf_index)
+        if published
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, MarmotPendingResolution::RolledBack { .. }))
+        {
+            let reason = published
+                .failures
+                .first()
+                .map(|failure| failure.reason.clone())
+                .unwrap_or_else(|| "Darkmatter inbound pending state was rolled back".to_string());
+            return Err(WhitenoiseError::MarmotPublishFailed(reason));
+        }
+
+        if published.pending.is_empty()
+            && let Some(failure) = published.failures.first()
+        {
+            return Err(WhitenoiseError::MarmotPublishFailed(failure.reason.clone()));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn marmot_publish_routes_for_session_effects(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        effects: &MarmotSessionEffects,
+    ) -> Result<MarmotPublishRoutes> {
+        let mut transport_group_ids = Vec::new();
+        let mut inbox_recipients = Vec::new();
+        for work in &effects.publish {
+            Self::collect_marmot_publish_work_routes(
+                work,
+                &mut transport_group_ids,
+                &mut inbox_recipients,
+            );
+        }
+
+        let mut routes = MarmotPublishRoutes::new();
+        if !transport_group_ids.is_empty() {
+            let marmot_session =
+                session
+                    .marmot
+                    .clone()
+                    .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                        session.account_pubkey,
+                    ))?;
+            let session = marmot_session.lock().await;
+            for transport_group_id in transport_group_ids {
+                routes = routes.with_group_publish_route(
+                    session.group_publish_route_for_transport_group_id(&transport_group_id)?,
+                );
+            }
+        }
+
+        for recipient in inbox_recipients {
+            let member_pubkey = PublicKey::from_slice(recipient.as_slice()).map_err(|error| {
+                WhitenoiseError::InvalidInput(format!(
+                    "invalid Marmot welcome recipient identity: {error}"
+                ))
+            })?;
+            let (user, _) =
+                User::find_or_create_by_pubkey(&member_pubkey, &self.shared.database).await?;
+            let relays = self
+                .shared
+                .resolve_member_delivery_relays(
+                    &user,
+                    account,
+                    "whitenoise::event_processor::handle_mls_message::marmot_inbound",
+                )
+                .await?;
+            let endpoints = Relay::urls(&relays)
+                .into_iter()
+                .map(|relay| TransportEndpoint(relay.to_string()))
+                .collect();
+            routes = routes.with_inbox_route(recipient, endpoints);
+        }
+
+        Ok(routes)
+    }
+
+    fn collect_marmot_publish_work_routes(
+        work: &PublishWork,
+        transport_group_ids: &mut Vec<Vec<u8>>,
+        inbox_recipients: &mut Vec<MemberId>,
+    ) {
+        match work {
+            PublishWork::ApplicationMessage { msg }
+            | PublishWork::Proposal { msg }
+            | PublishWork::AutoPublish { msg, .. } => {
+                Self::collect_marmot_message_route(msg, transport_group_ids, inbox_recipients);
+            }
+            PublishWork::GroupEvolution { msg, welcomes, .. } => {
+                Self::collect_marmot_message_route(msg, transport_group_ids, inbox_recipients);
+                for welcome in welcomes {
+                    Self::collect_marmot_message_route(
+                        welcome,
+                        transport_group_ids,
+                        inbox_recipients,
+                    );
+                }
+            }
+            PublishWork::GroupCreated { welcomes, .. } => {
+                for welcome in welcomes {
+                    Self::collect_marmot_message_route(
+                        welcome,
+                        transport_group_ids,
+                        inbox_recipients,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_marmot_message_route(
+        message: &TransportMessage,
+        transport_group_ids: &mut Vec<Vec<u8>>,
+        inbox_recipients: &mut Vec<MemberId>,
+    ) {
+        match &message.envelope {
+            TransportEnvelope::GroupMessage { transport_group_id } => {
+                if !transport_group_ids.contains(transport_group_id) {
+                    transport_group_ids.push(transport_group_id.clone());
+                }
+            }
+            TransportEnvelope::Welcome { recipient } => {
+                if !inbox_recipients.contains(recipient) {
+                    inbox_recipients.push(recipient.clone());
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn handle_marmot_group_event(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        wrapper_event_id: EventId,
+        event: GroupEvent,
+    ) -> Result<()> {
+        match event {
+            GroupEvent::MessageReceived {
+                group_id,
+                sender,
+                payload,
+            } => {
+                self.handle_marmot_application_message(
+                    session,
+                    account,
+                    group_id,
+                    sender,
+                    payload,
+                    wrapper_event_id,
+                )
                 .await
-            {
+            }
+            GroupEvent::MemberAdded { group_id, .. }
+            | GroupEvent::EpochChanged { group_id, .. }
+            | GroupEvent::ForkRecovered { group_id, .. } => {
+                self.refresh_marmot_group_projection_after_event(session, account, &group_id)
+                    .await
+            }
+            GroupEvent::MemberRemoved { group_id, member } => {
+                self.handle_marmot_member_removed(session, account, group_id, member)
+                    .await
+            }
+            GroupEvent::GroupCreated { group_id } | GroupEvent::GroupJoined { group_id, .. } => {
+                self.refresh_marmot_group_projection_after_event(session, account, &group_id)
+                    .await
+            }
+            GroupEvent::AppMessageInvalidated {
+                group_id,
+                message_id,
+                ..
+            } => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::handle_mls_message",
+                    group_id = %hex::encode(group_id.as_slice()),
+                    message_id = %hex::encode(message_id.as_slice()),
+                    "Darkmatter app-message invalidation has no WhiteNoise projection yet"
+                );
+                Ok(())
+            }
+            GroupEvent::GroupUnrecoverable { group_id } => {
                 tracing::warn!(
                     target: "whitenoise::event_processor::handle_mls_message",
                     account = %account.pubkey.to_hex(),
                     group_id = %hex::encode(group_id.as_slice()),
-                    sender_leaf_index = ?outcome.context.sender_leaf_index,
-                    message_id = ?message.event.id.map(|event_id| event_id.to_hex()),
+                    "Darkmatter group became unrecoverable"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn handle_marmot_member_removed(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        group_id: MarmotGroupId,
+        member: MemberId,
+    ) -> Result<()> {
+        let legacy_group_id = GroupId::from_slice(group_id.as_slice());
+        let local_member = {
+            let marmot_session =
+                session
+                    .marmot
+                    .clone()
+                    .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                        session.account_pubkey,
+                    ))?;
+            let session = marmot_session.lock().await;
+            session.self_id()
+        };
+        if member == local_member {
+            session
+                .membership()
+                .for_group(&legacy_group_id)
+                .mark_as_removed()
+                .await?;
+        }
+
+        self.refresh_marmot_group_projection_after_event(session, account, &group_id)
+            .await
+    }
+
+    async fn refresh_marmot_group_projection_after_event(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        group_id: &MarmotGroupId,
+    ) -> Result<()> {
+        let legacy_group_id = GroupId::from_slice(group_id.as_slice());
+        let has_account_group = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &legacy_group_id,
+            &session.account_db.inner.pool,
+        )
+        .await?
+        .is_some();
+
+        if !has_account_group {
+            tracing::info!(
+                target: "whitenoise::event_processor::handle_mls_message",
+                account = %account.pubkey.to_hex(),
+                group_id = %hex::encode(group_id.as_slice()),
+                "Skipping Darkmatter group projection refresh: no AccountGroup exists"
+            );
+            return Ok(());
+        }
+
+        let marmot_session =
+            session
+                .marmot
+                .clone()
+                .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                    session.account_pubkey,
+                ))?;
+        let projection = {
+            let session = marmot_session.lock().await;
+            session.group_projection(group_id)?
+        };
+        session.marmot_storage.put_group_projection(&projection)?;
+        if let Err(error) = session
+            .push()
+            .reconcile_group_tokens_for_active_leaves(&legacy_group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_processor::handle_mls_message",
+                account = %account.pubkey.to_hex(),
+                group_id = %hex::encode(group_id.as_slice()),
+                error = %error,
+                "Failed to reconcile group push tokens after Darkmatter projection refresh"
+            );
+        }
+
+        self.background_refresh_account_group_subscriptions(account);
+        self.background_sync_group_image_cache_if_needed(account, &legacy_group_id);
+
+        Ok(())
+    }
+
+    async fn handle_marmot_application_message(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        group_id: MarmotGroupId,
+        sender: cgka_traits::types::MemberId,
+        payload: Vec<u8>,
+        wrapper_event_id: EventId,
+    ) -> Result<()> {
+        let legacy_group_id = GroupId::from_slice(group_id.as_slice());
+        let has_account_group = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &legacy_group_id,
+            &session.account_db.inner.pool,
+        )
+        .await?
+        .is_some();
+
+        if !has_account_group {
+            tracing::info!(
+                target: "whitenoise::event_processor::event_handlers::handle_mls_message",
+                group_id = %hex::encode(group_id.as_slice()),
+                account = %account.pubkey.to_hex(),
+                "Skipping Darkmatter app message: no AccountGroup exists \
+                 (group may have been deleted)"
+            );
+            return Ok(());
+        }
+
+        let epoch = match &session.marmot {
+            Some(marmot_session) => {
+                let marmot_session = marmot_session.lock().await;
+                Some(marmot_session.group_epoch(&group_id)?)
+            }
+            None => None,
+        };
+        let marmot_message = MarmotMessage::from_app_payload(
+            legacy_group_id,
+            &payload,
+            wrapper_event_id,
+            epoch,
+            MessageState::Processed,
+            &sender,
+        )?;
+
+        if is_push_group_message_kind(marmot_message.kind) {
+            let sender_leaf_index = self
+                .marmot_sender_push_leaf_index(session, &group_id, &sender)
+                .await?;
+            if let Err(error) = session
+                .push()
+                .handle_received_push_group_message(&marmot_message, sender_leaf_index)
+                .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::event_handlers::handle_mls_message",
+                    group_id = %hex::encode(group_id.as_slice()),
+                    account = %account.pubkey.to_hex(),
                     error = %error,
-                    "Failed to reconcile received MIP-05 group message after MLS acceptance"
+                    "Failed to handle Darkmatter push group message"
                 );
             }
             return Ok(());
         }
-
-        self.handle_standard_application_message(account, mdk, group_id, inner_event, message)
+        self.handle_standard_marmot_application_message(session, account, marmot_message)
             .await
     }
 
-    #[perf_instrument("event_handlers")]
-    async fn handle_standard_application_message(
+    async fn marmot_sender_push_leaf_index(
         &self,
+        session: &Arc<AccountSession>,
+        group_id: &MarmotGroupId,
+        sender: &MemberId,
+    ) -> Result<Option<u32>> {
+        let sender_pubkey = PublicKey::from_slice(sender.as_slice()).map_err(|error| {
+            WhitenoiseError::InvalidInput(format!("invalid Darkmatter push sender pubkey: {error}"))
+        })?;
+        let marmot_session =
+            session
+                .marmot
+                .clone()
+                .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                    session.account_pubkey,
+                ))?;
+        let member_index = {
+            let marmot_session = marmot_session.lock().await;
+            marmot_session.push_member_index_map(group_id)?
+        };
+
+        Ok(member_index
+            .into_iter()
+            .find_map(|(index, pubkey)| (pubkey == sender_pubkey).then_some(index)))
+    }
+
+    async fn handle_standard_marmot_application_message(
+        &self,
+        session: &Arc<AccountSession>,
         account: &Account,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
-        group_id: GroupId,
-        inner_event: UnsignedEvent,
-        message: Message,
+        marmot_message: MarmotMessage,
     ) -> Result<()> {
-        let session = self
-            .account_manager
-            .get_session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        let media_files = crate::whitenoise::media_files::MediaFiles::new(
+        let group_id = marmot_message.mls_group_id.clone();
+        let media_files = MediaFiles::new(
             &self.shared.storage,
             &self.shared.database,
             &session.account_db.inner.pool,
         );
-
-        let parsed_references = {
-            let media_manager = mdk.media_manager(group_id.clone());
-            media_files.parse_imeta_tags_from_event(&inner_event, &media_manager)?
-        };
-
+        let parsed_references = media_files.parse_imeta_tags_from_event(&marmot_message.event)?;
         media_files
             .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
             .await?;
 
-        match message.kind {
+        MarmotMessageProjection::upsert(&marmot_message, &session.account_db.inner).await?;
+        match marmot_message.kind {
             Kind::ChatMessage => {
                 let msg = self
-                    .cache_chat_message(&account.pubkey, &group_id, &message)
+                    .cache_chat_message(&account.pubkey, &group_id, &marmot_message)
                     .await?;
-                let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
+                let group_name = session.groups().get(&group_id).ok().map(|group| group.name);
                 self.spawn_new_message_notification_if_enabled(
                     account, &group_id, &msg, group_name,
                 );
@@ -230,18 +669,26 @@ impl Whitenoise {
             }
             Kind::Reaction => {
                 if let Some(target) = self
-                    .cache_reaction(&account.pubkey, &group_id, &message)
+                    .cache_reaction(&account.pubkey, &group_id, &marmot_message)
                     .await?
                 {
                     self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
                 }
             }
             Kind::EventDeletion => {
-                self.handle_deletion_application_message(&account.pubkey, &group_id, &message)
-                    .await?;
+                self.handle_deletion_application_message(
+                    &account.pubkey,
+                    &group_id,
+                    &marmot_message,
+                )
+                .await?;
             }
             _ => {
-                tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
+                tracing::debug!(
+                    target: "whitenoise::event_processor::handle_mls_message",
+                    "Ignoring Darkmatter app message kind {:?} for cache",
+                    marmot_message.kind
+                );
             }
         }
 
@@ -252,7 +699,7 @@ impl Whitenoise {
         &self,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
-        message: &Message,
+        message: &MarmotMessage,
     ) -> Result<()> {
         // Capture the pre-deletion last message so authorized deletes can emit
         // LastMessageDeleted after cache_deletion mutates the target row.
@@ -279,196 +726,6 @@ impl Whitenoise {
         }
 
         Ok(())
-    }
-
-    #[perf_instrument("event_handlers")]
-    async fn handle_non_application_outcome(
-        &self,
-        session: &Arc<AccountSession>,
-        account: &Account,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
-        result: MessageProcessingResult,
-    ) -> Result<()> {
-        // Dispatch on every variant explicitly so the compiler enforces exhaustiveness.
-        // Unprocessable and PreviouslyFailed are returned as errors so the caller does
-        // not mark the event as processed or advance last_synced_at.
-        match result {
-            MessageProcessingResult::ApplicationMessage(_) => Ok(()),
-            MessageProcessingResult::Proposal(update_result) => {
-                self.handle_auto_committed_proposal(session, account, update_result)
-                    .await
-            }
-            MessageProcessingResult::PendingProposal { mls_group_id } => {
-                tracing::info!(
-                    target: "whitenoise::event_processor::handle_mls_message",
-                    "Stored pending proposal for group {} (awaiting admin commit)",
-                    hex::encode(mls_group_id.as_slice())
-                );
-                Ok(())
-            }
-            MessageProcessingResult::IgnoredProposal {
-                mls_group_id,
-                reason,
-            } => {
-                tracing::info!(
-                    target: "whitenoise::event_processor::handle_mls_message",
-                    "Ignored proposal for group {}: {}",
-                    hex::encode(mls_group_id.as_slice()),
-                    reason
-                );
-                Ok(())
-            }
-            MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
-                tracing::info!(
-                    target: "whitenoise::event_processor::handle_mls_message",
-                    "Received external join proposal for group {}",
-                    hex::encode(mls_group_id.as_slice())
-                );
-                Ok(())
-            }
-            MessageProcessingResult::Commit { mls_group_id } => {
-                self.handle_commit_outcome(session, account, mdk, &mls_group_id)
-                    .await
-            }
-            MessageProcessingResult::Unprocessable { mls_group_id } => {
-                tracing::warn!(
-                    target: "whitenoise::event_processor::handle_mls_message",
-                    "MLS message unprocessable for group {} (account {}): \
-                     event will not be marked processed",
-                    hex::encode(mls_group_id.as_slice()),
-                    account.pubkey.to_hex()
-                );
-                Err(WhitenoiseError::MlsMessageUnprocessable(hex::encode(
-                    mls_group_id.as_slice(),
-                )))
-            }
-            MessageProcessingResult::PreviouslyFailed => {
-                tracing::warn!(
-                    target: "whitenoise::event_processor::handle_mls_message",
-                    "MLS message was previously failed for account {}: \
-                     event will not be marked processed",
-                    account.pubkey.to_hex()
-                );
-                Err(WhitenoiseError::MlsMessagePreviouslyFailed)
-            }
-        }
-    }
-
-    #[perf_instrument("event_handlers")]
-    async fn handle_auto_committed_proposal(
-        &self,
-        session: &Arc<AccountSession>,
-        account: &Account,
-        update_result: mdk_core::prelude::UpdateGroupResult,
-    ) -> Result<()> {
-        let group_id = &update_result.mls_group_id;
-        let groups = session.groups();
-        let relay_urls = groups.ensure_relays(group_id)?;
-
-        groups
-            .publish_and_merge_commit(update_result.evolution_event.clone(), group_id, &relay_urls)
-            .await?;
-
-        self.background_refresh_account_group_subscriptions(account);
-
-        if let Some(welcome_rumors) = &update_result.welcome_rumors
-            && !welcome_rumors.is_empty()
-        {
-            tracing::warn!(
-                target: "whitenoise::event_processor::handle_mls_message",
-                "Auto-committed proposal produced {} welcome rumors that were not delivered",
-                welcome_rumors.len()
-            );
-        }
-
-        tracing::info!(
-            target: "whitenoise::event_processor::handle_mls_message",
-            "Published auto-committed proposal evolution event for group {}",
-            hex::encode(group_id.as_slice())
-        );
-
-        self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewLastMessage)
-            .await;
-        self.background_sync_group_image_cache_if_needed(account, group_id);
-
-        Ok(())
-    }
-
-    #[perf_instrument("event_handlers")]
-    async fn handle_commit_outcome(
-        &self,
-        session: &Arc<AccountSession>,
-        account: &Account,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
-        mls_group_id: &GroupId,
-    ) -> Result<()> {
-        tracing::info!(
-            target: "whitenoise::event_processor::handle_mls_message",
-            "Processed commit for group {}",
-            hex::encode(mls_group_id.as_slice())
-        );
-
-        let still_active = match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
-            Some(group) => group.state == GroupState::Active,
-            None => false,
-        };
-
-        if !still_active {
-            tracing::info!(
-                target: "whitenoise::event_processor::handle_mls_message",
-                "Account {} was removed from group {} — marking group as removed",
-                account.pubkey.to_hex(),
-                hex::encode(mls_group_id.as_slice())
-            );
-            let _ = session
-                .membership()
-                .for_group(mls_group_id)
-                .mark_as_removed()
-                .await?;
-        }
-
-        if still_active
-            && let Err(error) = session
-                .push()
-                .reconcile_group_tokens_for_active_leaves(mls_group_id)
-                .await
-        {
-            tracing::warn!(
-                target: "whitenoise::event_processor::handle_mls_message",
-                account = %account.pubkey.to_hex(),
-                group_id = %hex::encode(mls_group_id.as_slice()),
-                error = %error,
-                "Failed to reconcile group push tokens after commit processing"
-            );
-        }
-
-        self.background_refresh_account_group_subscriptions(account);
-        if still_active {
-            self.background_sync_group_image_cache_if_needed(account, mls_group_id);
-        }
-
-        Ok(())
-    }
-
-    /// Extracts group_id, inner_event, and the full Message from a processing result.
-    ///
-    /// Returns Some if the result contains an application message with inner event content,
-    /// None otherwise (e.g., for commits, proposals, or other non-message results).
-    /// The returned Message preserves all MDK-set fields (processed_at, epoch, state, etc.).
-    fn extract_message_details(
-        outcome: &MessageProcessingOutcome,
-    ) -> Option<(mdk_core::prelude::GroupId, UnsignedEvent, Message)> {
-        match &outcome.result {
-            MessageProcessingResult::ApplicationMessage(message) => {
-                // The message.event is the decrypted rumor (UnsignedEvent) from the MLS message
-                Some((
-                    message.mls_group_id.clone(),
-                    message.event.clone(),
-                    message.clone(),
-                ))
-            }
-            _ => None,
-        }
     }
 
     /// Emit a message update to all subscribers of a group.
@@ -509,7 +766,7 @@ impl Whitenoise {
         &self,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
-        message: &Message,
+        message: &MarmotMessage,
     ) -> Result<ChatMessage> {
         let session = self
             .account_manager
@@ -577,7 +834,7 @@ impl Whitenoise {
         &self,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
-        message: &Message,
+        message: &MarmotMessage,
     ) -> Result<Option<ChatMessage>> {
         let session = self
             .account_manager
@@ -634,7 +891,7 @@ impl Whitenoise {
     async fn apply_reaction_to_target(
         &self,
         account_pubkey: &PublicKey,
-        reaction: &Message,
+        reaction: &MarmotMessage,
         group_id: &GroupId,
     ) -> Result<Option<ChatMessage>> {
         let session = self
@@ -687,7 +944,7 @@ impl Whitenoise {
         &self,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
-        message: &Message,
+        message: &MarmotMessage,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
         let session = self
             .account_manager
@@ -734,7 +991,7 @@ impl Whitenoise {
     async fn apply_deletions_to_targets(
         &self,
         account_pubkey: &PublicKey,
-        deletion: &Message,
+        deletion: &MarmotMessage,
         group_id: &GroupId,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
         let target_ids = extract_deletion_target_ids(&deletion.tags);
@@ -989,63 +1246,416 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
-
-    use mdk_core::mip05::{
-        ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
-        build_token_removal_rumor, build_token_request_rumor,
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
     };
-    use mdk_core::prelude::UpdateGroupResult;
+
+    use cgka_traits::app_components::{
+        AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
+    };
+    use cgka_traits::app_event::MarmotAppEvent;
+    use cgka_traits::engine::{CreateGroupRequest, KeyPackage};
+    use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+    use cgka_traits::types::MessageId;
+    use transport_nostr_peeler::NostrTransportEvent;
 
     use super::*;
-    use crate::whitenoise::{
-        aggregated_message::AggregatedMessage, group_information::GroupInformation,
-        message_aggregator::DeliveryStatus, push_notifications::GroupPushToken, test_utils::*,
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
+    use crate::marmot::push::{
+        ENCRYPTED_TOKEN_LEN, EncryptedToken, LeafTokenTag, NotificationPlatform, TokenTag,
+        build_token_list_response_rumor, build_token_removal_rumor, build_token_request_rumor,
+        push_token_fingerprint,
     };
+    use crate::whitenoise::{
+        aggregated_message::AggregatedMessage,
+        database::group_push_tokens::GroupPushTokenUpsert,
+        group_information::GroupType,
+        message_aggregator::DeliveryStatus,
+        push_notifications::{GroupPushToken, PushPlatform},
+        test_utils::*,
+    };
+
+    #[derive(Clone, Default)]
+    struct RecordingMarmotPublisher {
+        messages: Arc<Mutex<Vec<TransportMessage>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MarmotMessagePublisher for RecordingMarmotPublisher {
+        async fn publish(&self, message: TransportMessage) -> MarmotPublishOutcome {
+            self.messages.lock().unwrap().push(message);
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
+
+    impl RecordingMarmotPublisher {
+        fn welcome_for(&self, recipient: PublicKey) -> TransportMessage {
+            self.messages
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|message| {
+                    matches!(
+                        &message.envelope,
+                        TransportEnvelope::Welcome { recipient: member }
+                            if member.as_slice() == recipient.as_bytes()
+                    )
+                })
+                .cloned()
+                .expect("expected a welcome message for recipient")
+        }
+
+        fn group_messages(&self) -> Vec<TransportMessage> {
+            self.messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    matches!(message.envelope, TransportEnvelope::GroupMessage { .. })
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    async fn create_local_marmot_test_session(
+        whitenoise: &Arc<Whitenoise>,
+    ) -> (Account, Keys, Arc<AccountSession>) {
+        let keys = Keys::generate();
+        let (account, _) = Account::new(whitenoise, Some(keys.clone())).await.unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
+        let session = Arc::new(
+            AccountSession::from_account(&account, whitenoise)
+                .await
+                .unwrap(),
+        );
+        whitenoise.account_manager.insert_session(session.clone());
+
+        (account, keys, session)
+    }
+
+    async fn setup_two_member_marmot_group_without_relay_publish(
+        creator_session: &Arc<AccountSession>,
+        member_session: &Arc<AccountSession>,
+        creator_pubkey: PublicKey,
+        member_pubkey: PublicKey,
+    ) -> GroupId {
+        setup_marmot_group_without_relay_publish(
+            creator_session,
+            creator_pubkey,
+            &[(member_session, member_pubkey)],
+            GroupType::Group,
+        )
+        .await
+    }
+
+    async fn setup_marmot_group_without_relay_publish(
+        creator_session: &Arc<AccountSession>,
+        creator_pubkey: PublicKey,
+        members: &[(&Arc<AccountSession>, PublicKey)],
+        group_type: GroupType,
+    ) -> GroupId {
+        let mut member_key_packages = Vec::with_capacity(members.len());
+        for (index, (member_session, _member_pubkey)) in members.iter().enumerate() {
+            let marker = 0xD1_u8.saturating_add(index as u8);
+            let marmot = member_session
+                .marmot
+                .clone()
+                .expect("Marmot session exists");
+            let mut marmot = marmot.lock().await;
+            member_key_packages.push(key_package_with_source_event_id(
+                marmot.fresh_key_package().await.unwrap(),
+                marker,
+            ));
+        }
+
+        let routing =
+            NostrRoutingV1::new([0xD2; 32], vec!["ws://localhost:8080/".to_string()]).unwrap();
+        let created = {
+            let marmot = creator_session
+                .marmot
+                .clone()
+                .expect("Marmot session exists");
+            let mut marmot = marmot.lock().await;
+            marmot
+                .create_group(CreateGroupRequest {
+                    name: "Darkmatter test".to_string(),
+                    description: "Darkmatter test group".to_string(),
+                    members: member_key_packages,
+                    required_features: Vec::new(),
+                    app_components: vec![AppComponentData {
+                        component_id: NOSTR_ROUTING_COMPONENT_ID,
+                        data: encode_nostr_routing_v1(&routing).unwrap(),
+                    }],
+                    initial_admins: Vec::new(),
+                })
+                .await
+                .unwrap()
+        };
+        let PublishWork::GroupCreated {
+            pending, welcomes, ..
+        } = &created.effects.publish[0]
+        else {
+            panic!("Darkmatter group creation must produce pending publish work");
+        };
+        let projection = {
+            let marmot = creator_session
+                .marmot
+                .clone()
+                .expect("Marmot session exists");
+            let mut marmot = marmot.lock().await;
+            marmot.confirm_published(*pending).await.unwrap();
+            marmot.group_projection(&created.group_id).unwrap()
+        };
+
+        let member_pubkeys = members
+            .iter()
+            .map(|(_member_session, member_pubkey)| *member_pubkey)
+            .collect::<Vec<_>>();
+        let group_id = creator_session
+            .groups()
+            .project_created_marmot_group(&projection, &member_pubkeys, Some(group_type.clone()))
+            .await
+            .unwrap();
+
+        for (member_session, member_pubkey) in members {
+            let welcome = welcomes
+                .iter()
+                .find(|message| {
+                    matches!(
+                        &message.envelope,
+                        TransportEnvelope::Welcome { recipient }
+                            if recipient.as_slice() == member_pubkey.as_bytes()
+                    )
+                })
+                .cloned()
+                .expect("group creation should produce a welcome for every member");
+            let member_group_id = project_marmot_welcome_for_account(
+                member_session,
+                welcome,
+                creator_pubkey,
+                group_type.clone(),
+            )
+            .await;
+            assert_eq!(member_group_id, group_id);
+        }
+
+        group_id
+    }
+
+    fn key_package_with_source_event_id(key_package: KeyPackage, marker: u8) -> KeyPackage {
+        KeyPackage::with_source_event_id(
+            key_package.bytes().to_vec(),
+            MessageId::new(vec![marker; 32]),
+        )
+    }
+
+    async fn project_marmot_welcome_for_account(
+        session: &Arc<AccountSession>,
+        welcome: TransportMessage,
+        welcomer_pubkey: PublicKey,
+        group_type: GroupType,
+    ) -> GroupId {
+        let marmot = session.marmot.clone().expect("Marmot session exists");
+        let projection = {
+            let mut session = marmot.lock().await;
+            let joined = session.ingest(welcome).await.unwrap();
+            let group_id = joined
+                .effects
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. } => {
+                        Some(group_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("welcome ingest should join the Marmot group");
+            session.group_projection(&group_id).unwrap()
+        };
+        let group_id = session
+            .groups()
+            .project_joined_marmot_group(&projection, Some(group_type), welcomer_pubkey)
+            .await
+            .unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .accept()
+            .await
+            .unwrap();
+
+        group_id
+    }
+
+    async fn setup_two_member_marmot_group(
+        whitenoise: &Whitenoise,
+        creator_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        wait_for_key_package_publication(whitenoise, &[member_account]).await;
+
+        let creator_session = whitenoise
+            .require_session(&creator_account.pubkey)
+            .expect("creator must have an active session");
+        let member_session = whitenoise
+            .require_session(&member_account.pubkey)
+            .expect("member must have an active session");
+        let group_publisher = RecordingMarmotPublisher::default();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                darkmatter_test_group_config(vec![creator_account.pubkey]),
+                Some(GroupType::Group),
+                &group_publisher,
+            )
+            .await
+            .unwrap();
+
+        let member_group_id = project_marmot_welcome_for_account(
+            &member_session,
+            group_publisher.welcome_for(member_account.pubkey),
+            creator_account.pubkey,
+            GroupType::Group,
+        )
+        .await;
+        assert_eq!(member_group_id, group.mls_group_id);
+
+        group.mls_group_id
+    }
+
+    fn darkmatter_test_group_config(admins: Vec<PublicKey>) -> crate::marmot::GroupConfig {
+        crate::marmot::GroupConfig::new(
+            "Darkmatter test".to_string(),
+            "Darkmatter test group".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:8080/").unwrap()],
+            admins,
+            None,
+        )
+    }
+
+    fn marmot_app_payload_from_unsigned_event(
+        inner_event: &UnsignedEvent,
+        expected_event_id: EventId,
+    ) -> Vec<u8> {
+        let tags = inner_event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        let app_event = MarmotAppEvent::new(
+            inner_event.pubkey.to_hex(),
+            inner_event.created_at.as_secs(),
+            u64::from(inner_event.kind.as_u16()),
+            tags,
+            inner_event.content.clone(),
+        );
+
+        assert_eq!(
+            app_event.id,
+            expected_event_id.to_hex(),
+            "test app payload must preserve the canonical Nostr event id"
+        );
+
+        app_event.encode().unwrap()
+    }
+
+    fn marmot_message_from_unsigned_event(
+        group_id: &GroupId,
+        mut inner_event: UnsignedEvent,
+    ) -> (MarmotMessage, EventId) {
+        inner_event.ensure_id();
+        let message_id = inner_event.id.expect("ensure_id sets the id");
+        let message = MarmotMessage::from_unsigned_app_event(
+            group_id.clone(),
+            inner_event,
+            EventId::all_zeros(),
+            Some(0),
+            MessageState::Processed,
+        )
+        .unwrap();
+
+        (message, message_id)
+    }
+
+    async fn darkmatter_app_message_event(
+        session: &Arc<AccountSession>,
+        group_id: &GroupId,
+        mut inner_event: UnsignedEvent,
+    ) -> (Event, EventId) {
+        inner_event.ensure_id();
+        let message_id = inner_event.id.expect("ensure_id sets the id");
+        let payload = marmot_app_payload_from_unsigned_event(&inner_event, message_id);
+        let effects = {
+            let marmot = session.marmot.clone().expect("Marmot session exists");
+            let mut session = marmot.lock().await;
+            session
+                .send_app_message(MarmotGroupId::new(group_id.as_slice().to_vec()), payload)
+                .await
+                .unwrap()
+        };
+        let transport_message = effects
+            .publish
+            .into_iter()
+            .find_map(|work| match work {
+                PublishWork::ApplicationMessage { msg } => Some(msg),
+                _ => None,
+            })
+            .expect("send should produce an application transport message");
+        let nostr_event = NostrTransportEvent::from_transport_message(&transport_message)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+
+        (nostr_event, message_id)
+    }
+
+    async fn marmot_push_leaf_index(
+        session: &Arc<AccountSession>,
+        group_id: &GroupId,
+        pubkey: PublicKey,
+    ) -> u32 {
+        let marmot = session.marmot.clone().expect("Marmot session exists");
+        let session = marmot.lock().await;
+        session
+            .push_member_index_map(&MarmotGroupId::new(group_id.as_slice().to_vec()))
+            .unwrap()
+            .into_iter()
+            .find_map(|(leaf_index, member_pubkey)| (member_pubkey == pubkey).then_some(leaf_index))
+            .expect("member should have a Darkmatter push leaf index")
+    }
 
     fn make_token_tag(seed: u8) -> TokenTag {
         TokenTag {
-            encrypted_token: mdk_core::mip05::EncryptedToken::from([seed; ENCRYPTED_TOKEN_LEN]),
+            encrypted_token: EncryptedToken::from([seed; ENCRYPTED_TOKEN_LEN]),
+            platform: None,
+            token_fingerprint: None,
             server_pubkey: Keys::generate().public_key(),
             relay_hint: RelayUrl::parse("wss://push.example.com").unwrap(),
         }
     }
 
-    async fn setup_two_member_group(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_account: &Account,
-    ) -> GroupId {
-        setup_two_member_group_with_accepted_account_groups(
-            whitenoise,
-            admin_account,
-            member_account,
-        )
-        .await
-    }
-
-    async fn setup_three_member_accepted_group(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_one: &Account,
-        member_two: &Account,
-    ) -> GroupId {
-        let group_id =
-            setup_three_member_group(whitenoise, admin_account, member_one, member_two).await;
-
-        GroupInformation::create_for_group(whitenoise, &group_id, None, "Test group")
-            .await
-            .unwrap();
-
-        for account in [admin_account, member_one, member_two] {
-            let (account_group, _) =
-                AccountGroup::get_or_create(whitenoise, &account.pubkey, &group_id, None)
-                    .await
-                    .unwrap();
-            account_group.accept(whitenoise).await.unwrap();
+    fn make_darkmatter_token_tag(seed: u8) -> TokenTag {
+        TokenTag {
+            encrypted_token: EncryptedToken::from([seed; ENCRYPTED_TOKEN_LEN]),
+            platform: Some(NotificationPlatform::Fcm),
+            token_fingerprint: Some(push_token_fingerprint(
+                NotificationPlatform::Fcm,
+                format!("firebase-token-{seed}").as_bytes(),
+            )),
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: RelayUrl::parse("wss://push.example.com").unwrap(),
         }
-
-        group_id
     }
 
     async fn assert_cached_peer_tokens(
@@ -1084,6 +1694,269 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_handle_mls_message_accepts_darkmatter_app_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let alice_account = whitenoise.create_identity().await.unwrap();
+        let bob_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&bob_account]).await;
+
+        let alice_session = whitenoise.require_session(&alice_account.pubkey).unwrap();
+        let bob_session = whitenoise.require_session(&bob_account.pubkey).unwrap();
+        let group_publisher = RecordingMarmotPublisher::default();
+        let group = alice_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![bob_account.pubkey],
+                darkmatter_test_group_config(vec![alice_account.pubkey]),
+                Some(GroupType::Group),
+                &group_publisher,
+            )
+            .await
+            .unwrap();
+
+        let welcome = group_publisher.welcome_for(bob_account.pubkey);
+        let bob_marmot = bob_session.marmot.clone().expect("Marmot session exists");
+        let bob_projection = {
+            let mut session = bob_marmot.lock().await;
+            let joined = session.ingest(welcome).await.unwrap();
+            assert!(
+                joined.effects.events.iter().any(|event| matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::GroupJoined { .. }
+                )),
+                "welcome ingest should join the Marmot group"
+            );
+            session
+                .group_projection(&cgka_traits::types::GroupId::new(
+                    group.mls_group_id.as_slice().to_vec(),
+                ))
+                .unwrap()
+        };
+        bob_session
+            .groups()
+            .project_created_marmot_group(
+                &bob_projection,
+                &[alice_account.pubkey],
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        let original_hash = [0x11; 32];
+        let encrypted_hash = [0x22; 32];
+        let nonce = [0x33; 12];
+        let imeta_tag = Tag::custom(
+            TagKind::Custom("imeta".into()),
+            [
+                format!(
+                    "url http://localhost:3000/{}.png",
+                    hex::encode(encrypted_hash)
+                ),
+                "m image/png".to_string(),
+                "filename darkmatter-media.png".to_string(),
+                format!("x {}", hex::encode(original_hash)),
+                format!("n {}", hex::encode(nonce)),
+                "v mip04-v2".to_string(),
+            ],
+        );
+        let app_event = MarmotAppEvent::new(
+            alice_account.pubkey.to_hex(),
+            Timestamp::now().as_secs(),
+            9,
+            vec![imeta_tag.as_slice().to_vec()],
+            "hello through darkmatter ingest",
+        );
+        let sent = {
+            let alice_marmot = alice_session.marmot.clone().expect("Marmot session exists");
+            let mut session = alice_marmot.lock().await;
+            session
+                .send_app_message(
+                    cgka_traits::types::GroupId::new(group.mls_group_id.as_slice().to_vec()),
+                    app_event.encode().unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let transport_message = sent
+            .publish
+            .into_iter()
+            .find_map(|work| match work {
+                crate::marmot::session::PublishWork::ApplicationMessage { msg } => Some(msg),
+                _ => None,
+            })
+            .expect("send should produce an application transport message");
+        let mls_event = NostrTransportEvent::from_transport_message(&transport_message)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+
+        whitenoise
+            .handle_mls_message(&bob_session, &bob_account, mls_event)
+            .await
+            .unwrap();
+
+        let cached = AggregatedMessage::find_by_id(
+            &app_event.id,
+            &group.mls_group_id,
+            &bob_account.pubkey,
+            &bob_session.account_db.inner,
+        )
+        .await
+        .unwrap()
+        .expect("Darkmatter app message should be cached for the recipient");
+        assert_eq!(cached.content, "hello through darkmatter ingest");
+        assert_eq!(cached.author, alice_account.pubkey);
+
+        let media_files = MediaFile::find_by_group(
+            &bob_session.account_db.inner.pool,
+            &whitenoise.shared.database,
+            &bob_account.pubkey,
+            &group.mls_group_id,
+        )
+        .await
+        .unwrap();
+        let media_file = media_files
+            .iter()
+            .find(|file| file.original_file_hash.as_deref() == Some(original_hash.as_slice()))
+            .expect("Darkmatter imeta reference should be stored for the recipient");
+        assert_eq!(media_file.encrypted_file_hash, encrypted_hash);
+        assert_eq!(media_file.mime_type, "image/png");
+        assert_eq!(media_file.media_type, "chat_media");
+        assert_eq!(
+            media_file.nonce.as_deref(),
+            Some(hex::encode(nonce).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_publishes_darkmatter_selfremove_auto_commit() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (alice_account, _alice_keys, alice_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (bob_account, _bob_keys, bob_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (carol_account, _carol_keys, carol_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_marmot_group_without_relay_publish(
+            &alice_session,
+            alice_account.pubkey,
+            &[
+                (&bob_session, bob_account.pubkey),
+                (&carol_session, carol_account.pubkey),
+            ],
+            GroupType::Group,
+        )
+        .await;
+
+        let bob_leave_publisher = RecordingMarmotPublisher::default();
+        bob_session
+            .groups()
+            .leave_marmot_group_with_publisher(&group_id, &bob_leave_publisher)
+            .await
+            .unwrap();
+        let bob_leave_messages = bob_leave_publisher.group_messages();
+        let [self_remove_proposal] = bob_leave_messages.as_slice() else {
+            panic!("Bob leave should publish one SelfRemove proposal");
+        };
+        let proposal_event = NostrTransportEvent::from_transport_message(self_remove_proposal)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+
+        let alice_inbound_publisher = RecordingMarmotPublisher::default();
+        whitenoise
+            .try_handle_marmot_mls_message_with_publisher(
+                &alice_session,
+                &alice_account,
+                &proposal_event,
+                &alice_inbound_publisher,
+            )
+            .await
+            .expect("Alice should handle Bob's SelfRemove proposal as a Darkmatter message");
+
+        let alice_inbound_messages = alice_inbound_publisher.group_messages();
+        let [auto_commit] = alice_inbound_messages.as_slice() else {
+            panic!("Alice should publish one Darkmatter auto-commit for Bob's SelfRemove");
+        };
+        assert!(matches!(
+            auto_commit.envelope,
+            TransportEnvelope::GroupMessage { .. }
+        ));
+
+        let members = alice_session.groups().members(&group_id).unwrap();
+        assert!(!members.contains(&bob_account.pubkey));
+        assert!(members.contains(&alice_account.pubkey));
+        assert!(members.contains(&carol_account.pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_emits_removed_from_group_after_darkmatter_removal_commit() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (alice_account, _alice_keys, alice_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (bob_account, _bob_keys, bob_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (carol_account, _carol_keys, carol_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_marmot_group_without_relay_publish(
+            &alice_session,
+            alice_account.pubkey,
+            &[
+                (&bob_session, bob_account.pubkey),
+                (&carol_session, carol_account.pubkey),
+            ],
+            GroupType::Group,
+        )
+        .await;
+
+        let mut group_state_updates = whitenoise
+            .subscribe_to_group_state(&carol_account.pubkey, &group_id)
+            .await
+            .unwrap()
+            .updates;
+
+        let removal_publisher = RecordingMarmotPublisher::default();
+        alice_session
+            .groups()
+            .remove_marmot_members_with_publisher(
+                &group_id,
+                vec![carol_account.pubkey],
+                &removal_publisher,
+            )
+            .await
+            .unwrap();
+
+        let group_messages = removal_publisher.group_messages();
+        let [removal_commit] = group_messages.as_slice() else {
+            panic!("Alice removal should publish one Darkmatter group evolution commit");
+        };
+        let removal_event = NostrTransportEvent::from_transport_message(removal_commit)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+
+        whitenoise
+            .try_handle_marmot_mls_message_with_publisher(
+                &carol_session,
+                &carol_account,
+                &removal_event,
+                &RecordingMarmotPublisher::default(),
+            )
+            .await
+            .expect("Carol should handle Alice's removal commit as a Darkmatter message");
+
+        let update = tokio::time::timeout(Duration::from_secs(1), group_state_updates.recv())
+            .await
+            .expect("removed member should receive a group-state update")
+            .expect("group-state stream should remain open");
+
+        assert_eq!(
+            update,
+            crate::whitenoise::group_state_streaming::GroupStateUpdate::RemovedFromGroup
+        );
+    }
+
     /// Test handling of different MLS message types: regular messages, reactions, and deletions
     #[tokio::test]
     async fn test_handle_mls_message_different_types() {
@@ -1092,77 +1965,60 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkey = members[0].0.pubkey;
-
-        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let group_id = &group.mls_group_id;
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &creator_account, &member_account).await;
 
         // Test 1: Regular message (Kind 9)
-        let mut inner = UnsignedEvent::new(
+        let inner = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::Custom(9),
             vec![],
             "Test message".to_string(),
         );
-        inner.ensure_id();
-        let message_id = inner.id.unwrap();
-        let message_event = mdk.create_message(group_id, inner, None).unwrap();
+        let (message_event, message_id) =
+            darkmatter_app_message_event(&creator_session, &group_id, inner).await;
 
         let result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, message_event)
+            .handle_mls_message(&member_session, &member_account, message_event)
             .await;
         assert!(result.is_ok(), "Failed to handle regular message");
 
         // Verify message was cached
         let cached_msg = AggregatedMessage::find_by_id(
             &message_id.to_string(),
-            group_id,
-            &creator_account.pubkey,
-            &creator_session.account_db.inner,
+            &group_id,
+            &member_account.pubkey,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap();
         assert!(cached_msg.is_some(), "Message should be cached");
 
         // Test 2: Reaction message (Kind 7)
-        let mut reaction_inner = UnsignedEvent::new(
+        let reaction_inner = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::Reaction,
             vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
             "👍".to_string(),
         );
-        reaction_inner.ensure_id();
-        let reaction_event = mdk.create_message(group_id, reaction_inner, None).unwrap();
+        let (reaction_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, reaction_inner).await;
 
         let result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, reaction_event)
+            .handle_mls_message(&member_session, &member_account, reaction_event)
             .await;
         assert!(result.is_ok(), "Failed to handle reaction");
 
         // Verify reaction was applied to cached message
         let cached_msg = AggregatedMessage::find_by_id(
             &message_id.to_string(),
-            group_id,
-            &creator_account.pubkey,
-            &creator_session.account_db.inner,
+            &group_id,
+            &member_account.pubkey,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1173,27 +2029,27 @@ mod tests {
         );
 
         // Test 3: Deletion message (Kind 5)
-        let mut deletion_inner = UnsignedEvent::new(
+        let deletion_inner = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::EventDeletion,
             vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
             String::new(),
         );
-        deletion_inner.ensure_id();
-        let deletion_event = mdk.create_message(group_id, deletion_inner, None).unwrap();
+        let (deletion_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, deletion_inner).await;
 
         let result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, deletion_event)
+            .handle_mls_message(&member_session, &member_account, deletion_event)
             .await;
         assert!(result.is_ok(), "Failed to handle deletion");
 
         // Verify message was marked as deleted
         let cached_msg = AggregatedMessage::find_by_id(
             &message_id.to_string(),
-            group_id,
-            &creator_account.pubkey,
-            &creator_session.account_db.inner,
+            &group_id,
+            &member_account.pubkey,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1202,63 +2058,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_mls_message_rejects_cross_author_deletion() {
+    async fn test_handle_darkmatter_duplicate_message_is_idempotent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &creator_account, &member_account).await;
 
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-
-        let mut message_inner = UnsignedEvent::new(
-            admin_account.pubkey,
+        let inner = UnsignedEvent::new(
+            creator_account.pubkey,
             Timestamp::now(),
             Kind::Custom(9),
             vec![],
-            "Protected admin message".to_string(),
+            "Idempotent duplicate".to_string(),
         );
-        message_inner.ensure_id();
-        let message_id = message_inner.id.unwrap();
-        let message_event = admin_mdk
-            .create_message(&group_id, message_inner, None)
-            .unwrap();
+        let (message_event, message_id) =
+            darkmatter_app_message_event(&creator_session, &group_id, inner).await;
 
         whitenoise
-            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .handle_mls_message(&member_session, &member_account, message_event.clone())
             .await
             .unwrap();
-
-        let member_mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let mut deletion_inner = UnsignedEvent::new(
-            member_account.pubkey,
-            Timestamp::now(),
-            Kind::EventDeletion,
-            vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
-            String::new(),
-        );
-        deletion_inner.ensure_id();
-        let deletion_event = member_mdk
-            .create_message(&group_id, deletion_inner, None)
-            .unwrap();
-
         whitenoise
-            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .handle_mls_message(&member_session, &member_account, message_event)
             .await
             .unwrap();
 
         let cached_msg = AggregatedMessage::find_by_id(
             &message_id.to_string(),
             &group_id,
-            &admin_account.pubkey,
-            &admin_session.account_db.inner,
+            &member_account.pubkey,
+            &member_session.account_db.inner,
+        )
+        .await
+        .unwrap();
+        assert!(cached_msg.is_some(), "Message should remain cached once");
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_rejects_cross_author_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (receiver_account, _receiver_keys, receiver_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (attacker_account, _attacker_keys, attacker_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_marmot_group_without_relay_publish(
+            &admin_session,
+            admin_account.pubkey,
+            &[
+                (&receiver_session, receiver_account.pubkey),
+                (&attacker_session, attacker_account.pubkey),
+            ],
+            GroupType::Group,
+        )
+        .await;
+
+        let message_inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Protected admin message".to_string(),
+        );
+        let (message_event, message_id) =
+            darkmatter_app_message_event(&admin_session, &group_id, message_inner).await;
+
+        whitenoise
+            .handle_mls_message(&receiver_session, &receiver_account, message_event)
+            .await
+            .unwrap();
+
+        let deletion_inner = UnsignedEvent::new(
+            attacker_account.pubkey,
+            Timestamp::now(),
+            Kind::EventDeletion,
+            vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
+            String::new(),
+        );
+        let (deletion_event, _) =
+            darkmatter_app_message_event(&attacker_session, &group_id, deletion_inner).await;
+
+        whitenoise
+            .handle_mls_message(&receiver_session, &receiver_account, deletion_event)
+            .await
+            .unwrap();
+
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            &group_id,
+            &receiver_account.pubkey,
+            &receiver_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1269,17 +2163,23 @@ mod tests {
     #[tokio::test]
     async fn test_handle_mls_message_rejects_cross_author_orphaned_deletion() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (receiver_account, _receiver_keys, receiver_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (attacker_account, _attacker_keys, attacker_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_marmot_group_without_relay_publish(
+            &admin_session,
+            admin_account.pubkey,
+            &[
+                (&receiver_session, receiver_account.pubkey),
+                (&attacker_session, attacker_account.pubkey),
+            ],
+            GroupType::Group,
+        )
+        .await;
 
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
         let mut message_inner = UnsignedEvent::new(
             admin_account.pubkey,
             Timestamp::now(),
@@ -1289,41 +2189,35 @@ mod tests {
         );
         message_inner.ensure_id();
         let future_message_id = message_inner.id.unwrap();
-        let member_mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
 
-        let mut deletion_inner = UnsignedEvent::new(
-            member_account.pubkey,
+        let deletion_inner = UnsignedEvent::new(
+            attacker_account.pubkey,
             Timestamp::now(),
             Kind::EventDeletion,
             vec![Tag::parse(vec!["e", &future_message_id.to_string()]).unwrap()],
             String::new(),
         );
-        deletion_inner.ensure_id();
-        let deletion_event = member_mdk
-            .create_message(&group_id, deletion_inner, None)
-            .unwrap();
+        let (deletion_event, _) =
+            darkmatter_app_message_event(&attacker_session, &group_id, deletion_inner).await;
 
         whitenoise
-            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .handle_mls_message(&receiver_session, &receiver_account, deletion_event)
             .await
             .unwrap();
 
-        let message_event = admin_mdk
-            .create_message(&group_id, message_inner, None)
-            .unwrap();
+        let (message_event, _) =
+            darkmatter_app_message_event(&admin_session, &group_id, message_inner).await;
 
         whitenoise
-            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .handle_mls_message(&receiver_session, &receiver_account, message_event)
             .await
             .unwrap();
 
         let cached_msg = AggregatedMessage::find_by_id(
             &future_message_id.to_string(),
             &group_id,
-            &admin_account.pubkey,
-            &admin_session.account_db.inner,
+            &receiver_account.pubkey,
+            &receiver_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1334,79 +2228,73 @@ mod tests {
     #[tokio::test]
     async fn test_handle_mls_message_rejects_cross_author_reaction_deletion() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (receiver_account, _receiver_keys, receiver_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (attacker_account, _attacker_keys, attacker_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_marmot_group_without_relay_publish(
+            &admin_session,
+            admin_account.pubkey,
+            &[
+                (&receiver_session, receiver_account.pubkey),
+                (&attacker_session, attacker_account.pubkey),
+            ],
+            GroupType::Group,
+        )
+        .await;
 
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-
-        let mut message_inner = UnsignedEvent::new(
+        let message_inner = UnsignedEvent::new(
             admin_account.pubkey,
             Timestamp::now(),
             Kind::Custom(9),
             vec![],
             "Reaction parent".to_string(),
         );
-        message_inner.ensure_id();
-        let message_id = message_inner.id.unwrap();
-        let message_event = admin_mdk
-            .create_message(&group_id, message_inner, None)
-            .unwrap();
+        let (message_event, message_id) =
+            darkmatter_app_message_event(&admin_session, &group_id, message_inner).await;
 
         whitenoise
-            .handle_mls_message(&admin_session, &admin_account, message_event)
+            .handle_mls_message(&receiver_session, &receiver_account, message_event)
             .await
             .unwrap();
 
-        let mut reaction_inner = UnsignedEvent::new(
+        let reaction_inner = UnsignedEvent::new(
             admin_account.pubkey,
             Timestamp::now(),
             Kind::Reaction,
             vec![Tag::parse(vec!["e", &message_id.to_string()]).unwrap()],
             "+".to_string(),
         );
-        reaction_inner.ensure_id();
-        let reaction_id = reaction_inner.id.unwrap();
-        let reaction_event = admin_mdk
-            .create_message(&group_id, reaction_inner, None)
-            .unwrap();
+        let (reaction_event, reaction_id) =
+            darkmatter_app_message_event(&admin_session, &group_id, reaction_inner).await;
 
         whitenoise
-            .handle_mls_message(&admin_session, &admin_account, reaction_event)
+            .handle_mls_message(&receiver_session, &receiver_account, reaction_event)
             .await
             .unwrap();
 
-        let member_mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let mut deletion_inner = UnsignedEvent::new(
-            member_account.pubkey,
+        let deletion_inner = UnsignedEvent::new(
+            attacker_account.pubkey,
             Timestamp::now(),
             Kind::EventDeletion,
             vec![Tag::parse(vec!["e", &reaction_id.to_string()]).unwrap()],
             String::new(),
         );
-        deletion_inner.ensure_id();
-        let deletion_event = member_mdk
-            .create_message(&group_id, deletion_inner, None)
-            .unwrap();
+        let (deletion_event, _) =
+            darkmatter_app_message_event(&attacker_session, &group_id, deletion_inner).await;
 
         whitenoise
-            .handle_mls_message(&admin_session, &admin_account, deletion_event)
+            .handle_mls_message(&receiver_session, &receiver_account, deletion_event)
             .await
             .unwrap();
 
         let cached_msg = AggregatedMessage::find_by_id(
             &message_id.to_string(),
             &group_id,
-            &admin_account.pubkey,
-            &admin_session.account_db.inner,
+            &receiver_account.pubkey,
+            &receiver_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1422,7 +2310,7 @@ mod tests {
         let cached_reaction = AggregatedMessage::find_reaction_by_id(
             &reaction_id.to_string(),
             &group_id,
-            &admin_session.account_db.inner,
+            &receiver_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1433,48 +2321,24 @@ mod tests {
     async fn test_cache_chat_message_preserves_existing_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
-        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkey = members[0].0.pubkey;
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &creator_account, &member_account).await;
 
-        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-
-        let mut inner = UnsignedEvent::new(
+        let inner = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::Custom(9),
             vec![],
             "Echo status preservation".to_string(),
         );
-        inner.ensure_id();
-        let message_id = inner.id.unwrap();
-        mdk.create_message(&group.mls_group_id, inner, None)
-            .unwrap();
-
-        let message = mdk
-            .get_message(&group.mls_group_id, &message_id)
-            .unwrap()
-            .expect("message should exist in mdk");
+        let (message, message_id) = marmot_message_from_unsigned_event(&group_id, inner);
 
         // Initial cache pass creates the row without delivery status.
         let first = whitenoise
-            .cache_chat_message(&creator_account.pubkey, &group.mls_group_id, &message)
+            .cache_chat_message(&member_account.pubkey, &group_id, &message)
             .await
             .unwrap();
         assert_eq!(first.delivery_status, None);
@@ -1482,26 +2346,26 @@ mod tests {
         // Simulate background publish completion updating delivery status.
         AggregatedMessage::update_delivery_status(
             &message_id.to_string(),
-            &group.mls_group_id,
-            &creator_account.pubkey,
+            &group_id,
+            &member_account.pubkey,
             &DeliveryStatus::Sent(1),
-            &creator_session.account_db.inner,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap();
 
         // Relay echo reprocess should preserve the existing status.
         let second = whitenoise
-            .cache_chat_message(&creator_account.pubkey, &group.mls_group_id, &message)
+            .cache_chat_message(&member_account.pubkey, &group_id, &message)
             .await
             .unwrap();
         assert_eq!(second.delivery_status, Some(DeliveryStatus::Sent(1)));
 
         let persisted = AggregatedMessage::find_by_id(
             &message_id.to_string(),
-            &group.mls_group_id,
-            &creator_account.pubkey,
-            &creator_session.account_db.inner,
+            &group_id,
+            &member_account.pubkey,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1516,50 +2380,123 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkey = members[0].0.pubkey;
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &creator_account, &member_account).await;
 
-        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let mut inner = UnsignedEvent::new(
+        let inner = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::Custom(9),
             vec![],
             "Valid message".to_string(),
         );
-        inner.ensure_id();
-        let valid_event = mdk
-            .create_message(&group.mls_group_id, inner, None)
-            .unwrap();
+        let (valid_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, inner).await;
 
-        // Corrupt the event by changing its kind (MLS processing should fail)
+        // Corrupt the event by changing its kind. The Darkmatter peeler should
+        // reject it, and Darkmatter-only accounts must not create legacy MLS
+        // storage just to fail in the fallback path.
         let mut bad_event = valid_event;
         bad_event.kind = Kind::TextNote;
 
         let result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, bad_event)
+            .handle_mls_message(&member_session, &member_account, bad_event)
             .await;
 
         assert!(result.is_err(), "Expected error for corrupted event");
         match result.err().unwrap() {
-            WhitenoiseError::MdkCoreError(_) => {}
-            other => panic!("Expected MdkCoreError, got: {:?}", other),
+            WhitenoiseError::InvalidEvent(_) => {}
+            other => panic!("Expected InvalidEvent, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_darkmatter_event_without_marmot_does_not_fall_back_to_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (creator_account, _creator_keys, creator_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_account, member_keys, member_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_two_member_marmot_group_without_relay_publish(
+            &creator_session,
+            &member_session,
+            creator_account.pubkey,
+            member_account.pubkey,
+        )
+        .await;
+
+        let inner = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Valid Darkmatter message".to_string(),
+        );
+        let (mls_event, _) = darkmatter_app_message_event(&creator_session, &group_id, inner).await;
+        let artifacts = remove_obsolete_mls_artifacts(&member_account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+        let member_session_without_marmot = Arc::new(
+            AccountSession::new(
+                member_account.pubkey,
+                whitenoise.shared.clone(),
+                Arc::downgrade(&whitenoise),
+                Some(Arc::new(member_keys)),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let result = whitenoise
+            .handle_mls_message(&member_session_without_marmot, &member_account, mls_event)
+            .await;
+
+        match result {
+            Err(WhitenoiseError::MarmotSessionUnavailable(pubkey))
+                if pubkey == member_account.pubkey => {}
+            other => panic!("Expected MarmotSessionUnavailable, got: {other:?}"),
+        }
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_darkmatter_route_miss_does_not_fall_back_to_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (creator_account, _creator_keys, creator_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_account, _member_keys, member_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (unrelated_account, _unrelated_keys, unrelated_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_two_member_marmot_group_without_relay_publish(
+            &creator_session,
+            &member_session,
+            creator_account.pubkey,
+            member_account.pubkey,
+        )
+        .await;
+
+        let inner = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Valid Darkmatter message for another local account".to_string(),
+        );
+        let (mls_event, _) = darkmatter_app_message_event(&creator_session, &group_id, inner).await;
+        let artifacts = remove_obsolete_mls_artifacts(&unrelated_account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        whitenoise
+            .handle_mls_message(&unrelated_session, &unrelated_account, mls_event)
+            .await
+            .expect("Darkmatter route misses should be ignored without legacy fallback");
+
+        assert_obsolete_mls_artifacts_absent(&artifacts);
     }
 
     /// Test orphaned reactions and deletions are applied when target message arrives later
@@ -1569,29 +2506,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkey = members[0].0.pubkey;
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &creator_account, &member_account).await;
 
-        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let group_id = &group.mls_group_id;
-
-        // Build the message first so MDK can stamp a valid content-hash id,
-        // then tag the orphaned reaction at that id.
         let mut actual_message = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -1602,28 +2521,26 @@ mod tests {
         actual_message.ensure_id();
         let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
-        let mut orphaned_reaction = UnsignedEvent::new(
+        let orphaned_reaction = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::Reaction,
             vec![Tag::parse(vec!["e", &future_message_id.to_string()]).unwrap()],
             "+".to_string(), // Use simple emoji that won't be normalized
         );
-        orphaned_reaction.ensure_id();
-        let reaction_event = mdk
-            .create_message(group_id, orphaned_reaction, None)
-            .unwrap();
+        let (reaction_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, orphaned_reaction).await;
 
         let result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, reaction_event)
+            .handle_mls_message(&member_session, &member_account, reaction_event)
             .await;
         assert!(result.is_ok(), "Orphaned reaction should be stored");
 
         // Verify orphaned reaction is stored
         let orphaned_reactions = AggregatedMessage::find_orphaned_reactions(
             &future_message_id.to_string(),
-            group_id,
-            &creator_session.account_db.inner,
+            &group_id,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1633,10 +2550,11 @@ mod tests {
             "Should have one orphaned reaction"
         );
 
-        let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
+        let (message_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, actual_message).await;
 
         let result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, message_event)
+            .handle_mls_message(&member_session, &member_account, message_event)
             .await;
         assert!(
             result.is_ok(),
@@ -1646,9 +2564,9 @@ mod tests {
         // Verify the orphaned reaction was applied
         let cached_msg = AggregatedMessage::find_by_id(
             &future_message_id.to_string(),
-            group_id,
-            &creator_account.pubkey,
-            &creator_session.account_db.inner,
+            &group_id,
+            &member_account.pubkey,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1675,29 +2593,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkey = members[0].0.pubkey;
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &creator_account, &member_account).await;
 
-        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![member_pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let group_id = &group.mls_group_id;
-
-        // Build the target first so MDK can stamp a valid content-hash id,
-        // then tag the orphaned reactions at that id.
         let mut actual_message = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -1709,43 +2609,42 @@ mod tests {
         let future_message_id = actual_message.id.expect("ensure_id sets the id");
 
         // Send a VALID orphaned reaction
-        let mut valid_reaction = UnsignedEvent::new(
+        let valid_reaction = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::Reaction,
             vec![Tag::parse(vec!["e", &future_message_id.to_string()]).unwrap()],
             "👍".to_string(),
         );
-        valid_reaction.ensure_id();
-        let valid_event = mdk.create_message(group_id, valid_reaction, None).unwrap();
+        let (valid_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, valid_reaction).await;
 
         whitenoise
-            .handle_mls_message(&creator_session, &creator_account, valid_event)
+            .handle_mls_message(&member_session, &member_account, valid_event)
             .await
             .unwrap();
 
         // Send an INVALID orphaned reaction (empty content - not a valid emoji)
-        let mut invalid_reaction = UnsignedEvent::new(
+        let invalid_reaction = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
             Kind::Reaction,
             vec![Tag::parse(vec!["e", &future_message_id.to_string()]).unwrap()],
             "".to_string(), // Empty content is invalid
         );
-        invalid_reaction.ensure_id();
-        let invalid_event = mdk
-            .create_message(group_id, invalid_reaction, None)
-            .unwrap();
+        let (invalid_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, invalid_reaction).await;
 
         whitenoise
-            .handle_mls_message(&creator_session, &creator_account, invalid_event)
+            .handle_mls_message(&member_session, &member_account, invalid_event)
             .await
             .unwrap();
 
-        let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
+        let (message_event, _) =
+            darkmatter_app_message_event(&creator_session, &group_id, actual_message).await;
 
         let result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, message_event)
+            .handle_mls_message(&member_session, &member_account, message_event)
             .await;
 
         // The critical assertion: message processing should succeed
@@ -1757,9 +2656,9 @@ mod tests {
         // Verify only the valid reaction was applied
         let cached_msg = AggregatedMessage::find_by_id(
             &future_message_id.to_string(),
-            group_id,
-            &creator_account.pubkey,
-            &creator_session.account_db.inner,
+            &group_id,
+            &member_account.pubkey,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1777,59 +2676,9 @@ mod tests {
         );
     }
 
-    /// Test helper methods: extract_message_details, extract_reaction_target_id, etc.
+    /// Test helper methods: extract_reaction_target_id, extract_deletion_target_ids, etc.
     #[tokio::test]
     async fn test_helper_methods() {
-        let pubkey = nostr_sdk::Keys::generate().public_key();
-        let group_id = GroupId::from_slice(&[1; 32]);
-
-        // Test extract_message_details with ApplicationMessage
-        let mut inner_event = UnsignedEvent::new(
-            pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Test".to_string(),
-        );
-        inner_event.ensure_id();
-
-        let message = mdk_core::prelude::message_types::Message {
-            id: inner_event.id.unwrap(),
-            pubkey,
-            created_at: Timestamp::now(),
-            processed_at: Timestamp::now(),
-            kind: Kind::Custom(9),
-            tags: Tags::new(),
-            content: "Test".to_string(),
-            mls_group_id: group_id.clone(),
-            event: inner_event.clone(),
-            wrapper_event_id: EventId::all_zeros(),
-            epoch: None, // Epoch not needed for test message
-            state: mdk_core::prelude::message_types::MessageState::Processed,
-        };
-
-        let outcome = MessageProcessingOutcome {
-            result: MessageProcessingResult::ApplicationMessage(message),
-            context: mdk_core::prelude::MessageProcessingContext::default(),
-        };
-        let extracted = Whitenoise::extract_message_details(&outcome);
-        assert!(extracted.is_some(), "Should extract application message");
-        let (extracted_group_id, extracted_event, extracted_message) = extracted.unwrap();
-        assert_eq!(extracted_group_id, group_id);
-        assert_eq!(extracted_event.content, "Test");
-        assert_eq!(extracted_message.content, "Test");
-        assert_eq!(extracted_message.mls_group_id, group_id);
-
-        // Test extract_message_details with non-ApplicationMessage
-        let commit_outcome = MessageProcessingOutcome {
-            result: MessageProcessingResult::Commit {
-                mls_group_id: group_id,
-            },
-            context: mdk_core::prelude::MessageProcessingContext::default(),
-        };
-        let extracted = Whitenoise::extract_message_details(&commit_outcome);
-        assert!(extracted.is_none(), "Should not extract commit");
-
         // Test extract_reaction_target_id
         let mut tags = Tags::new();
         tags.push(Tag::parse(vec!["e", "test_event_id"]).unwrap());
@@ -1860,55 +2709,34 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-
-        let member_accounts = members
-            .iter()
-            .map(|(account, _)| account)
-            .collect::<Vec<_>>();
-        wait_for_key_package_publication(&whitenoise, &member_accounts).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![members[0].0.pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
+        let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &creator_account, &member_account).await;
 
         // Send multiple messages
         for i in 1..=3 {
-            let mut inner = UnsignedEvent::new(
+            let inner = UnsignedEvent::new(
                 creator_account.pubkey,
                 Timestamp::now(),
                 Kind::Custom(9),
                 vec![],
                 format!("Message {}", i),
             );
-            inner.ensure_id();
-            let event = mdk
-                .create_message(&group.mls_group_id, inner, None)
-                .unwrap();
+            let (event, _) = darkmatter_app_message_event(&creator_session, &group_id, inner).await;
 
             whitenoise
-                .handle_mls_message(&creator_session, &creator_account, event)
+                .handle_mls_message(&member_session, &member_account, event)
                 .await
                 .unwrap();
         }
 
         // Verify all messages are in cache
         let messages = AggregatedMessage::find_messages_by_group(
-            &group.mls_group_id,
-            &creator_account.pubkey,
+            &group_id,
+            &member_account.pubkey,
             None,
-            &creator_session.account_db.inner,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1921,8 +2749,8 @@ mod tests {
         // Verify messages are accessible via public API
         let fetched = whitenoise
             .fetch_aggregated_messages_for_group(
-                &creator_account.pubkey,
-                &group.mls_group_id,
+                &member_account.pubkey,
+                &group_id,
                 &PaginationOptions::default(),
                 None,
             )
@@ -1935,17 +2763,14 @@ mod tests {
     async fn test_handle_mls_message_stores_token_request_in_group_push_cache() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_leaf_index =
+            marmot_push_leaf_index(&member_session, &group_id, admin_account.pubkey).await;
 
         let token_tag = make_token_tag(1);
         let request = build_token_request_rumor(
@@ -1954,7 +2779,7 @@ mod tests {
             vec![token_tag.clone()],
         )
         .unwrap();
-        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+        let (event, _) = darkmatter_app_message_event(&admin_session, &group_id, request).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, event)
@@ -1999,26 +2824,22 @@ mod tests {
     async fn test_handle_mls_message_updates_token_request_cache_inside_response_cooldown() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_leaf_index =
+            marmot_push_leaf_index(&member_session, &group_id, admin_account.pubkey).await;
 
         let first_token = make_token_tag(10);
         let first_request =
             build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![first_token])
                 .unwrap();
         let first_request_id = first_request.id.expect("447 rumor must have an event id");
-        let first_event = admin_mdk
-            .create_message(&group_id, first_request, None)
-            .unwrap();
+        let (first_event, _) =
+            darkmatter_app_message_event(&admin_session, &group_id, first_request).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, first_event)
@@ -2036,9 +2857,8 @@ mod tests {
         let replacement_request_id = replacement_request
             .id
             .expect("447 replacement rumor must have an event id");
-        let replacement_event = admin_mdk
-            .create_message(&group_id, replacement_request, None)
-            .unwrap();
+        let (replacement_event, _) =
+            darkmatter_app_message_event(&admin_session, &group_id, replacement_request).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, replacement_event)
@@ -2078,36 +2898,29 @@ mod tests {
     #[tokio::test]
     async fn test_handle_mls_message_gossips_token_requests_to_all_other_participants() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
-        let member_one = members[0].0.clone();
-        let member_two = members[1].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_one, &member_two]).await;
-
-        let group_id = setup_three_member_accepted_group(
-            &whitenoise,
-            &admin_account,
-            &member_one,
-            &member_two,
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_one, _member_one_keys, member_one_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_two, _member_two_keys, member_two_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_marmot_group_without_relay_publish(
+            &admin_session,
+            admin_account.pubkey,
+            &[
+                (&member_one_session, member_one.pubkey),
+                (&member_two_session, member_two.pubkey),
+            ],
+            GroupType::Group,
         )
         .await;
-        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
-        let member_one_session = whitenoise.require_session(&member_one.pubkey).unwrap();
-        let member_two_session = whitenoise.require_session(&member_two.pubkey).unwrap();
 
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let member_one_mdk = whitenoise
-            .create_mdk_for_account(member_one.pubkey)
-            .unwrap();
-        let member_two_mdk = whitenoise
-            .create_mdk_for_account(member_two.pubkey)
-            .unwrap();
-        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
-        let member_one_leaf_index = member_one_mdk.own_leaf_index(&group_id).unwrap();
-        let member_two_leaf_index = member_two_mdk.own_leaf_index(&group_id).unwrap();
+        let admin_leaf_index =
+            marmot_push_leaf_index(&admin_session, &group_id, admin_account.pubkey).await;
+        let member_one_leaf_index =
+            marmot_push_leaf_index(&admin_session, &group_id, member_one.pubkey).await;
+        let member_two_leaf_index =
+            marmot_push_leaf_index(&admin_session, &group_id, member_two.pubkey).await;
 
         let admin_token = make_token_tag(30);
         let admin_request = build_token_request_rumor(
@@ -2116,9 +2929,8 @@ mod tests {
             vec![admin_token.clone()],
         )
         .unwrap();
-        let admin_event = admin_mdk
-            .create_message(&group_id, admin_request, None)
-            .unwrap();
+        let (admin_event, _) =
+            darkmatter_app_message_event(&admin_session, &group_id, admin_request).await;
         whitenoise
             .handle_mls_message(&member_one_session, &member_one, admin_event.clone())
             .await
@@ -2135,9 +2947,8 @@ mod tests {
             vec![member_one_token.clone()],
         )
         .unwrap();
-        let member_one_event = member_one_mdk
-            .create_message(&group_id, member_one_request, None)
-            .unwrap();
+        let (member_one_event, _) =
+            darkmatter_app_message_event(&member_one_session, &group_id, member_one_request).await;
         whitenoise
             .handle_mls_message(&admin_session, &admin_account, member_one_event.clone())
             .await
@@ -2154,9 +2965,8 @@ mod tests {
             vec![member_two_token.clone()],
         )
         .unwrap();
-        let member_two_event = member_two_mdk
-            .create_message(&group_id, member_two_request, None)
-            .unwrap();
+        let (member_two_event, _) =
+            darkmatter_app_message_event(&member_two_session, &group_id, member_two_request).await;
         whitenoise
             .handle_mls_message(&admin_session, &admin_account, member_two_event.clone())
             .await
@@ -2200,19 +3010,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_mls_message_merges_token_list_response_into_group_push_cache() {
+    async fn test_handle_darkmatter_mls_message_merges_token_list_response_into_group_push_cache() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_account, _member_keys, member_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_two_member_marmot_group_without_relay_publish(
+            &admin_session,
+            &member_session,
+            admin_account.pubkey,
+            member_account.pubkey,
+        )
+        .await;
+        let admin_leaf_index =
+            marmot_push_leaf_index(&member_session, &group_id, admin_account.pubkey).await;
+        let member_leaf_index =
+            marmot_push_leaf_index(&member_session, &group_id, member_account.pubkey).await;
 
         let leaf_zero = make_token_tag(2);
         let leaf_one = make_token_tag(3);
@@ -2224,11 +3038,11 @@ mod tests {
             vec![
                 LeafTokenTag {
                     token_tag: leaf_zero.clone(),
-                    leaf_index: 0,
+                    leaf_index: admin_leaf_index,
                 },
                 LeafTokenTag {
                     token_tag: leaf_one.clone(),
-                    leaf_index: 1,
+                    leaf_index: member_leaf_index,
                 },
                 LeafTokenTag {
                     token_tag: inactive_leaf,
@@ -2237,7 +3051,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let event = admin_mdk.create_message(&group_id, response, None).unwrap();
+        let (event, _) = darkmatter_app_message_event(&admin_session, &group_id, response).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, event)
@@ -2259,14 +3073,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].leaf_index, 0);
+        let admin_token = stored
+            .iter()
+            .find(|token| token.leaf_index == admin_leaf_index)
+            .expect("admin token should be cached by Darkmatter leaf index");
+        assert_eq!(admin_token.member_pubkey, admin_account.pubkey);
         assert_eq!(
-            stored[0].encrypted_token,
+            admin_token.encrypted_token,
             leaf_zero.encrypted_token.to_base64()
         );
-        assert_eq!(stored[1].leaf_index, 1);
+        let member_token = stored
+            .iter()
+            .find(|token| token.leaf_index == member_leaf_index)
+            .expect("member token should be cached by Darkmatter leaf index");
+        assert_eq!(member_token.member_pubkey, member_account.pubkey);
         assert_eq!(
-            stored[1].encrypted_token,
+            member_token.encrypted_token,
             leaf_one.encrypted_token.to_base64()
         );
 
@@ -2285,17 +3107,14 @@ mod tests {
     async fn test_handle_mls_message_removes_token_on_token_removal() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
         let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_leaf_index =
+            marmot_push_leaf_index(&member_session, &group_id, admin_account.pubkey).await;
         let token_tag = make_token_tag(4);
 
         let member_pool = &whitenoise
@@ -2318,7 +3137,7 @@ mod tests {
         .unwrap();
 
         let removal = build_token_removal_rumor(admin_account.pubkey, Timestamp::now());
-        let event = admin_mdk.create_message(&group_id, removal, None).unwrap();
+        let (event, _) = darkmatter_app_message_event(&admin_session, &group_id, removal).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, event)
@@ -2346,18 +3165,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_mls_message_token_request_schedules_token_list_response() {
+    async fn test_handle_darkmatter_mls_message_token_request_schedules_token_list_response() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_account, _member_keys, member_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_two_member_marmot_group_without_relay_publish(
+            &admin_session,
+            &member_session,
+            admin_account.pubkey,
+            member_account.pubkey,
+        )
+        .await;
+        let member_leaf_index =
+            marmot_push_leaf_index(&member_session, &group_id, member_account.pubkey).await;
+        let member_token = make_darkmatter_token_tag(8);
+        let member_token_fingerprint = member_token
+            .token_fingerprint
+            .clone()
+            .expect("Darkmatter token fixture should include a fingerprint");
+        member_session
+            .repos
+            .group_push_tokens
+            .upsert_with_metadata(GroupPushTokenUpsert {
+                mls_group_id: &group_id,
+                member_pubkey: &member_account.pubkey,
+                leaf_index: member_leaf_index,
+                server_pubkey: &member_token.server_pubkey,
+                relay_hint: Some(&member_token.relay_hint),
+                encrypted_token: &member_token.encrypted_token.to_base64(),
+                platform: Some(PushPlatform::Fcm),
+                token_fingerprint: Some(&member_token_fingerprint),
+            })
+            .await
             .unwrap();
         let before_count = count_published_events_for_account(&whitenoise, &member_account).await;
 
@@ -2366,7 +3207,7 @@ mod tests {
             build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
                 .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+        let (event, _) = darkmatter_app_message_event(&admin_session, &group_id, request).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, event)
@@ -2396,19 +3237,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_mls_message_matching_token_list_response_suppresses_pending_reply() {
+    async fn test_handle_darkmatter_mls_message_matching_token_list_response_suppresses_pending_reply()
+     {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_account, _member_keys, member_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let group_id = setup_two_member_marmot_group_without_relay_publish(
+            &admin_session,
+            &member_session,
+            admin_account.pubkey,
+            member_account.pubkey,
+        )
+        .await;
+        let admin_leaf_index =
+            marmot_push_leaf_index(&member_session, &group_id, admin_account.pubkey).await;
 
         let request = build_token_request_rumor(
             admin_account.pubkey,
@@ -2417,7 +3261,8 @@ mod tests {
         )
         .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let request_event = admin_mdk.create_message(&group_id, request, None).unwrap();
+        let (request_event, _) =
+            darkmatter_app_message_event(&admin_session, &group_id, request).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, request_event)
@@ -2438,11 +3283,12 @@ mod tests {
             request_event_id,
             vec![LeafTokenTag {
                 token_tag: make_token_tag(7),
-                leaf_index: 0,
+                leaf_index: admin_leaf_index,
             }],
         )
         .unwrap();
-        let response_event = admin_mdk.create_message(&group_id, response, None).unwrap();
+        let (response_event, _) =
+            darkmatter_app_message_event(&admin_session, &group_id, response).await;
 
         whitenoise
             .handle_mls_message(&member_session, &member_account, response_event)
@@ -2468,28 +3314,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_mls_message_commit_prunes_inactive_leaf_tokens() {
+    async fn test_handle_darkmatter_mls_message_commit_prunes_inactive_leaf_tokens() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
-        let member_one = members[0].0.clone();
-        let member_two = members[1].0.clone();
-        let member_two_session = whitenoise.require_session(&member_two.pubkey).unwrap();
+        let (admin_account, _admin_keys, admin_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_one, _member_one_keys, member_one_session) =
+            create_local_marmot_test_session(&whitenoise).await;
+        let (member_two, _member_two_keys, member_two_session) =
+            create_local_marmot_test_session(&whitenoise).await;
 
-        wait_for_key_package_publication(&whitenoise, &[&member_one, &member_two]).await;
-
-        let group_id =
-            setup_three_member_group(&whitenoise, &admin_account, &member_one, &member_two).await;
-
-        let observer_mdk = whitenoise
-            .create_mdk_for_account(member_two.pubkey)
-            .unwrap();
-        let removed_leaf_index = observer_mdk
-            .group_leaf_map(&group_id)
-            .unwrap()
-            .iter()
-            .find_map(|(leaf_index, pubkey)| (*pubkey == member_one.pubkey).then_some(*leaf_index))
-            .expect("removed member leaf should exist before removal");
+        let group_id = setup_marmot_group_without_relay_publish(
+            &admin_session,
+            admin_account.pubkey,
+            &[
+                (&member_one_session, member_one.pubkey),
+                (&member_two_session, member_two.pubkey),
+            ],
+            GroupType::Group,
+        )
+        .await;
+        let removed_leaf_index =
+            marmot_push_leaf_index(&member_two_session, &group_id, member_one.pubkey).await;
         let stale_token = make_token_tag(8);
 
         let member_two_pool = &whitenoise
@@ -2511,15 +3356,25 @@ mod tests {
         .await
         .unwrap();
 
-        let removal_event = {
-            let admin_mdk = whitenoise
-                .create_mdk_for_account(admin_account.pubkey)
-                .unwrap();
-            admin_mdk
-                .remove_members(&group_id, &[member_one.pubkey])
-                .unwrap()
-                .evolution_event
-        };
+        let removal_publisher = RecordingMarmotPublisher::default();
+        admin_session
+            .groups()
+            .remove_marmot_members_with_publisher(
+                &group_id,
+                vec![member_one.pubkey],
+                &removal_publisher,
+            )
+            .await
+            .unwrap();
+        let removal_message = removal_publisher
+            .group_messages()
+            .into_iter()
+            .next()
+            .expect("member removal should publish a group message");
+        let removal_event = NostrTransportEvent::from_transport_message(&removal_message)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
 
         whitenoise
             .handle_mls_message(&member_two_session, &member_two, removal_event)
@@ -2542,352 +3397,24 @@ mod tests {
         );
     }
 
-    /// Test that auto-committed proposals (e.g., admin auto-commits a
-    /// member's self-removal) are published and merged successfully.
-    #[tokio::test]
-    async fn test_handle_mls_message_auto_committed_proposal() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        // Set up a group where both admin and member have full MLS state
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-
-        // Member creates a self-removal proposal (leave)
-        let member_mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let leave_result = member_mdk.leave_group(&group_id).unwrap();
-
-        // Admin processes the leave proposal -- should auto-commit because
-        // admin_account is the group admin
-        let result = whitenoise
-            .handle_mls_message(&admin_session, &admin_account, leave_result.evolution_event)
-            .await;
-        assert!(
-            result.is_ok(),
-            "Admin should successfully auto-commit the leave proposal: {:?}",
-            result.err()
-        );
-
-        // Verify the admin's MLS state was updated (pending commit merged)
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let group = admin_mdk
-            .get_group(&group_id)
-            .expect("should be able to get group")
-            .expect("group should exist");
-
-        // After merging the commit that removed the member, the epoch
-        // should have advanced beyond 0 (the initial epoch)
-        assert!(
-            group.epoch > 0,
-            "Group epoch should have advanced after auto-committed removal"
-        );
-    }
-
-    /// Duplicate MLS messages (already-processed by MDK) return
-    /// `MlsMessageUnprocessable` so the caller does not mark the event as
-    /// processed or advance `last_synced_at`.
-    #[tokio::test]
-    async fn test_unprocessable_message_returns_err() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-
-        let member_accounts = members
-            .iter()
-            .map(|(account, _)| account)
-            .collect::<Vec<_>>();
-        wait_for_key_package_publication(&whitenoise, &member_accounts).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![members[0].0.pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-
-        let mut inner = UnsignedEvent::new(
-            creator_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Test message".to_string(),
-        );
-        inner.ensure_id();
-        let event = mdk
-            .create_message(&group.mls_group_id, inner, None)
-            .unwrap();
-
-        // First processing: should succeed
-        let first = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, event.clone())
-            .await;
-        assert!(first.is_ok(), "First processing should succeed: {first:?}");
-
-        // Second processing of the same event: MDK returns Unprocessable because
-        // the event was already processed and its state recorded as Processed.
-        // Our handler must propagate this as an error.
-        let second = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, event)
-            .await;
-        assert!(
-            second.is_err(),
-            "Second processing of same event should return Err"
-        );
-        match second.err().unwrap() {
-            WhitenoiseError::MlsMessageUnprocessable(_) => {}
-            other => panic!("Expected MlsMessageUnprocessable, got: {other:?}"),
-        }
-    }
-
-    /// Verify that when `handle_mls_message` returns `Err` for an unprocessable
-    /// event, the account event processor does NOT record it as processed.
-    ///
-    /// This is tested end-to-end through `process_account_event`: we send the
-    /// same event twice.  After the second attempt (which the handler rejects as
-    /// `Unprocessable`), the event must NOT appear in the processed-event tracker
-    /// for the account.  It was already recorded by the first successful pass, so
-    /// the tracker returns `true`; the important thing is that the second `Err`
-    /// path does not call `track_processed_account_event` a second time (the
-    /// tracker would silently ignore duplicates, but we can still assert the
-    /// correct error path by inspecting `already_processed_account_event` and
-    /// confirming it reflects the one tracked entry from the FIRST call only,
-    /// not a spurious second call that could corrupt `last_synced_at`).
-    ///
-    /// The real observable guarantee: `process_account_event` only advances
-    /// `last_synced_at` on `Ok`.  We confirm this indirectly by asserting that
-    /// the second call to `handle_mls_message` returns `Err`.
-    #[tokio::test]
-    async fn test_unprocessable_not_tracked_via_process_account_event() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-
-        let member_accounts = members
-            .iter()
-            .map(|(account, _)| account)
-            .collect::<Vec<_>>();
-        wait_for_key_package_publication(&whitenoise, &member_accounts).await;
-
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(
-                vec![members[0].0.pubkey],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-
-        let mut inner = UnsignedEvent::new(
-            creator_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Unprocessable test".to_string(),
-        );
-        inner.ensure_id();
-        let event = mdk
-            .create_message(&group.mls_group_id, inner, None)
-            .unwrap();
-        let event_id = event.id;
-
-        // Build a relay-plane source context for this account.
-        let source = EventSource::RelaySubscription(SubscriptionContext {
-            plane: RelayPlane::Group,
-            account_pubkey: Some(creator_account.pubkey),
-            relay_url: RelayUrl::parse("wss://relay.example.com").unwrap(),
-            stream: SubscriptionStream::GroupMessages,
-            group_ids: vec![],
-        });
-
-        // First pass through process_account_event: succeeds, event is tracked.
-        whitenoise
-            .process_account_event(event.clone(), source.clone(), Default::default())
-            .await;
-
-        let tracked_after_first = whitenoise
-            .shared
-            .event_tracker
-            .already_processed_account_event(&event_id, &creator_account.pubkey)
-            .await
-            .unwrap();
-        assert!(
-            tracked_after_first,
-            "Event should be tracked after first successful processing"
-        );
-
-        // Second pass: the should_skip check will detect it as already processed
-        // and skip it WITHOUT calling handle_mls_message at all, so last_synced_at
-        // is not advanced for a duplicate.  This is the intended guard.
-        // We verify the skip path by confirming it doesn't panic or double-advance.
-        whitenoise
-            .process_account_event(event.clone(), source.clone(), Default::default())
-            .await;
-
-        // Still tracked — no double-entry, no crash.
-        let tracked_after_second = whitenoise
-            .shared
-            .event_tracker
-            .already_processed_account_event(&event_id, &creator_account.pubkey)
-            .await
-            .unwrap();
-        assert!(
-            tracked_after_second,
-            "Event should still be tracked after second call"
-        );
-
-        // Confirm that handle_mls_message itself returns Err on duplicate so
-        // any caller that bypasses the skip check also cannot silently succeed.
-        let direct_result = whitenoise
-            .handle_mls_message(&creator_session, &creator_account, event)
-            .await;
-        assert!(
-            direct_result.is_err(),
-            "Direct second call to handle_mls_message must return Err"
-        );
-    }
-
-    /// Verify MLS state consistency after an auto-committed removal:
-    /// the admin can still create messages in the group, confirming
-    /// that merge_pending_commit left the state valid.
-    #[tokio::test]
-    async fn test_handle_mls_message_commit_after_auto_committed_proposal() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-
-        // Member leaves
-        let member_mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let leave_result = member_mdk.leave_group(&group_id).unwrap();
-
-        // Admin auto-commits the leave proposal
-        whitenoise
-            .handle_mls_message(&admin_session, &admin_account, leave_result.evolution_event)
-            .await
-            .expect("auto-commit should succeed");
-
-        // After auto-commit, admin should still be able to send messages
-        // to the group (verifies the MLS state is consistent)
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let mut inner = UnsignedEvent::new(
-            admin_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "Message after member left".to_string(),
-        );
-        inner.ensure_id();
-
-        let message_event = admin_mdk.create_message(&group_id, inner, None);
-        assert!(
-            message_event.is_ok(),
-            "Admin should be able to create messages after auto-committed removal: {:?}",
-            message_event.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_token_request_does_not_create_second_task() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let _admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        let fake_event_id = EventId::all_zeros();
-        let fake_group_id = GroupId::from_slice(&[1u8; 32]);
-
-        // Pre-insert the key to simulate an in-flight task holding it. This
-        // avoids the race where a spawned task with delay_ms=0 could clear the
-        // key before the assertion runs.
-        whitenoise.insert_pending_token_response_for_test(
-            member_account.pubkey,
-            fake_group_id.clone(),
-            fake_event_id,
-        );
-
-        assert!(
-            whitenoise
-                .shared
-                .pending_push_token_responses
-                .contains_key(&(member_account.pubkey, fake_group_id.clone(), fake_event_id))
-        );
-
-        // Schedule with the same key hits the duplicate-dedup early-return;
-        // the existing entry must remain intact.
-        whitenoise.schedule_token_response_for_test(
-            member_account.clone(),
-            fake_group_id.clone(),
-            fake_event_id,
-        );
-
-        assert!(
-            whitenoise
-                .shared
-                .pending_push_token_responses
-                .contains_key(&(member_account.pubkey, fake_group_id.clone(), fake_event_id)),
-            "pending entry should still be present after duplicate request"
-        );
-    }
-
     #[tokio::test]
     async fn test_scheduled_token_response_task_runs_and_clears_pending_entry() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let group_id =
+            setup_two_member_marmot_group(&whitenoise, &admin_account, &member_account).await;
 
         let token_tag = make_token_tag(22);
         let request =
             build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
                 .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+        let (event, _) = darkmatter_app_message_event(&admin_session, &group_id, request).await;
 
-        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
         whitenoise
             .handle_mls_message(&member_session, &member_account, event)
             .await
@@ -2917,130 +3444,5 @@ mod tests {
         })
         .await
         .expect("timed out waiting for spawned token-response task to complete");
-    }
-
-    // Note: `test_token_request_dropped_when_semaphore_exhausted` was removed
-    // in Phase 18c. It exercised a token-response concurrency cap that only
-    // existed on the legacy `Whitenoise::schedule_pending_token_response` test
-    // fixture (which writes to `SharedServices::pending_push_token_responses`,
-    // a `#[cfg(test)]` map). Production token-response scheduling moved to
-    // `AccountSession::schedule_pending_token_response` in Phase 12 and never
-    // had a cap. The test passed pre-18c only because `has_pending_token_response`
-    // was reading the wrong map; once it correctly checks the session map,
-    // the assertion's premise (cap drops the entry) no longer holds.
-
-    /// Verify `extract_group_id` returns the correct group ID for every variant
-    /// that carries one, and `None` for `PreviouslyFailed`.
-    #[test]
-    fn test_extract_group_id_returns_correct_id_for_each_variant() {
-        let group_id = GroupId::from_slice(&[0xAB; 32]);
-        let pubkey = nostr_sdk::Keys::generate().public_key();
-
-        // ApplicationMessage
-        let mut inner_event = UnsignedEvent::new(
-            pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "test".to_string(),
-        );
-        inner_event.ensure_id();
-        let message = mdk_core::prelude::message_types::Message {
-            id: inner_event.id.unwrap(),
-            pubkey,
-            created_at: Timestamp::now(),
-            processed_at: Timestamp::now(),
-            kind: Kind::Custom(9),
-            tags: Tags::new(),
-            content: "test".to_string(),
-            mls_group_id: group_id.clone(),
-            event: inner_event,
-            wrapper_event_id: EventId::all_zeros(),
-            epoch: None,
-            state: mdk_core::prelude::message_types::MessageState::Processed,
-        };
-        let result = MessageProcessingResult::ApplicationMessage(message);
-        assert_eq!(
-            extract_group_id(&result),
-            Some(&group_id),
-            "ApplicationMessage should return group_id"
-        );
-
-        // Commit
-        let result = MessageProcessingResult::Commit {
-            mls_group_id: group_id.clone(),
-        };
-        assert_eq!(
-            extract_group_id(&result),
-            Some(&group_id),
-            "Commit should return group_id"
-        );
-
-        // PendingProposal
-        let result = MessageProcessingResult::PendingProposal {
-            mls_group_id: group_id.clone(),
-        };
-        assert_eq!(
-            extract_group_id(&result),
-            Some(&group_id),
-            "PendingProposal should return group_id"
-        );
-
-        // IgnoredProposal
-        let result = MessageProcessingResult::IgnoredProposal {
-            mls_group_id: group_id.clone(),
-            reason: "test reason".to_string(),
-        };
-        assert_eq!(
-            extract_group_id(&result),
-            Some(&group_id),
-            "IgnoredProposal should return group_id"
-        );
-
-        // ExternalJoinProposal
-        let result = MessageProcessingResult::ExternalJoinProposal {
-            mls_group_id: group_id.clone(),
-        };
-        assert_eq!(
-            extract_group_id(&result),
-            Some(&group_id),
-            "ExternalJoinProposal should return group_id"
-        );
-
-        // Unprocessable
-        let result = MessageProcessingResult::Unprocessable {
-            mls_group_id: group_id.clone(),
-        };
-        assert_eq!(
-            extract_group_id(&result),
-            Some(&group_id),
-            "Unprocessable should return group_id"
-        );
-
-        // Proposal (auto-committed) - requires constructing UpdateGroupResult with a
-        // signed Event; use a throwaway key to produce a valid one.
-        let keys = nostr_sdk::Keys::generate();
-        let dummy_event = nostr_sdk::EventBuilder::text_note("dummy")
-            .sign_with_keys(&keys)
-            .unwrap();
-        let update_result = UpdateGroupResult {
-            evolution_event: dummy_event,
-            welcome_rumors: None,
-            mls_group_id: group_id.clone(),
-        };
-        let result = MessageProcessingResult::Proposal(update_result);
-        assert_eq!(
-            extract_group_id(&result),
-            Some(&group_id),
-            "Proposal should return group_id"
-        );
-
-        // PreviouslyFailed
-        let result = MessageProcessingResult::PreviouslyFailed;
-        assert_eq!(
-            extract_group_id(&result),
-            None,
-            "PreviouslyFailed should return None"
-        );
     }
 }

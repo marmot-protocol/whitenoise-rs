@@ -110,6 +110,7 @@ impl MediaFileStorage {
     ///
     /// # Returns
     /// The path to the first matching file, if any
+    #[cfg(test)]
     pub(crate) async fn find_file_with_prefix(&self, prefix: &str) -> Option<PathBuf> {
         if !self.cache_dir.exists() {
             return None;

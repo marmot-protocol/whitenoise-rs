@@ -219,7 +219,6 @@ impl Whitenoise {
             WhitenoiseError::Initialization
                 | WhitenoiseError::Database(_)
                 | WhitenoiseError::SqlxError(_)
-                | WhitenoiseError::MdkSqliteStorage(_)
                 | WhitenoiseError::Filesystem(_)
                 | WhitenoiseError::Configuration(_)
         )
@@ -308,7 +307,7 @@ mod tests {
 
     use super::*;
     use crate::whitenoise::test_utils::{
-        create_mock_whitenoise, create_nostr_group_config_data, insert_test_account,
+        create_group_config, create_mock_whitenoise, insert_test_account,
     };
 
     #[tokio::test]
@@ -422,7 +421,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey]);
         config.name = "Foreground snapshot".to_string();
 
         let group = whitenoise
@@ -448,7 +447,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
-        let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let mut config = create_group_config(vec![creator.pubkey]);
         config.name = "Foreground replay".to_string();
 
         let group = whitenoise

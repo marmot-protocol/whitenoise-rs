@@ -27,7 +27,7 @@ pub(crate) mod relay_sync;
 pub use key_package::KeyPackageStatus;
 
 #[cfg(test)]
-use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND_LEGACY, MLS_PROPOSALS_TAG_KEY};
+use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_PROPOSALS_TAG_KEY};
 #[cfg(test)]
 use key_package::classify_key_package;
 
@@ -2482,8 +2482,7 @@ mod tests {
 
         async fn create_event_with_tags(tags: Vec<Tag>) -> Event {
             let keys = Keys::generate();
-            let builder =
-                EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50").tags(tags);
+            let builder = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "dGVzdF9jb250ZW50").tags(tags);
             builder.sign(&keys).await.unwrap()
         }
 

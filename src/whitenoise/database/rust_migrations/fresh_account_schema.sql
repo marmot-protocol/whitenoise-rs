@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS published_key_packages (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     key_package_hash_ref  BLOB NOT NULL,
     event_id              TEXT NOT NULL UNIQUE,
-    kind                  INTEGER NOT NULL DEFAULT 443,
+    kind                  INTEGER NOT NULL DEFAULT 30443,
     d_tag                 TEXT NULL,
     consumed_at           INTEGER,
     key_material_deleted  INTEGER NOT NULL DEFAULT 0,
@@ -125,6 +125,11 @@ CREATE TABLE IF NOT EXISTS group_push_tokens (
     mls_group_id    BLOB NOT NULL,
     member_pubkey   TEXT NOT NULL,
     leaf_index      INTEGER NOT NULL CHECK (leaf_index >= 0),
+    platform        TEXT CHECK (platform IN ('apns', 'fcm')),
+    token_fingerprint TEXT CHECK (
+        token_fingerprint IS NULL OR
+        token_fingerprint GLOB 'sha256:[0-9a-f]*'
+    ),
     server_pubkey   TEXT NOT NULL,
     relay_hint      TEXT,
     encrypted_token TEXT NOT NULL CHECK (
@@ -204,6 +209,19 @@ CREATE INDEX IF NOT EXISTS idx_aggregated_messages_group
 
 CREATE INDEX IF NOT EXISTS idx_aggregated_messages_kind_group
     ON aggregated_messages(kind, mls_group_id, created_at DESC, message_id DESC);
+
+CREATE TABLE IF NOT EXISTS marmot_message_projections (
+    message_id   TEXT NOT NULL
+        CHECK (length(message_id) = 64 AND message_id GLOB '[0-9a-fA-F]*'),
+    mls_group_id BLOB NOT NULL,
+    created_at   INTEGER NOT NULL,
+    processed_at INTEGER NOT NULL,
+    message_json TEXT NOT NULL,
+    PRIMARY KEY (message_id, mls_group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_marmot_message_projections_group
+    ON marmot_message_projections(mls_group_id, created_at DESC, processed_at DESC);
 
 CREATE TABLE IF NOT EXISTS message_delivery_status (
     message_id      TEXT NOT NULL,

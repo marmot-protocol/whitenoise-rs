@@ -37,8 +37,7 @@ async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
     let _flush_tracing = FlushTracingOnDrop;
 
-    // Initialize mock keyring store for integration tests
-    // This is required for MDK database encryption in test environments
+    // Initialize mock keyring store for encrypted test databases.
     Whitenoise::initialize_mock_keyring_store();
 
     tracing::info!("=== Starting Whitenoise Integration Test Suite ===");

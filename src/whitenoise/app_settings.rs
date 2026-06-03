@@ -298,10 +298,8 @@ mod tests {
     async fn test_whitenoise_app_settings() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let settings = whitenoise.app_settings().await.unwrap();
-        // Default settings are created during initialization via DB migration.
-        // The migration sets theme_mode='system' and language='en' (English).
         assert_eq!(settings.theme_mode, ThemeMode::System);
-        assert_eq!(settings.language, Language::English);
+        assert_eq!(settings.language, Language::System);
     }
 
     #[tokio::test]

@@ -2,13 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use crate::marmot::GroupId;
 use chrono::Utc;
-use mdk_core::prelude::GroupId;
 use nostr_sdk::{PublicKey, RelayUrl};
 use sqlx::SqlitePool;
 
+use crate::marmot::push::LeafTokenTag;
 use crate::perf_instrument;
-use crate::whitenoise::push_notifications::GroupPushToken;
+use crate::whitenoise::push_notifications::{GroupPushToken, PushPlatform};
 
 /// Row carrier for `group_push_tokens` in the per-account DB.
 ///
@@ -20,11 +21,24 @@ struct LocalGroupPushTokenRow {
     mls_group_id: Vec<u8>,
     member_pubkey: String,
     leaf_index: i64,
+    platform: Option<String>,
+    token_fingerprint: Option<String>,
     server_pubkey: String,
     relay_hint: Option<String>,
     encrypted_token: String,
     created_at: i64,
     updated_at: i64,
+}
+
+pub(crate) struct GroupPushTokenUpsert<'a> {
+    pub(crate) mls_group_id: &'a GroupId,
+    pub(crate) member_pubkey: &'a PublicKey,
+    pub(crate) leaf_index: u32,
+    pub(crate) server_pubkey: &'a PublicKey,
+    pub(crate) relay_hint: Option<&'a RelayUrl>,
+    pub(crate) encrypted_token: &'a str,
+    pub(crate) platform: Option<PushPlatform>,
+    pub(crate) token_fingerprint: Option<&'a str>,
 }
 
 impl LocalGroupPushTokenRow {
@@ -45,6 +59,21 @@ impl LocalGroupPushTokenRow {
                 index: "leaf_index".to_string(),
                 source: Box::new(error),
             })?;
+
+        let platform = self
+            .platform
+            .map(|value| {
+                value
+                    .parse::<PushPlatform>()
+                    .map_err(|error| sqlx::Error::ColumnDecode {
+                        index: "platform".to_string(),
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            error,
+                        )),
+                    })
+            })
+            .transpose()?;
 
         let server_pubkey =
             PublicKey::parse(&self.server_pubkey).map_err(|error| sqlx::Error::ColumnDecode {
@@ -70,6 +99,8 @@ impl LocalGroupPushTokenRow {
             mls_group_id,
             member_pubkey,
             leaf_index,
+            platform,
+            token_fingerprint: self.token_fingerprint,
             server_pubkey,
             relay_hint,
             encrypted_token: self.encrypted_token,
@@ -101,6 +132,29 @@ impl GroupPushToken {
         encrypted_token: &str,
         pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
+        Self::upsert_with_metadata(
+            account_pubkey,
+            GroupPushTokenUpsert {
+                mls_group_id,
+                member_pubkey,
+                leaf_index,
+                server_pubkey,
+                relay_hint,
+                encrypted_token,
+                platform: None,
+                token_fingerprint: None,
+            },
+            pool,
+        )
+        .await
+    }
+
+    #[perf_instrument("db::group_push_tokens")]
+    pub(crate) async fn upsert_with_metadata(
+        account_pubkey: &PublicKey,
+        upsert: GroupPushTokenUpsert<'_>,
+        pool: &SqlitePool,
+    ) -> Result<Self, sqlx::Error> {
         let now = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, LocalGroupPushTokenRow>(
@@ -108,28 +162,34 @@ impl GroupPushToken {
                  mls_group_id,
                  member_pubkey,
                  leaf_index,
+                 platform,
+                 token_fingerprint,
                  server_pubkey,
                  relay_hint,
                  encrypted_token,
                  created_at,
                  updated_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id, leaf_index) DO UPDATE SET
                  member_pubkey = excluded.member_pubkey,
+                 platform = excluded.platform,
+                 token_fingerprint = excluded.token_fingerprint,
                  server_pubkey = excluded.server_pubkey,
                  relay_hint = excluded.relay_hint,
                  encrypted_token = excluded.encrypted_token,
                  updated_at = excluded.updated_at
-             RETURNING mls_group_id, member_pubkey, leaf_index, server_pubkey,
+             RETURNING mls_group_id, member_pubkey, leaf_index, platform, token_fingerprint, server_pubkey,
                        relay_hint, encrypted_token, created_at, updated_at",
         )
-        .bind(mls_group_id.as_slice())
-        .bind(member_pubkey.to_hex())
-        .bind(i64::from(leaf_index))
-        .bind(server_pubkey.to_hex())
-        .bind(relay_hint.map(super::utils::normalize_relay_url))
-        .bind(encrypted_token)
+        .bind(upsert.mls_group_id.as_slice())
+        .bind(upsert.member_pubkey.to_hex())
+        .bind(i64::from(upsert.leaf_index))
+        .bind(upsert.platform.map(|platform| platform.as_str().to_string()))
+        .bind(upsert.token_fingerprint)
+        .bind(upsert.server_pubkey.to_hex())
+        .bind(upsert.relay_hint.map(super::utils::normalize_relay_url))
+        .bind(upsert.encrypted_token)
         .bind(now)
         .bind(now)
         .fetch_one(pool)
@@ -194,7 +254,7 @@ impl GroupPushToken {
         pool: &SqlitePool,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let rows = sqlx::query_as::<_, LocalGroupPushTokenRow>(
-            "SELECT mls_group_id, member_pubkey, leaf_index, server_pubkey,
+            "SELECT mls_group_id, member_pubkey, leaf_index, platform, token_fingerprint, server_pubkey,
                     relay_hint, encrypted_token, created_at, updated_at
              FROM group_push_tokens
              WHERE mls_group_id = ?
@@ -231,7 +291,7 @@ impl GroupPushToken {
     pub(crate) async fn upsert_active_token_list_response(
         mls_group_id: &GroupId,
         active_leaf_map: &BTreeMap<u32, PublicKey>,
-        tokens: Vec<mdk_core::mip05::LeafTokenTag>,
+        tokens: Vec<LeafTokenTag>,
         pool: &SqlitePool,
     ) -> Result<(), sqlx::Error> {
         let mut tx = pool.begin().await?;
@@ -247,15 +307,19 @@ impl GroupPushToken {
                      mls_group_id,
                      member_pubkey,
                      leaf_index,
+                     platform,
+                     token_fingerprint,
                      server_pubkey,
                      relay_hint,
                      encrypted_token,
                      created_at,
                      updated_at
                  )
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(mls_group_id, leaf_index) DO UPDATE SET
                      member_pubkey = excluded.member_pubkey,
+                     platform = excluded.platform,
+                     token_fingerprint = excluded.token_fingerprint,
                      server_pubkey = excluded.server_pubkey,
                      relay_hint = excluded.relay_hint,
                      encrypted_token = excluded.encrypted_token,
@@ -264,6 +328,13 @@ impl GroupPushToken {
             .bind(mls_group_id.as_slice())
             .bind(member_pubkey.to_hex())
             .bind(i64::from(token.leaf_index))
+            .bind(
+                token
+                    .token_tag
+                    .platform
+                    .map(|platform| platform.as_str().to_string()),
+            )
+            .bind(token.token_tag.token_fingerprint.as_deref())
             .bind(token.token_tag.server_pubkey.to_hex())
             .bind(super::utils::normalize_relay_url(
                 &token.token_tag.relay_hint,
@@ -309,6 +380,11 @@ mod tests {
                 mls_group_id    BLOB NOT NULL,
                 member_pubkey   TEXT NOT NULL,
                 leaf_index      INTEGER NOT NULL CHECK (leaf_index >= 0),
+                platform        TEXT CHECK (platform IN ('apns', 'fcm')),
+                token_fingerprint TEXT CHECK (
+                    token_fingerprint IS NULL OR
+                    token_fingerprint GLOB 'sha256:[0-9a-f]*'
+                ),
                 server_pubkey   TEXT NOT NULL,
                 relay_hint      TEXT,
                 encrypted_token TEXT NOT NULL CHECK (
@@ -386,6 +462,55 @@ mod tests {
                 .await
                 .unwrap();
         assert!(stored_after_delete.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_group_push_tokens_preserve_darkmatter_push_metadata() {
+        let (pool, account_pubkey, _dir) = setup().await;
+        let mls_group_id = make_group_id(2);
+        let member_pubkey = Keys::generate().public_key();
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        let created = GroupPushToken::upsert_with_metadata(
+            &account_pubkey,
+            GroupPushTokenUpsert {
+                mls_group_id: &mls_group_id,
+                member_pubkey: &member_pubkey,
+                leaf_index: 5,
+                server_pubkey: &server_pubkey,
+                relay_hint: Some(&relay_hint),
+                encrypted_token: "ciphertext",
+                platform: Some(crate::whitenoise::push_notifications::PushPlatform::Fcm),
+                token_fingerprint: Some("sha256:1234567890abcdef12345678"),
+            },
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            created.platform,
+            Some(crate::whitenoise::push_notifications::PushPlatform::Fcm)
+        );
+        assert_eq!(
+            created.token_fingerprint.as_deref(),
+            Some("sha256:1234567890abcdef12345678")
+        );
+
+        let loaded =
+            GroupPushToken::find_by_account_and_group(&account_pubkey, &mls_group_id, &pool)
+                .await
+                .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].platform,
+            Some(crate::whitenoise::push_notifications::PushPlatform::Fcm)
+        );
+        assert_eq!(
+            loaded[0].token_fingerprint.as_deref(),
+            Some("sha256:1234567890abcdef12345678")
+        );
     }
 
     #[tokio::test]
@@ -612,6 +737,8 @@ mod tests {
             mls_group_id: make_group_id(55),
             member_pubkey: Keys::generate().public_key(),
             leaf_index: 2,
+            platform: None,
+            token_fingerprint: None,
             server_pubkey: Keys::generate().public_key(),
             relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
             encrypted_token: "ciphertext-value".to_string(),

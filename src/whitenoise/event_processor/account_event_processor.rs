@@ -14,7 +14,6 @@ use crate::{
         session::AccountSession,
     },
 };
-
 impl Whitenoise {
     #[perf_instrument("event_processor")]
     pub(super) async fn process_account_event(
@@ -50,6 +49,15 @@ impl Whitenoise {
                 );
                 return;
             }
+        };
+        let Some(_session_operation) = session.begin_operation() else {
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_account_event",
+                "Skipping event {}: session is closing for account {}",
+                event.id.to_hex(),
+                account.pubkey.to_hex()
+            );
+            return;
         };
 
         // Check if we should skip this event (already processed or self-published)
@@ -503,37 +511,12 @@ mod tests {
     async fn test_group_relay_fanout_preserves_account_scoped_processing() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group_with_accepted_account_groups(
-            &whitenoise,
-            &admin_account,
-            &member_account,
-        )
-        .await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let nostr_group_id = hex::encode([0xA5_u8; 32]);
+        let event = EventBuilder::new(Kind::Custom(9), "shared group relay event")
+            .sign(&Keys::generate())
+            .await
             .unwrap();
-        let nostr_group_id = hex::encode(
-            admin_mdk
-                .get_group(&group_id)
-                .unwrap()
-                .unwrap()
-                .nostr_group_id,
-        );
-
-        let mut inner = UnsignedEvent::new(
-            admin_account.pubkey,
-            Timestamp::now(),
-            Kind::Custom(9),
-            vec![],
-            "shared group relay event".to_string(),
-        );
-        inner.ensure_id();
-        let event = admin_mdk.create_message(&group_id, inner, None).unwrap();
         let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
 
         for account in [&admin_account, &member_account] {

@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::whitenoise::database::account_db::AccountDatabase;
-use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
+use crate::whitenoise::database::published_key_packages::{
+    PublishedKeyPackage, PublishedKeyPackageProtocolData,
+};
 use crate::whitenoise::error::Result;
 
 /// Repository for published key package lifecycle records scoped to a single account.
@@ -28,6 +30,26 @@ impl PublishedKeyPackagesRepo {
         Ok(PublishedKeyPackage::create(&self.db, hash_ref, event_id, kind, d_tag).await?)
     }
 
+    /// Record a successfully published key package with protocol metadata.
+    pub async fn create_with_protocol_data(
+        &self,
+        hash_ref: &[u8],
+        event_id: &str,
+        kind: nostr_sdk::Kind,
+        d_tag: Option<&str>,
+        protocol_data: PublishedKeyPackageProtocolData,
+    ) -> Result<()> {
+        Ok(PublishedKeyPackage::create_with_protocol_data(
+            &self.db,
+            hash_ref,
+            event_id,
+            kind,
+            d_tag,
+            protocol_data,
+        )
+        .await?)
+    }
+
     /// Look up a published key package by its event ID.
     pub async fn find_by_event_id(&self, event_id: &str) -> Result<Option<PublishedKeyPackage>> {
         Ok(PublishedKeyPackage::find_by_event_id(&self.db, event_id).await?)
@@ -36,6 +58,11 @@ impl PublishedKeyPackagesRepo {
     /// Look up all published key packages sharing the same hash reference.
     pub async fn find_by_hash_ref(&self, hash_ref: &[u8]) -> Result<Vec<PublishedKeyPackage>> {
         Ok(PublishedKeyPackage::find_by_hash_ref(&self.db, hash_ref).await?)
+    }
+
+    #[cfg(feature = "integration-tests")]
+    pub async fn find_consumed(&self) -> Result<Vec<PublishedKeyPackage>> {
+        Ok(PublishedKeyPackage::find_consumed(&self.db).await?)
     }
 
     /// Return the most recently inserted row for a given event kind, if any.
@@ -79,9 +106,9 @@ impl PublishedKeyPackagesRepo {
     ///
     /// Mirrors `PublishedKeyPackage::mark_consumed` by updating ALL rows
     /// sharing the same `key_package_hash_ref` as the row matching `event_id`.
-    /// Dual-published kind:30443/kind:443 twins must stay in sync — otherwise
-    /// the un-backdated twin's recent `consumed_at` keeps tripping the
-    /// `NOT EXISTS` clause in `find_eligible_for_cleanup`.
+    /// Hash-ref siblings must stay in sync, otherwise one recent
+    /// `consumed_at` keeps tripping the `NOT EXISTS` clause in
+    /// `find_eligible_for_cleanup`.
     #[cfg(feature = "integration-tests")]
     pub async fn backdate_consumed_at(&self, event_id: &str, age_secs: i64) -> Result<()> {
         sqlx::query(
@@ -115,12 +142,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        // Matches the project-wide account-DB test pattern: stamp the schema
-        // directly because `AccountDatabase::new` uses `open_without_migrations`
-        // and running the full migration timeline here would require wiring
-        // a shared pool. NOTE: the CREATE TABLE below must stay in sync with
-        // `fresh_account_schema.sql`; until a `setup_account_db_with_migrations`
-        // helper exists, divergence here will silently mask production drift.
+        // Matches the project-wide account-DB test pattern: stamp the current
+        // table shape directly because `AccountDatabase::new` uses
+        // `open_without_migrations` and running the full migration timeline
+        // here would require wiring a shared pool.
         sqlx::query("DROP TABLE IF EXISTS published_key_packages")
             .execute(&db.inner.pool)
             .await
@@ -129,9 +154,15 @@ mod tests {
             "CREATE TABLE published_key_packages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key_package_hash_ref BLOB NOT NULL,
+                key_package_ref BLOB NULL,
+                key_package_content TEXT NULL,
                 event_id TEXT NOT NULL UNIQUE,
-                kind INTEGER NOT NULL DEFAULT 443,
+                kind INTEGER NOT NULL DEFAULT 30443,
                 d_tag TEXT NULL,
+                app_components TEXT NOT NULL DEFAULT '[]',
+                package_version INTEGER NOT NULL DEFAULT 1,
+                package_role TEXT NOT NULL DEFAULT 'legacy'
+                    CHECK (package_role IN ('legacy', 'last_resort', 'rotated')),
                 consumed_at INTEGER,
                 key_material_deleted INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -157,7 +188,7 @@ mod tests {
         repo.create(hash_ref, "evt_a_id", Kind::Custom(30443), Some("d"))
             .await
             .unwrap();
-        repo.create(hash_ref, "evt_b_id", Kind::Custom(443), None)
+        repo.create(hash_ref, "evt_b_id", Kind::Custom(30443), Some("d-2"))
             .await
             .unwrap();
 
@@ -169,16 +200,16 @@ mod tests {
             .expect("must exist");
         repo.mark_key_material_deleted(canonical.id).await.unwrap();
 
-        let twins = repo.find_by_hash_ref(hash_ref).await.unwrap();
-        assert_eq!(twins.len(), 2);
-        let deleted_kinds: Vec<i64> = twins
+        let siblings = repo.find_by_hash_ref(hash_ref).await.unwrap();
+        assert_eq!(siblings.len(), 2);
+        let deleted_events: Vec<String> = siblings
             .iter()
             .filter(|t| t.key_material_deleted)
-            .map(|t| t.kind)
+            .map(|t| t.event_id.clone())
             .collect();
         assert_eq!(
-            deleted_kinds,
-            vec![30443_i64],
+            deleted_events,
+            vec!["evt_a_id".to_string()],
             "by-id variant must only flip the canonical row"
         );
     }
@@ -188,9 +219,14 @@ mod tests {
         let (repo, _dir) = setup().await;
         let hash_ref = b"recent_hash";
 
-        repo.create(hash_ref, "evt_recent", Kind::Custom(443), None)
-            .await
-            .unwrap();
+        repo.create(
+            hash_ref,
+            "evt_recent",
+            Kind::Custom(30443),
+            Some("recent-d"),
+        )
+        .await
+        .unwrap();
         assert!(!repo.has_consumed_since(30).await.unwrap());
 
         repo.mark_consumed("evt_recent").await.unwrap();
@@ -207,9 +243,14 @@ mod tests {
         let (repo, _dir) = setup().await;
         let hash_ref = b"eligible_hash";
 
-        repo.create(hash_ref, "evt_eligible", Kind::Custom(443), None)
-            .await
-            .unwrap();
+        repo.create(
+            hash_ref,
+            "evt_eligible",
+            Kind::Custom(30443),
+            Some("eligible-d"),
+        )
+        .await
+        .unwrap();
         repo.mark_consumed("evt_eligible").await.unwrap();
         sqlx::query(
             "UPDATE published_key_packages

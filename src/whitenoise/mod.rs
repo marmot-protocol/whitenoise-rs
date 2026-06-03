@@ -43,6 +43,7 @@ pub mod group_state_streaming;
 pub mod groups;
 mod init_timing;
 pub mod key_packages;
+pub mod media_processing;
 // Platform keyring wrappers are only needed where we install a custom
 // keyring-core default store, plus tests that exercise those wrappers.
 #[cfg(any(
@@ -85,10 +86,8 @@ pub mod users;
 pub mod utils;
 pub mod zapstore;
 
-use mdk_core::prelude::MDK;
-use mdk_sqlite_storage::{MdkSqliteStorage, keyring};
-
 use crate::init_tracing;
+use crate::marmot::storage::WhitenoiseMarmotStorage;
 use crate::perf_instrument;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::discovery::DiscoveryPlaneConfig;
@@ -97,6 +96,7 @@ use crate::types::ProcessableEvent;
 
 use accounts::*;
 use app_settings::*;
+use database::keyring;
 use database::*;
 use error::{Result, WhitenoiseError};
 use event_tracker::WhitenoiseEventTracker;
@@ -148,7 +148,7 @@ pub struct WhitenoiseConfig {
     /// Configuration for the message aggregator
     pub message_aggregator_config: Option<message_aggregator::AggregatorConfig>,
 
-    /// Keyring service identifier for MDK SQLCipher key management.
+    /// Keyring service identifier for WhiteNoise SQLCipher key management.
     /// Each application using this crate must provide a unique identifier
     /// to avoid key collisions in the system keyring.
     pub keyring_service_id: String,
@@ -490,10 +490,11 @@ impl Whitenoise {
 
     /// Initializes the keyring-core credential store.
     ///
-    /// `mdk-sqlite-storage` and [`SecretsStore`] both use `keyring-core` to store
-    /// secret key material.  Unlike the `keyring` crate (v3), `keyring-core` does
-    /// **not** auto-detect a platform backend — callers must register one via
-    /// `keyring_core::set_default_store()` before any `Entry` operations.
+    /// [`WhitenoiseMarmotStorage`] and [`SecretsStore`] both use `keyring-core`
+    /// to store secret key material. Unlike the `keyring` crate (v3),
+    /// `keyring-core` does **not** auto-detect a platform backend - callers must
+    /// register one via `keyring_core::set_default_store()` before any `Entry`
+    /// operations.
     ///
     /// In test, integration-test, and benchmark-test builds the mock (in-memory)
     /// store is used so that neither `cargo test` nor unsigned `cargo run`
@@ -756,15 +757,6 @@ impl Whitenoise {
         Self::initialize_keyring_store().expect("Failed to initialize mock keyring store");
     }
 
-    /// Creates an MDK instance for the given account public key using this
-    /// instance's configured data directory and keyring service identifier.
-    pub(crate) fn create_mdk_for_account(
-        &self,
-        pubkey: PublicKey,
-    ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
-        Account::create_mdk(pubkey, &self.config().data_dir, self.keyring_service_id())
-    }
-
     /// Constructs a fully-initialized `Whitenoise` instance and returns it
     /// wrapped in `Arc<Self>`.
     ///
@@ -818,7 +810,7 @@ impl Whitenoise {
         }
         let keyring_service_id = config.keyring_service_id.clone();
 
-        // Ensure keyring-core has a credential store before any MDK or
+        // Ensure keyring-core has a credential store before any database or
         // SecretsStore operations attempt to create or read keyring entries.
         Self::initialize_keyring_store()?;
 
@@ -987,7 +979,7 @@ impl Whitenoise {
 
         tracing::info!(
             target: "whitenoise::new",
-            "Synchronizing message cache with MDK..."
+            "Synchronizing message cache from local message projections..."
         );
         // Synchronize message cache BEFORE starting event processor
         // This eliminates race conditions between startup sync and real-time cache updates
@@ -1251,23 +1243,39 @@ impl Whitenoise {
         // Remove storage artifacts (media cache, etc.)
         self.shared.storage.wipe_all().await?;
 
-        // Remove MLS related data
+        // Remove obsolete pre-Marmot MLS storage if it exists.
         let mls_dir = self.shared.config.data_dir.join("mls");
-        let orphaned_mdk_database_key_pubkeys = self
-            .collect_orphaned_mdk_storage_pubkeys(&accounts, &mls_dir)
+        match tokio::fs::metadata(&mls_dir).await {
+            Ok(metadata) if metadata.is_dir() => {
+                tracing::debug!(
+                    target: "whitenoise::delete_all_data",
+                    "Removing obsolete MLS directory: {:?}",
+                    mls_dir
+                );
+                tokio::fs::remove_dir_all(&mls_dir).await?;
+            }
+            Ok(_) => {
+                tokio::fs::remove_file(&mls_dir).await?;
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let marmot_dir = self.shared.config.data_dir.join("marmot");
+        let orphaned_marmot_database_key_pubkeys = self
+            .collect_orphaned_marmot_storage_pubkeys(&accounts, &marmot_dir)
             .await?;
-        if mls_dir.exists() {
+        if marmot_dir.exists() {
             tracing::debug!(
                 target: "whitenoise::delete_all_data",
-                "Removing MLS directory: {:?}",
-                mls_dir
+                "Removing Marmot directory: {:?}",
+                marmot_dir
             );
-            tokio::fs::remove_dir_all(&mls_dir).await?;
+            tokio::fs::remove_dir_all(&marmot_dir).await?;
         }
-        // Always recreate the empty MLS directory
-        tokio::fs::create_dir_all(&mls_dir).await?;
-        self.delete_mdk_database_keys_for_accounts(&accounts)?;
-        self.delete_mdk_database_keys_for_pubkeys(&orphaned_mdk_database_key_pubkeys)?;
+        tokio::fs::create_dir_all(&marmot_dir).await?;
+        self.delete_marmot_database_keys_for_accounts(&accounts)?;
+        self.delete_marmot_database_keys_for_pubkeys(&orphaned_marmot_database_key_pubkeys)?;
 
         // Remove logs
         if self.shared.config.logs_dir.exists() {
@@ -1285,44 +1293,51 @@ impl Whitenoise {
         Ok(())
     }
 
-    async fn delete_mdk_storage_for_account(&self, pubkey: &PublicKey) -> Result<()> {
-        let mls_storage_path = Account::mdk_storage_path(pubkey, &self.config().data_dir);
-        match tokio::fs::metadata(&mls_storage_path).await {
+    async fn delete_marmot_storage_for_account(&self, pubkey: &PublicKey) -> Result<()> {
+        let marmot_storage_path = Account::marmot_storage_path(pubkey, &self.config().data_dir);
+        let marmot_storage_dir = marmot_storage_path
+            .parent()
+            .unwrap_or(marmot_storage_path.as_path());
+        match tokio::fs::metadata(marmot_storage_dir).await {
             Ok(metadata) if metadata.is_dir() => {
-                tokio::fs::remove_dir_all(mls_storage_path).await?;
+                tokio::fs::remove_dir_all(marmot_storage_dir).await?;
             }
             Ok(_) => {
-                tokio::fs::remove_file(mls_storage_path).await?;
+                tokio::fs::remove_file(marmot_storage_dir).await?;
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) if e.kind() == ErrorKind::NotADirectory => {
                 tracing::warn!(
                     target: "whitenoise::accounts",
                     account_pubkey = %pubkey,
-                    path = ?mls_storage_path,
+                    path = ?marmot_storage_dir,
                     reason = "path component is not a directory",
                 );
             }
             Err(e) => return Err(e.into()),
         }
-        self.delete_mdk_database_key_for_pubkey(pubkey)
+        self.delete_marmot_database_key_for_pubkey(pubkey)
     }
 
-    fn delete_mdk_database_keys_for_accounts(&self, accounts: &[Account]) -> Result<()> {
+    fn delete_marmot_database_keys_for_accounts(&self, accounts: &[Account]) -> Result<()> {
         let pubkeys = accounts
             .iter()
             .map(|account| account.pubkey)
             .collect::<Vec<_>>();
-        self.delete_mdk_database_keys_for_pubkeys(&pubkeys)
+        self.delete_marmot_database_keys_for_pubkeys(&pubkeys)
     }
 
-    fn delete_mdk_database_keys_for_pubkeys(&self, pubkeys: &[PublicKey]) -> Result<()> {
-        Self::delete_mdk_database_keys(pubkeys, |pubkey| {
-            self.delete_mdk_database_key_for_pubkey(pubkey)
+    fn delete_marmot_database_keys_for_pubkeys(&self, pubkeys: &[PublicKey]) -> Result<()> {
+        Self::delete_database_keys("Marmot", pubkeys, |pubkey| {
+            self.delete_marmot_database_key_for_pubkey(pubkey)
         })
     }
 
-    fn delete_mdk_database_keys<F>(pubkeys: &[PublicKey], mut delete: F) -> Result<()>
+    fn delete_database_keys<F>(
+        database_label: &'static str,
+        pubkeys: &[PublicKey],
+        mut delete: F,
+    ) -> Result<()>
     where
         F: FnMut(&PublicKey) -> Result<()>,
     {
@@ -1334,7 +1349,8 @@ impl Whitenoise {
                     target: "whitenoise::delete_all_data",
                     account_pubkey = %pubkey,
                     error = %e,
-                    reason = "failed to delete MDK database key",
+                    database = database_label,
+                    reason = "failed to delete database key",
                 );
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1348,12 +1364,17 @@ impl Whitenoise {
         }
     }
 
-    fn mdk_storage_pubkey_from_entry_name(file_name: &OsStr, path: &Path) -> Option<PublicKey> {
+    fn storage_pubkey_from_entry_name(
+        storage_label: &'static str,
+        file_name: &OsStr,
+        path: &Path,
+    ) -> Option<PublicKey> {
         let Some(file_name) = file_name.to_str() else {
             tracing::warn!(
                 target: "whitenoise::delete_all_data",
                 path = ?path,
-                reason = "non-UTF-8 MLS storage filename",
+                storage = storage_label,
+                reason = "non-UTF-8 storage entry name",
             );
             return None;
         };
@@ -1362,7 +1383,8 @@ impl Whitenoise {
             tracing::debug!(
                 target: "whitenoise::delete_all_data",
                 path = ?path,
-                reason = "non-account MLS storage entry",
+                storage = storage_label,
+                reason = "non-account storage entry",
             );
             return None;
         };
@@ -1370,13 +1392,17 @@ impl Whitenoise {
         Some(pubkey)
     }
 
-    async fn collect_orphaned_mdk_storage_pubkeys(
+    fn marmot_storage_pubkey_from_entry_name(file_name: &OsStr, path: &Path) -> Option<PublicKey> {
+        Self::storage_pubkey_from_entry_name("Marmot", file_name, path)
+    }
+
+    async fn collect_orphaned_marmot_storage_pubkeys(
         &self,
         accounts: &[Account],
-        mls_dir: &Path,
+        marmot_dir: &Path,
     ) -> Result<Vec<PublicKey>> {
         let mut pubkeys = Vec::new();
-        let mut entries = match tokio::fs::read_dir(mls_dir).await {
+        let mut entries = match tokio::fs::read_dir(marmot_dir).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(pubkeys),
             Err(e) => return Err(e.into()),
@@ -1384,7 +1410,8 @@ impl Whitenoise {
 
         while let Some(entry) = entries.next_entry().await? {
             let file_name = entry.file_name();
-            let Some(pubkey) = Self::mdk_storage_pubkey_from_entry_name(&file_name, &entry.path())
+            let Some(pubkey) =
+                Self::marmot_storage_pubkey_from_entry_name(&file_name, &entry.path())
             else {
                 continue;
             };
@@ -1399,9 +1426,9 @@ impl Whitenoise {
         Ok(pubkeys)
     }
 
-    fn delete_mdk_database_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
-        let db_key_id = Account::mdk_db_key_id(pubkey);
-        keyring::delete_db_key(self.keyring_service_id(), &db_key_id)?;
+    fn delete_marmot_database_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
+        let db_key_id = Account::marmot_db_key_id(pubkey);
+        WhitenoiseMarmotStorage::delete_account_key(self.keyring_service_id(), &db_key_id)?;
         Ok(())
     }
 
@@ -1683,17 +1710,19 @@ impl Whitenoise {
 
 #[cfg(test)]
 pub mod test_utils {
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     use super::*;
+    use crate::marmot::{GroupConfig, GroupId};
     use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::group_information::GroupInformation;
     use crate::whitenoise::relays::Relay;
-    use mdk_core::prelude::*;
-    use nostr_sdk::{EventBuilder, EventId, Keys, PublicKey, RelayUrl, UnsignedEvent};
+    use nostr_sdk::{Keys, PublicKey, RelayUrl};
     use tempfile::TempDir;
 
     pub struct DropFlag(Arc<AtomicBool>);
@@ -1708,6 +1737,35 @@ pub mod test_utils {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    pub(crate) struct ObsoleteMlsArtifacts {
+        pub(crate) storage_path: PathBuf,
+    }
+
+    pub(crate) fn obsolete_mls_storage_path(pubkey: &PublicKey, data_dir: &Path) -> PathBuf {
+        data_dir.join("mls").join(pubkey.to_hex())
+    }
+
+    pub(crate) fn remove_obsolete_mls_artifacts(
+        account: &Account,
+        data_dir: &Path,
+    ) -> ObsoleteMlsArtifacts {
+        let artifacts = ObsoleteMlsArtifacts {
+            storage_path: obsolete_mls_storage_path(&account.pubkey, data_dir),
+        };
+
+        if artifacts.storage_path.is_dir() {
+            fs::remove_dir_all(&artifacts.storage_path).unwrap();
+        } else if artifacts.storage_path.exists() {
+            fs::remove_file(&artifacts.storage_path).unwrap();
+        }
+
+        artifacts
+    }
+
+    pub(crate) fn assert_obsolete_mls_artifacts_absent(artifacts: &ObsoleteMlsArtifacts) {
+        assert!(!artifacts.storage_path.exists());
     }
 
     // ── Shared raw-SQL fixture helpers ────────────────────────────────────────
@@ -2035,17 +2093,45 @@ pub mod test_utils {
         (account, keys)
     }
 
-    pub(crate) fn create_nostr_group_config_data(admins: Vec<PublicKey>) -> NostrGroupConfigData {
-        NostrGroupConfigData::new(
+    pub(crate) fn create_group_config(admins: Vec<PublicKey>) -> GroupConfig {
+        GroupConfig::new(
             "Test group".to_owned(),
             "test description".to_owned(),
-            Some([0u8; 32]), // 32-byte hash for fake image
-            Some([1u8; 32]), // 32-byte encryption key
-            Some([2u8; 12]), // 12-byte nonce
+            None,
+            None,
+            None,
             vec![RelayUrl::parse("ws://localhost:8080/").unwrap()],
             admins,
             None,
         )
+    }
+
+    pub(crate) async fn setup_unprojected_accepted_group(
+        whitenoise: &Whitenoise,
+        group_members: &[&Account],
+    ) -> GroupId {
+        let mut group_id_bytes = [0_u8; 32];
+        ::rand::rng().fill_bytes(&mut group_id_bytes);
+        let group_id = GroupId::from_slice(&group_id_bytes);
+
+        GroupInformation::create_for_group(
+            whitenoise,
+            &group_id,
+            Some(group_information::GroupType::Group),
+            "Unprojected group",
+        )
+        .await
+        .unwrap();
+
+        for account in group_members {
+            let (account_group, _) =
+                AccountGroup::get_or_create(whitenoise, &account.pubkey, &group_id, None)
+                    .await
+                    .unwrap();
+            account_group.accept(whitenoise).await.unwrap();
+        }
+
+        group_id
     }
 
     pub(crate) async fn setup_multiple_test_accounts(
@@ -2120,175 +2206,17 @@ pub mod test_utils {
             )
         });
     }
-
-    async fn create_group_with_member_welcomes(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_accounts: &[&Account],
-    ) -> (GroupId, Vec<UnsignedEvent>) {
-        let mut key_package_events = Vec::with_capacity(member_accounts.len());
-        for member_account in member_accounts {
-            let relay_urls = Relay::urls(
-                &member_account
-                    .key_package_relays(&whitenoise.shared)
-                    .await
-                    .unwrap(),
-            );
-            let key_package_event = whitenoise
-                .shared
-                .relay_control
-                .fetch_user_key_package(member_account.pubkey, &relay_urls)
-                .await
-                .unwrap()
-                .expect("member must have a published key package");
-            key_package_events.push(key_package_event);
-        }
-
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let create_result = admin_mdk
-            .create_group(
-                &admin_account.pubkey,
-                key_package_events,
-                create_nostr_group_config_data(vec![admin_account.pubkey]),
-            )
-            .unwrap();
-
-        (
-            create_result.group.mls_group_id.clone(),
-            create_result.welcome_rumors,
-        )
-    }
-
-    async fn deliver_group_welcomes(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_accounts: &[&Account],
-        welcome_rumors: Vec<UnsignedEvent>,
-    ) {
-        assert_eq!(
-            member_accounts.len(),
-            welcome_rumors.len(),
-            "each invited member should receive exactly one welcome rumor"
-        );
-
-        let admin_signer = whitenoise
-            .shared
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
-            .unwrap();
-
-        for (member_account, welcome_rumor) in member_accounts.iter().zip(welcome_rumors) {
-            let giftwrap = EventBuilder::gift_wrap(
-                &admin_signer,
-                &member_account.pubkey,
-                welcome_rumor,
-                vec![],
-            )
-            .await
-            .unwrap();
-
-            let session = whitenoise
-                .require_session(&member_account.pubkey)
-                .expect("member must have an active session");
-            whitenoise
-                .handle_giftwrap(&session, member_account, giftwrap)
-                .await
-                .expect("member should process welcome successfully");
-        }
-    }
-
-    pub(crate) async fn setup_two_member_group_with_welcome_finalization(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_account: &Account,
-    ) -> GroupId {
-        let member_accounts = [member_account];
-        let (group_id, welcome_rumors) =
-            create_group_with_member_welcomes(whitenoise, admin_account, &member_accounts).await;
-        deliver_group_welcomes(whitenoise, admin_account, &member_accounts, welcome_rumors).await;
-
-        let group_name = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap()
-            .get_group(&group_id)
-            .unwrap()
-            .expect("member should have group after welcome")
-            .name;
-        let member_session = whitenoise.session(&member_account.pubkey).unwrap();
-        Whitenoise::finalize_welcome_with_instance(
-            whitenoise,
-            member_account,
-            &member_session,
-            &group_id,
-            &group_name,
-            EventId::all_zeros(),
-            admin_account.pubkey,
-        )
-        .await;
-
-        group_id
-    }
-
-    pub(crate) async fn setup_two_member_group_with_accepted_account_groups(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_account: &Account,
-    ) -> GroupId {
-        let member_accounts = [member_account];
-        let (group_id, welcome_rumors) =
-            create_group_with_member_welcomes(whitenoise, admin_account, &member_accounts).await;
-        deliver_group_welcomes(whitenoise, admin_account, &member_accounts, welcome_rumors).await;
-
-        GroupInformation::create_for_group(whitenoise, &group_id, None, "Test group")
-            .await
-            .unwrap();
-
-        let (admin_group, _) =
-            AccountGroup::get_or_create(whitenoise, &admin_account.pubkey, &group_id, None)
-                .await
-                .unwrap();
-        admin_group.accept(whitenoise).await.unwrap();
-
-        let (member_group, _) =
-            AccountGroup::get_or_create(whitenoise, &member_account.pubkey, &group_id, None)
-                .await
-                .unwrap();
-        member_group.accept(whitenoise).await.unwrap();
-
-        group_id
-    }
-
-    pub(crate) async fn setup_three_member_group(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        first_member: &Account,
-        second_member: &Account,
-    ) -> GroupId {
-        let member_accounts = [first_member, second_member];
-        let (group_id, welcome_rumors) =
-            create_group_with_member_welcomes(whitenoise, admin_account, &member_accounts).await;
-        deliver_group_welcomes(whitenoise, admin_account, &member_accounts, welcome_rumors).await;
-
-        group_id
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::ffi::OsString;
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStringExt;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use keyring_core::api::CredentialStoreApi;
 
     use super::test_utils::*;
     use super::*;
+    use crate::marmot::GroupId;
     use database::aggregated_messages::PaginationOptions;
 
     struct CustomLegacyStoreCreationError;
@@ -2525,7 +2453,7 @@ mod tests {
     #[tokio::test]
     async fn insert_test_group_creates_group_information_row() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let group_id = mdk_core::prelude::GroupId::from_slice(&[0xab, 0xcd, 0xef, 0x01]);
+        let group_id = GroupId::from_slice(&[0xab, 0xcd, 0xef, 0x01]);
 
         insert_test_group(&whitenoise.shared.database, &group_id).await;
 
@@ -2781,10 +2709,9 @@ mod tests {
             let media_cache_dir_after = whitenoise.shared.storage.media_files.cache_dir();
             assert!(!media_cache_dir_after.exists());
 
-            // MLS directory should be recreated as empty
+            // Obsolete pre-Marmot MLS directory should stay absent after a full wipe.
             let mls_dir = whitenoise.config().data_dir.join("mls");
-            assert!(mls_dir.exists());
-            assert!(mls_dir.is_dir());
+            assert!(!mls_dir.exists());
         }
 
         #[tokio::test]
@@ -2890,186 +2817,95 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_delete_all_data_removes_mdk_database_keys() {
+        async fn test_delete_all_data_removes_marmot_database_keys() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (account, _keys) = create_test_account(&whitenoise).await;
             account.save(&whitenoise.shared.database).await.unwrap();
 
-            let db_key_id = Account::mdk_db_key_id(&account.pubkey);
-            keyring::get_or_create_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                .expect("Failed to create MDK database key");
+            let storage_path =
+                Account::marmot_storage_path(&account.pubkey, &whitenoise.config().data_dir);
+            let db_key_id = Account::marmot_db_key_id(&account.pubkey);
+            let storage = WhitenoiseMarmotStorage::open_for_account(
+                &storage_path,
+                &whitenoise.config().keyring_service_id,
+                &db_key_id,
+            )
+            .expect("Failed to create Marmot storage");
 
-            assert!(
-                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                    .unwrap()
-                    .is_some()
-            );
+            assert!(storage_path.exists());
+            assert!(keyring_core_entry_exists(
+                &whitenoise.config().keyring_service_id,
+                &db_key_id
+            ));
+            drop(storage);
 
             whitenoise.delete_all_data().await.unwrap();
 
             assert!(
-                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                    .unwrap()
-                    .is_none(),
-                "App wipe should remove account-scoped MDK database keys"
+                !keyring_core_entry_exists(&whitenoise.config().keyring_service_id, &db_key_id),
+                "App wipe should remove account-scoped Marmot database keys"
             );
         }
 
         #[tokio::test]
-        async fn test_delete_all_data_removes_orphaned_mdk_database_keys_from_storage_dirs() {
+        async fn test_delete_all_data_removes_obsolete_mls_storage_directory() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let orphan_pubkey = create_test_keys().public_key();
-            let orphan_storage_dir =
-                Account::mdk_storage_path(&orphan_pubkey, &whitenoise.config().data_dir);
-            let db_key_id = Account::mdk_db_key_id(&orphan_pubkey);
+            let orphan_storage_dir = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+                &orphan_pubkey,
+                &whitenoise.config().data_dir,
+            );
 
             tokio::fs::create_dir_all(&orphan_storage_dir)
                 .await
                 .unwrap();
-            keyring::get_or_create_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                .expect("Failed to create orphaned MDK database key");
-
-            assert!(
-                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                    .unwrap()
-                    .is_some()
-            );
 
             whitenoise.delete_all_data().await.unwrap();
 
-            assert!(
-                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                    .unwrap()
-                    .is_none()
-            );
             assert!(!orphan_storage_dir.exists());
         }
 
         #[tokio::test]
-        async fn test_collect_orphaned_mdk_storage_pubkeys_handles_missing_and_invalid_entries() {
+        async fn test_delete_all_data_removes_orphaned_marmot_database_keys_from_storage_dirs() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-            let account_pubkey = create_test_keys().public_key();
             let orphan_pubkey = create_test_keys().public_key();
-            let mls_dir = whitenoise.config().data_dir.join("scan_mls");
-            let missing_dir = whitenoise.config().data_dir.join("missing_mls");
-            let not_a_dir = whitenoise.config().data_dir.join("mls-file");
-            let accounts = vec![
-                Account::new_external(&whitenoise, account_pubkey)
-                    .await
-                    .unwrap(),
-            ];
+            let orphan_storage_path =
+                Account::marmot_storage_path(&orphan_pubkey, &whitenoise.config().data_dir);
+            let orphan_storage_dir = orphan_storage_path
+                .parent()
+                .expect("Marmot storage path should have account directory");
+            let db_key_id = Account::marmot_db_key_id(&orphan_pubkey);
+            let storage = WhitenoiseMarmotStorage::open_for_account(
+                &orphan_storage_path,
+                &whitenoise.config().keyring_service_id,
+                &db_key_id,
+            )
+            .expect("Failed to create orphaned Marmot storage");
 
-            let missing = whitenoise
-                .collect_orphaned_mdk_storage_pubkeys(&accounts, &missing_dir)
-                .await
-                .unwrap();
-            assert!(missing.is_empty());
+            assert!(orphan_storage_path.exists());
+            assert!(keyring_core_entry_exists(
+                &whitenoise.config().keyring_service_id,
+                &db_key_id
+            ));
+            drop(storage);
 
-            tokio::fs::write(&not_a_dir, "not a directory")
-                .await
-                .unwrap();
-            assert!(
-                whitenoise
-                    .collect_orphaned_mdk_storage_pubkeys(&accounts, &not_a_dir)
-                    .await
-                    .is_err()
-            );
+            whitenoise.delete_all_data().await.unwrap();
 
-            tokio::fs::create_dir_all(mls_dir.join(account_pubkey.to_string()))
-                .await
-                .unwrap();
-            tokio::fs::create_dir_all(mls_dir.join(orphan_pubkey.to_string()))
-                .await
-                .unwrap();
-            tokio::fs::write(mls_dir.join("not-a-pubkey"), "ignored")
-                .await
-                .unwrap();
-
-            let found = whitenoise
-                .collect_orphaned_mdk_storage_pubkeys(&accounts, &mls_dir)
-                .await
-                .unwrap();
-
-            assert_eq!(found, vec![orphan_pubkey]);
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn test_mdk_storage_pubkey_from_entry_name_skips_non_utf8_and_invalid_names() {
-            let orphan_pubkey = create_test_keys().public_key();
-            let non_utf8_name = OsString::from_vec(vec![0xff, b'm', b'd', b'k']);
-
-            assert_eq!(
-                Whitenoise::mdk_storage_pubkey_from_entry_name(
-                    non_utf8_name.as_os_str(),
-                    Path::new("non-utf8")
-                ),
-                None
-            );
-            assert_eq!(
-                Whitenoise::mdk_storage_pubkey_from_entry_name(
-                    OsStr::new("not-a-pubkey"),
-                    Path::new("invalid")
-                ),
-                None
-            );
-            assert_eq!(
-                Whitenoise::mdk_storage_pubkey_from_entry_name(
-                    OsStr::new(&orphan_pubkey.to_string()),
-                    Path::new("valid")
-                ),
-                Some(orphan_pubkey)
-            );
-        }
-
-        #[tokio::test]
-        async fn test_delete_mdk_storage_for_account_treats_not_a_directory_as_cleanup_complete() {
-            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-            let pubkey = create_test_keys().public_key();
-            let mls_dir = whitenoise.config().data_dir.join("mls");
-            let db_key_id = Account::mdk_db_key_id(&pubkey);
-
-            let _ = tokio::fs::remove_dir_all(&mls_dir).await;
-            tokio::fs::write(&mls_dir, "not a directory").await.unwrap();
-            keyring::get_or_create_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                .expect("Failed to create MDK database key");
-
-            whitenoise
-                .delete_mdk_storage_for_account(&pubkey)
-                .await
-                .unwrap();
-
-            assert!(
-                keyring::get_db_key(&whitenoise.config().keyring_service_id, &db_key_id)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-
-        #[cfg(unix)]
-        #[tokio::test]
-        async fn test_delete_mdk_storage_for_account_propagates_unexpected_metadata_errors() {
-            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-            let pubkey = create_test_keys().public_key();
-            let mls_dir = whitenoise.config().data_dir.join("mls");
-
-            tokio::fs::create_dir_all(&mls_dir).await.unwrap();
-            std::fs::set_permissions(&mls_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-            let result = whitenoise.delete_mdk_storage_for_account(&pubkey).await;
-
-            std::fs::set_permissions(&mls_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(result.is_err());
+            assert!(!keyring_core_entry_exists(
+                &whitenoise.config().keyring_service_id,
+                &db_key_id
+            ));
+            assert!(!orphan_storage_dir.exists());
         }
 
         #[test]
-        fn test_delete_mdk_database_keys_continues_after_delete_error() {
+        fn test_delete_database_keys_continues_after_delete_error() {
             let first_pubkey = create_test_keys().public_key();
             let second_pubkey = create_test_keys().public_key();
             let pubkeys = vec![first_pubkey, second_pubkey];
             let mut attempted_pubkeys = Vec::new();
 
-            let result = Whitenoise::delete_mdk_database_keys(&pubkeys, |pubkey| {
+            let result = Whitenoise::delete_database_keys("test", &pubkeys, |pubkey| {
                 attempted_pubkeys.push(*pubkey);
                 if *pubkey == first_pubkey {
                     return Err(WhitenoiseError::Internal("delete failed".to_string()));
@@ -3081,6 +2917,16 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(attempted_pubkeys, pubkeys);
         }
+
+        fn keyring_core_entry_exists(service_id: &str, key_id: &str) -> bool {
+            let entry = keyring_core::Entry::new(service_id, key_id)
+                .expect("Failed to create keyring-core entry");
+            match entry.get_secret() {
+                Ok(_) => true,
+                Err(keyring_core::Error::NoEntry) => false,
+                Err(err) => panic!("Failed to inspect keyring-core entry: {err}"),
+            }
+        }
     }
 
     // API Tests (using mock to minimize network calls)
@@ -3088,7 +2934,7 @@ mod tests {
     // For complete isolation, implement the trait-based mocking described above
     mod api_tests {
         use super::*;
-        use mdk_core::prelude::GroupId;
+        use crate::marmot::GroupId;
 
         #[tokio::test]
         async fn test_message_aggregator_access() {
@@ -3361,13 +3207,12 @@ mod tests {
             .unwrap();
             // Create and register a session so require_session() works
             if whitenoise.account_manager.get_session(pubkey).is_none() {
-                let mdk = whitenoise.create_mdk_for_account(*pubkey).unwrap();
                 let session = std::sync::Arc::new(
                     session::AccountSession::new(
                         *pubkey,
-                        mdk,
                         whitenoise.shared.clone(),
                         std::sync::Weak::new(),
+                        None,
                         None,
                     )
                     .await
@@ -4534,8 +4379,9 @@ mod tests {
             );
         }
 
-        /// When MDK has more active groups than the group plane, the parity
-        /// check should detect the mismatch and report non-operational.
+        /// When the Darkmatter runtime has more confirmed groups than the
+        /// group plane, the parity check should detect the mismatch and report
+        /// non-operational.
         #[tokio::test]
         async fn test_is_account_operational_detects_group_count_mismatch() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -4545,7 +4391,7 @@ mod tests {
             let member_pubkey = members[0].0.pubkey;
             wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
-            // Starts operational (0 groups in MDK, 0 in plane)
+            // Starts operational (0 groups in the runtime, 0 in plane)
             assert!(
                 whitenoise
                     .is_account_subscriptions_operational(&creator_account)
@@ -4554,9 +4400,9 @@ mod tests {
                 "Should be operational with zero groups"
             );
 
-            // Create a group — this adds it to MDK and (via background task)
-            // to the group plane
-            let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+            // Create a group — this adds it to the Darkmatter runtime and
+            // (via background task) to the group plane.
+            let config = create_group_config(vec![creator_account.pubkey]);
             whitenoise
                 .require_session(&creator_account.pubkey)
                 .unwrap()
@@ -4580,7 +4426,8 @@ mod tests {
             .expect("background group-plane refresh should settle");
 
             // Tear down subscriptions to simulate the welcome-processing
-            // cascade failure (group exists in MDK but not in group plane)
+            // cascade failure (group exists in the runtime but not in the
+            // group plane).
             session.deactivate_subscriptions().await;
 
             // Re-activate inbox only (without groups) to isolate the test
@@ -4610,7 +4457,7 @@ mod tests {
                     .group_plane_account_group_count(&creator_account.pubkey)
                     .await,
                 0,
-                "test setup should leave MDK with one group and the group plane empty"
+                "test setup should leave the runtime with one group and the group plane empty"
             );
 
             let is_operational = whitenoise
@@ -4619,7 +4466,7 @@ mod tests {
                 .unwrap();
             assert!(
                 !is_operational,
-                "Should detect mismatch: MDK has 1 group, plane has 0"
+                "Should detect mismatch: runtime has 1 group, plane has 0"
             );
 
             // Recovery via ensure should fix it
@@ -5066,7 +4913,7 @@ mod tests {
             let member = whitenoise.create_identity().await.unwrap();
 
             let base_timestamp = Utc::now().timestamp() as u64;
-            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            let mut config = create_group_config(vec![creator.pubkey]);
             config.name = "Group A".to_string();
             let group_a = whitenoise
                 .require_session(&creator.pubkey)
@@ -5075,7 +4922,7 @@ mod tests {
                 .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
-            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            let mut config = create_group_config(vec![creator.pubkey]);
             config.name = "Group B".to_string();
             let group_b = whitenoise
                 .require_session(&creator.pubkey)
@@ -5084,7 +4931,7 @@ mod tests {
                 .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
-            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            let mut config = create_group_config(vec![creator.pubkey]);
             config.name = "Group C".to_string();
             let group_c = whitenoise
                 .require_session(&creator.pubkey)
@@ -5093,7 +4940,7 @@ mod tests {
                 .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
-            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            let mut config = create_group_config(vec![creator.pubkey]);
             config.name = "Group D".to_string();
             let group_d = whitenoise
                 .require_session(&creator.pubkey)
@@ -5102,7 +4949,7 @@ mod tests {
                 .create_group(vec![member.pubkey], config, None)
                 .await
                 .unwrap();
-            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            let mut config = create_group_config(vec![creator.pubkey]);
             config.name = "Group E".to_string();
             let group_e = whitenoise
                 .require_session(&creator.pubkey)

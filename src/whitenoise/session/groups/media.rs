@@ -1,16 +1,12 @@
 //! Group media operations scoped to an [`AccountSession`].
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use base64ct::{Base64, Encoding as _};
+use cgka_traits::types::GroupId as MarmotGroupId;
 use futures::StreamExt;
-use mdk_core::encrypted_media::types::MediaReference;
-use mdk_core::extension::group_image;
-use mdk_core::media_processing::MediaProcessingOptions;
-use mdk_core::prelude::GroupId;
-use mdk_storage_traits::Secret;
 use nostr_blossom::bud01::{
     BlossomAuthorization, BlossomAuthorizationScope, BlossomAuthorizationVerb,
     BlossomBuilderExtension,
@@ -20,13 +16,19 @@ use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
+use crate::marmot::media::{
+    ChatMediaReference, ENCRYPTED_MEDIA_VERSION, decrypt_chat_media, encrypt_chat_media,
+};
+use crate::marmot::{Group, GroupId};
 use crate::perf_instrument;
-use crate::types::ImageType;
 use crate::whitenoise::database::media_files::{FileMetadata, MediaFile};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::groups::blossom_error::BlossomError;
 use crate::whitenoise::groups::media::{is_debug_local_blossom_url, require_https};
 use crate::whitenoise::media_files::{AudioMetadata, MediaFileUpload};
+use crate::whitenoise::media_processing::{
+    MediaProcessingOptions, process_for_chat_media_encryption,
+};
 use crate::whitenoise::session::AccountSession;
 
 /// Shared HTTP client for Blossom blob downloads.
@@ -82,6 +84,50 @@ static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to build shared Blossom HTTP client")
 });
 
+const DARKMATTER_MEDIA_UNSUPPORTED: &str =
+    "Darkmatter group image operations require a group image component implementation";
+
+#[derive(Debug)]
+struct PreparedChatMedia {
+    plaintext_data: Vec<u8>,
+    encrypted_data: Vec<u8>,
+    original_hash: [u8; 32],
+    encrypted_hash: [u8; 32],
+    mime_type: String,
+    filename: String,
+    dimensions: Option<(u32, u32)>,
+    blurhash: Option<String>,
+    thumbhash: Option<String>,
+    duration_ms: Option<u64>,
+    waveform: Option<Vec<u8>>,
+    nonce: [u8; 12],
+}
+
+impl PreparedChatMedia {
+    fn from_darkmatter(
+        encrypted: crate::marmot::media::EncryptedChatMedia,
+        plaintext_data: Vec<u8>,
+        dimensions: Option<(u32, u32)>,
+        blurhash: Option<String>,
+        thumbhash: Option<String>,
+    ) -> Self {
+        Self {
+            plaintext_data,
+            encrypted_data: encrypted.encrypted_data,
+            original_hash: encrypted.original_hash,
+            encrypted_hash: encrypted.encrypted_hash,
+            mime_type: encrypted.mime_type,
+            filename: encrypted.filename,
+            dimensions,
+            blurhash,
+            thumbhash,
+            duration_ms: None,
+            waveform: None,
+            nonce: encrypted.nonce,
+        }
+    }
+}
+
 /// View over [`AccountSession`] for group media operations.
 ///
 /// Obtain via [`super::GroupOps::media`].
@@ -120,58 +166,18 @@ impl<'a> MediaOps<'a> {
 
     // ── Public operations ─────────────────────────────────────────────
 
-    /// Syncs group image cache if needed (smart, hash-based check).
+    /// Syncs group image cache if needed.
     ///
-    /// This method is called after processing welcomes and commits to proactively
-    /// cache group images. It only downloads if:
-    /// 1. The group has an image set
-    /// 2. The image_hash is not already cached
-    ///
-    /// This ensures images are ready before the UI needs them, while avoiding
-    /// redundant downloads.
+    /// Darkmatter group images need a first-class app component before this can
+    /// download anything. Until then, projected Darkmatter groups no-op and
+    /// legacy-only groups are treated as absent.
     #[perf_instrument("groups")]
     pub async fn sync_group_image_cache_if_needed(&self, group_id: &GroupId) -> Result<()> {
-        let group = self
-            .session
-            .mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
+        if self.darkmatter_group_projection(group_id)?.is_some() {
+            return Ok(());
+        }
 
-        // Check if group has an image set
-        let (image_hash, image_key, image_nonce) =
-            match (group.image_hash, group.image_key, group.image_nonce) {
-                (Some(hash), Some(key), Some(nonce)) => (hash, key, nonce),
-                _ => return Ok(()), // No image set, nothing to do
-            };
-
-        // Try to get the stored blossom_url from the database
-        let blossom_url = if let Some(media_file) = MediaFile::find_by_hash(
-            &self.session.account_db.inner.pool,
-            &self.session.shared.database,
-            &self.session.account_pubkey,
-            &image_hash,
-        )
-        .await?
-        {
-            media_file
-                .blossom_url
-                .and_then(|url_str| Url::parse(&url_str).ok())
-        } else {
-            None
-        };
-
-        // Download and cache the image
-        self.download_and_cache_group_image(
-            blossom_url,
-            group_id,
-            &image_hash,
-            &image_key,
-            &image_nonce,
-        )
-        .await?;
-
-        Ok(())
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Uploads a group image to a Blossom server and returns the encrypted metadata.
@@ -182,92 +188,19 @@ impl<'a> MediaOps<'a> {
     pub async fn upload_group_image(
         &self,
         group_id: &GroupId,
-        file_path: &str,
-        blossom_server_url: Option<Url>,
-        options: Option<MediaProcessingOptions>,
+        _file_path: &str,
+        _blossom_server_url: Option<Url>,
+        _options: Option<MediaProcessingOptions>,
     ) -> Result<([u8; 32], [u8; 32], [u8; 12])> {
-        let admins: Vec<PublicKey> = self
-            .session
-            .mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?
-            .admin_pubkeys
-            .into_iter()
-            .collect();
-        if !admins.contains(&self.session.account_pubkey) {
-            return Err(WhitenoiseError::AccountNotAuthorized);
+        if let Some(group) = self.darkmatter_group_projection(group_id)? {
+            if !group.admin_pubkeys.contains(&self.session.account_pubkey) {
+                return Err(WhitenoiseError::AccountNotAuthorized);
+            }
+
+            return Err(Self::darkmatter_media_unsupported("group image upload"));
         }
 
-        let image_data = tokio::fs::read(file_path).await?;
-        let image_type = ImageType::detect(&image_data).map_err(|e| {
-            WhitenoiseError::UnsupportedMediaFormat(format!(
-                "Failed to detect or validate image from {}: {}",
-                file_path, e
-            ))
-        })?;
-
-        let prepared =
-            mdk_core::extension::group_image::prepare_group_image_for_upload_with_options(
-                &image_data,
-                image_type.mime_type(),
-                &options.unwrap_or_default(),
-            )?;
-
-        let blossom_server_url = blossom_server_url.unwrap_or_else(Self::default_blossom_url);
-        let descriptor = Self::upload_encrypted_blob_to_blossom(
-            &blossom_server_url,
-            prepared.encrypted_data.as_ref().clone(),
-            image_type.mime_type(),
-            &prepared.upload_keypair,
-        )
-        .await?;
-
-        let returned_hash_bytes: [u8; 32] = *descriptor.sha256.as_ref();
-        if returned_hash_bytes != prepared.encrypted_hash {
-            return Err(WhitenoiseError::HashMismatch {
-                expected: hex::encode(prepared.encrypted_hash),
-                actual: hex::encode(returned_hash_bytes),
-            });
-        }
-
-        let hash_hex = hex::encode(prepared.encrypted_hash);
-        let filename = format!("{}.{}", hash_hex, image_type.extension());
-
-        let mut hasher = sha2::Sha256::new();
-        sha2::Digest::update(&mut hasher, &image_data);
-        let original_hash: [u8; 32] = hasher.finalize().into();
-
-        let upload = MediaFileUpload {
-            data: &image_data,
-            original_file_hash: Some(&original_hash),
-            encrypted_file_hash: prepared.encrypted_hash,
-            mime_type: image_type.mime_type(),
-            media_type: "group_image",
-            blossom_url: Some(descriptor.url.as_str()),
-            nostr_key: Some(prepared.upload_keypair.secret_key().to_secret_hex()),
-            file_metadata: None,
-            nonce: None,
-            scheme_version: None,
-        };
-
-        if let Err(e) = self
-            .media_files()
-            .store_and_record(&self.session.account_pubkey, group_id, &filename, upload)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::session::groups::media",
-                "Failed to cache uploaded group image: {}. Image will be downloaded on next access.",
-                e
-            );
-        }
-
-        Ok((
-            prepared.encrypted_hash,
-            *prepared.image_key.as_ref(),
-            *prepared.image_nonce.as_ref(),
-        ))
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Uploads a chat media file to a Blossom server, encrypts it, and records it in the database.
@@ -299,6 +232,10 @@ impl<'a> MediaOps<'a> {
         options: Option<MediaProcessingOptions>,
         audio_metadata: Option<AudioMetadata>,
     ) -> Result<MediaFile> {
+        if self.darkmatter_group_projection(group_id)?.is_none() {
+            return Err(WhitenoiseError::GroupNotFound);
+        }
+
         let file_data = tokio::fs::read(file_path).await?;
         let media_detection = crate::types::detect_media_type(&file_data)?;
 
@@ -307,16 +244,29 @@ impl<'a> MediaOps<'a> {
             .and_then(|n| n.to_str())
             .ok_or_else(|| WhitenoiseError::Internal("Invalid file path".to_string()))?;
 
-        let mut prepared = {
-            let media_manager = self.session.mdk.media_manager(group_id.clone());
-
-            media_manager.encrypt_for_upload_with_options(
-                &file_data,
-                media_detection.mime_type(),
-                original_filename,
-                &options.unwrap_or_default(),
-            )?
-        };
+        let options = options.unwrap_or_default();
+        let processed = process_for_chat_media_encryption(
+            &file_data,
+            media_detection.mime_type(),
+            original_filename,
+            &options,
+        )?;
+        let exporter_secret = self
+            .darkmatter_encrypted_media_exporter_secret(group_id)
+            .await?;
+        let encrypted = encrypt_chat_media(
+            exporter_secret.as_ref(),
+            &processed.data,
+            &processed.mime_type,
+            original_filename,
+        )?;
+        let mut prepared = PreparedChatMedia::from_darkmatter(
+            encrypted,
+            processed.data,
+            processed.dimensions,
+            processed.blurhash,
+            processed.thumbhash,
+        );
         if let Some(metadata) = audio_metadata {
             prepared.duration_ms = metadata.duration_ms;
             prepared.waveform = metadata.waveform;
@@ -361,7 +311,7 @@ impl<'a> MediaOps<'a> {
         });
 
         let upload = MediaFileUpload {
-            data: &file_data,
+            data: &prepared.plaintext_data,
             original_file_hash: Some(&prepared.original_hash),
             encrypted_file_hash: prepared.encrypted_hash,
             mime_type: &prepared.mime_type,
@@ -370,7 +320,7 @@ impl<'a> MediaOps<'a> {
             nostr_key: Some(upload_keys_hex),
             file_metadata: file_metadata.as_ref(),
             nonce: Some(hex::encode(prepared.nonce)),
-            scheme_version: Some("mip04-v2"),
+            scheme_version: Some(ENCRYPTED_MEDIA_VERSION),
         };
 
         self.media_files()
@@ -390,6 +340,10 @@ impl<'a> MediaOps<'a> {
         group_id: &GroupId,
         original_file_hash: &[u8; 32],
     ) -> Result<MediaFile> {
+        if self.darkmatter_group_projection(group_id)?.is_none() {
+            return Err(WhitenoiseError::GroupNotFound);
+        }
+
         let media_file = MediaFile::find_by_original_hash_and_group(
             &self.session.account_db.inner.pool,
             &self.session.shared.database,
@@ -462,296 +416,66 @@ impl<'a> MediaOps<'a> {
     /// Returns the filesystem path of the cached group image, downloading if needed.
     #[perf_instrument("groups")]
     pub async fn get_group_image_path(&self, group_id: &GroupId) -> Result<Option<PathBuf>> {
-        let group = self
-            .session
-            .mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
+        if self.darkmatter_group_projection(group_id)?.is_some() {
+            return Ok(None);
+        }
 
-        self.resolve_group_image_path(&group).await
+        Err(WhitenoiseError::GroupNotFound)
     }
 
-    /// Resolves the filesystem path for a group's image, downloading and caching if needed.
+    /// Resolves the filesystem path for a group's image.
+    ///
+    /// Darkmatter group-image projection is intentionally unavailable until the
+    /// app component exists. Legacy-only groups are treated as absent.
     #[perf_instrument("groups")]
-    pub(crate) async fn resolve_group_image_path(
-        &self,
-        group: &mdk_core::prelude::group_types::Group,
-    ) -> Result<Option<PathBuf>> {
-        let (image_hash, image_key, image_nonce) =
-            match (&group.image_hash, &group.image_key, &group.image_nonce) {
-                (Some(hash), Some(key), Some(nonce)) => (hash, key, nonce),
-                _ => return Ok(None),
-            };
-
-        let blossom_url = if let Some(media_file) = MediaFile::find_by_hash(
-            &self.session.account_db.inner.pool,
-            &self.session.shared.database,
-            &self.session.account_pubkey,
-            image_hash,
-        )
-        .await?
+    pub(crate) async fn resolve_group_image_path(&self, group: &Group) -> Result<Option<PathBuf>> {
+        if self
+            .darkmatter_group_projection(&group.mls_group_id)?
+            .is_some()
         {
-            media_file
-                .blossom_url
-                .and_then(|url_str| Url::parse(&url_str).ok())
-        } else {
-            None
-        };
+            return Ok(None);
+        }
 
-        let media_file = self
-            .download_and_cache_group_image(
-                blossom_url,
-                &group.mls_group_id,
-                image_hash,
-                image_key.as_ref(),
-                image_nonce.as_ref(),
-            )
-            .await?;
-
-        Ok(Some(media_file.file_path))
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     // ── Private helpers ───────────────────────────────────────────────
 
-    /// Downloads, decrypts, and caches a group image if not already cached.
-    #[perf_instrument("groups")]
-    async fn download_and_cache_group_image(
-        &self,
-        blossom_url: Option<Url>,
-        group_id: &GroupId,
-        image_hash: &[u8; 32],
-        image_key: &[u8; 32],
-        image_nonce: &[u8; 12],
-    ) -> Result<MediaFile> {
-        let hash_hex = hex::encode(image_hash);
-
-        if let Some(cached_path) = self.check_cached_image(&hash_hex).await? {
-            let media_file = self
-                .link_cached_image_to_group(group_id, &cached_path, image_hash, image_key)
-                .await?;
-            return Ok(media_file);
-        }
-
-        let blossom_url = blossom_url.unwrap_or_else(Self::default_blossom_url);
-
-        tracing::info!(
-            target: "whitenoise::session::groups::media",
-            "Downloading group image {} for group {} from {}",
-            hash_hex,
-            hex::encode(group_id.as_slice()),
-            blossom_url
-        );
-
-        let encrypted_data = Self::download_blob_from_blossom(&blossom_url, image_hash).await?;
-
-        let secret_key = Secret::new(*image_key);
-        let secret_nonce = Secret::new(*image_nonce);
-        let decrypted_data = Self::decrypt_group_image(
-            &encrypted_data,
-            Some(image_hash),
-            &secret_key,
-            &secret_nonce,
-        )?;
-        let image_type = ImageType::detect(&decrypted_data).map_err(|e| {
-            WhitenoiseError::UnsupportedMediaFormat(format!("Failed to detect image type: {}", e))
-        })?;
-
-        tracing::debug!(
-            target: "whitenoise::session::groups::media",
-            "Detected image type: {} for group image {}",
-            image_type.mime_type(),
-            hash_hex
-        );
-
-        let media_file = self
-            .store_and_record_group_image(
-                group_id,
-                &decrypted_data,
-                image_hash,
-                image_key,
-                &image_type,
-                &blossom_url,
-            )
-            .await?;
-
-        tracing::info!(
-            target: "whitenoise::session::groups::media",
-            "Cached group image at: {}",
-            media_file.file_path.display()
-        );
-
-        Ok(media_file)
-    }
-
-    /// Checks whether a group image is already cached on disk.
-    async fn check_cached_image(&self, hash_hex: &str) -> Result<Option<PathBuf>> {
-        let media_files = self.media_files();
-        if let Some(cached_path) = media_files.find_file_with_prefix(hash_hex).await {
-            tracing::debug!(
-                target: "whitenoise::session::groups::media",
-                "Group image already cached at: {}",
-                cached_path.display()
-            );
-            Ok(Some(cached_path))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn link_cached_image_to_group(
+    fn darkmatter_group_projection(
         &self,
         group_id: &GroupId,
-        cached_path: &Path,
-        image_hash: &[u8; 32],
-        image_key: &[u8; 32],
-    ) -> Result<MediaFile> {
-        let existing_record_opt = MediaFile::find_by_hash(
-            &self.session.account_db.inner.pool,
-            &self.session.shared.database,
-            &self.session.account_pubkey,
-            image_hash,
-        )
-        .await?;
-
-        match existing_record_opt {
-            Some(existing_record) => {
-                self.link_cached_image_from_existing_record(
-                    group_id,
-                    cached_path,
-                    image_hash,
-                    existing_record,
-                )
-                .await
-            }
-            None => {
-                self.link_cached_image_with_detection(group_id, cached_path, image_hash, image_key)
-                    .await
-            }
-        }
+    ) -> Result<Option<crate::marmot::MarmotCreatedGroupProjection>> {
+        self.session
+            .marmot_storage
+            .find_group_projection(&MarmotGroupId::new(group_id.as_slice().to_vec()))
+            .map_err(WhitenoiseError::from)
     }
 
-    async fn link_cached_image_from_existing_record(
+    async fn darkmatter_encrypted_media_exporter_secret(
         &self,
         group_id: &GroupId,
-        cached_path: &Path,
-        image_hash: &[u8; 32],
-        existing_record: crate::whitenoise::database::media_files::MediaFile,
-    ) -> Result<MediaFile> {
-        let metadata_ref = existing_record.file_metadata.as_ref();
-        let original_hash_ref = existing_record
-            .original_file_hash
-            .as_ref()
-            .and_then(|hash| hash.as_slice().try_into().ok());
-        let upload = MediaFileUpload {
-            data: &[],
-            original_file_hash: original_hash_ref.as_ref(),
-            encrypted_file_hash: *image_hash,
-            mime_type: &existing_record.mime_type,
-            media_type: &existing_record.media_type,
-            blossom_url: existing_record.blossom_url.as_deref(),
-            nostr_key: existing_record.nostr_key.clone(),
-            file_metadata: metadata_ref,
-            nonce: existing_record.nonce.as_deref().map(|s| s.to_string()),
-            scheme_version: existing_record.scheme_version.as_deref(),
-        };
-
-        self.media_files()
-            .record_in_database(&self.session.account_pubkey, group_id, cached_path, upload)
+    ) -> Result<cgka_traits::SecretBytes> {
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let marmot =
+            self.session
+                .marmot
+                .as_ref()
+                .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                    self.session.account_pubkey,
+                ))?;
+        marmot
+            .lock()
             .await
+            .encrypted_media_exporter_secret(&marmot_group_id)
     }
 
-    async fn link_cached_image_with_detection(
-        &self,
-        group_id: &GroupId,
-        cached_path: &Path,
-        image_hash: &[u8; 32],
-        image_key: &[u8; 32],
-    ) -> Result<MediaFile> {
-        tracing::debug!(
-            target: "whitenoise::session::groups::media",
-            "No existing database record for hash {}, detecting MIME type from cached file",
-            hex::encode(image_hash)
-        );
-
-        let file_data = tokio::fs::read(cached_path)
-            .await
-            .map_err(WhitenoiseError::from)?;
-
-        let image_type = ImageType::detect(&file_data).map_err(|e| {
-            WhitenoiseError::UnsupportedMediaFormat(format!(
-                "Failed to detect image type for cached file {}: {}",
-                cached_path.display(),
-                e
-            ))
-        })?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(&file_data);
-        let original_hash: [u8; 32] = hasher.finalize().into();
-
-        let secret_key = Secret::new(*image_key);
-        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2)?;
-
-        let upload = MediaFileUpload {
-            data: &[],
-            original_file_hash: Some(&original_hash),
-            encrypted_file_hash: *image_hash,
-            mime_type: image_type.mime_type(),
-            media_type: "group_image",
-            blossom_url: None,
-            nostr_key: Some(upload_keypair.secret_key().to_secret_hex()),
-            file_metadata: None,
-            nonce: None,
-            scheme_version: None,
-        };
-
-        self.media_files()
-            .record_in_database(&self.session.account_pubkey, group_id, cached_path, upload)
-            .await
-    }
-
-    async fn store_and_record_group_image(
-        &self,
-        group_id: &GroupId,
-        decrypted_data: &[u8],
-        image_hash: &[u8; 32],
-        image_key: &[u8; 32],
-        image_type: &ImageType,
-        blossom_server: &Url,
-    ) -> Result<MediaFile> {
-        let hash_hex = hex::encode(image_hash);
-        let filename = format!("{}.{}", hash_hex, image_type.extension());
-        let blossom_url = blossom_server.join(&hash_hex).map_err(BlossomError::from)?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(decrypted_data);
-        let original_hash: [u8; 32] = hasher.finalize().into();
-
-        let secret_key = Secret::new(*image_key);
-        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2)?;
-
-        let upload = MediaFileUpload {
-            data: decrypted_data,
-            original_file_hash: Some(&original_hash),
-            encrypted_file_hash: *image_hash,
-            mime_type: image_type.mime_type(),
-            media_type: "group_image",
-            blossom_url: Some(blossom_url.as_str()),
-            nostr_key: Some(upload_keypair.secret_key().to_secret_hex()),
-            file_metadata: None,
-            nonce: None,
-            scheme_version: None,
-        };
-
-        self.media_files()
-            .store_and_record(&self.session.account_pubkey, group_id, &filename, upload)
-            .await
+    fn darkmatter_media_unsupported(operation: &str) -> WhitenoiseError {
+        WhitenoiseError::UnsupportedMarmotOperation(format!(
+            "{operation} is not available for Darkmatter groups yet; {DARKMATTER_MEDIA_UNSUPPORTED}"
+        ))
     }
 
     /// Downloads, decrypts, and verifies a chat media blob.
-    ///
-    /// Uses `self.session.mdk` directly (no `config.data_dir` or keyring needed).
     async fn decrypt_downloaded_chat_media_blob(
         &self,
         group_id: &GroupId,
@@ -782,6 +506,10 @@ impl<'a> MediaOps<'a> {
             WhitenoiseError::MediaCache(format!("Invalid Blossom URL '{}': {}", blossom_url_str, e))
         })?;
 
+        if self.darkmatter_group_projection(group_id)?.is_none() {
+            return Err(WhitenoiseError::GroupNotFound);
+        }
+
         tracing::debug!(
             target: "whitenoise::session::groups::media",
             "Downloading encrypted blob from: {}",
@@ -790,8 +518,6 @@ impl<'a> MediaOps<'a> {
 
         let encrypted_data =
             Self::download_blob_from_blossom(&blossom_url, &encrypted_hash).await?;
-
-        let media_manager = self.session.mdk.media_manager(group_id.clone());
 
         let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
             WhitenoiseError::MediaCache("Missing nonce for chat media".to_string())
@@ -810,19 +536,28 @@ impl<'a> MediaOps<'a> {
             .try_into()
             .map_err(|_| WhitenoiseError::MediaCache("Invalid nonce length".to_string()))?;
 
-        let reference = MediaReference {
-            url: String::new(),
-            original_hash: *original_file_hash,
-            mime_type: media_file.mime_type.clone(),
-            filename: filename.to_string(),
-            dimensions: None,
-            duration_ms: None,
-            waveform: None,
-            scheme_version,
-            nonce,
-        };
+        let actual_encrypted_hash: [u8; 32] = Sha256::digest(&encrypted_data).into();
+        if actual_encrypted_hash != encrypted_hash {
+            return Err(WhitenoiseError::HashMismatch {
+                expected: hex::encode(encrypted_hash),
+                actual: hex::encode(actual_encrypted_hash),
+            });
+        }
 
-        let decrypted = media_manager.decrypt_from_download(&encrypted_data, &reference)?;
+        let exporter_secret = self
+            .darkmatter_encrypted_media_exporter_secret(group_id)
+            .await?;
+        let decrypted = decrypt_chat_media(
+            exporter_secret.as_ref(),
+            &encrypted_data,
+            ChatMediaReference {
+                original_hash: original_file_hash,
+                mime_type: &media_file.mime_type,
+                filename,
+                scheme_version: &scheme_version,
+                nonce,
+            },
+        )?;
 
         // MIP-04 requires an explicit SHA-256 check on the plaintext after decryption.
         // ChaCha20-Poly1305 authenticates the ciphertext, but does not guarantee the
@@ -851,21 +586,6 @@ impl<'a> MediaOps<'a> {
             "https://blossom.primal.net"
         };
         Url::parse(url).expect("Hardcoded Blossom URL should be valid")
-    }
-
-    fn decrypt_group_image(
-        encrypted_data: &[u8],
-        expected_hash: Option<&[u8; 32]>,
-        image_key: &Secret<[u8; 32]>,
-        image_nonce: &Secret<[u8; 12]>,
-    ) -> Result<Vec<u8>> {
-        group_image::decrypt_group_image(encrypted_data, expected_hash, image_key, image_nonce)
-            .map_err(|e| {
-                WhitenoiseError::ImageDecryptionFailed(format!(
-                    "Failed to decrypt group image: {}",
-                    e
-                ))
-            })
     }
 
     pub(crate) async fn download_blob_from_blossom(

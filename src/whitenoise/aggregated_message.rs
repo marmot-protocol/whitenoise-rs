@@ -1,5 +1,5 @@
+use crate::marmot::GroupId;
 use chrono::{DateTime, Utc};
-use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 
 /// A lightweight representation of a cached event from the aggregated_messages table.

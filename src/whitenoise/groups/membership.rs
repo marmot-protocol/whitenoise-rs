@@ -1,4 +1,4 @@
-use mdk_core::prelude::group_types;
+use crate::marmot::group_types;
 
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::group_information::GroupInformation;
@@ -10,7 +10,7 @@ use crate::whitenoise::group_information::GroupInformation;
 /// such as user confirmation status (pending, accepted, or declined).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GroupWithMembership {
-    /// The MLS group data from MDK
+    /// The MLS group data projected by WhiteNoise.
     pub group: group_types::Group,
     /// The account-group relationship (join table record)
     pub membership: AccountGroup,
@@ -36,7 +36,7 @@ impl GroupWithMembership {
 /// per-group queries.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GroupWithInfoAndMembership {
-    /// The MLS group data from MDK
+    /// The MLS group data projected by WhiteNoise.
     pub group: group_types::Group,
     /// Group metadata stored in the whitenoise database (type, timestamps)
     pub info: GroupInformation,

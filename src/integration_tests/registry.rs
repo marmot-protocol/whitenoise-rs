@@ -83,9 +83,6 @@ scenario_registry! {
     "advanced-messaging" => AdvancedMessagingScenario,
     "group-membership" => GroupMembershipScenario,
     "group-state-streaming" => GroupStateStreamingScenario,
-    "create-group-with-legacy-member" => CreateGroupWithLegacyMemberScenario,
-    "add-member-to-strict-group-rejected" => AddMemberToStrictGroupRejectedScenario,
-    "upgrade-required-proposals-after-legacy-self-update" => UpgradeRequiredProposalsAfterLegacySelfUpdateScenario,
     "chat-media-upload" => ChatMediaUploadScenario,
     "user-discovery" => UserDiscoveryScenario,
     "scheduler" => SchedulerScenario,
@@ -215,9 +212,11 @@ mod tests {
         assert!(parse_scenario_name("advanced-messaging").is_ok());
         assert!(parse_scenario_name("group-membership").is_ok());
         assert!(parse_scenario_name("group-state-streaming").is_ok());
-        assert!(parse_scenario_name("create-group-with-legacy-member").is_ok());
-        assert!(parse_scenario_name("add-member-to-strict-group-rejected").is_ok());
-        assert!(parse_scenario_name("upgrade-required-proposals-after-legacy-self-update").is_ok());
+        assert!(parse_scenario_name("create-group-with-legacy-member").is_err());
+        assert!(parse_scenario_name("add-member-to-strict-group-rejected").is_err());
+        assert!(
+            parse_scenario_name("upgrade-required-proposals-after-legacy-self-update").is_err()
+        );
         assert!(parse_scenario_name("chat-media-upload").is_ok());
         assert!(parse_scenario_name("user-discovery").is_ok());
         assert!(parse_scenario_name("scheduler").is_ok());
@@ -257,14 +256,12 @@ mod tests {
 
         let mut expected = vec![
             "account-management",
-            "add-member-to-strict-group-rejected",
             "advanced-messaging",
             "app-settings",
             "basic-messaging",
             "chat-list",
             "chat-list-streaming",
             "chat-media-upload",
-            "create-group-with-legacy-member",
             "drafts",
             "follow-management",
             "group-membership",
@@ -276,7 +273,6 @@ mod tests {
             "notification-streaming",
             "scheduler",
             "subscription-processing",
-            "upgrade-required-proposals-after-legacy-self-update",
             "user-discovery",
             "user-search",
         ];

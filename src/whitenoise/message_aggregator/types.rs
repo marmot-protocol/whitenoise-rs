@@ -1,6 +1,6 @@
+use crate::marmot::GroupId;
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
-use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -206,7 +206,7 @@ pub enum ProcessingError {
     #[error("Invalid timestamp")]
     InvalidTimestamp,
 
-    #[error("Failed to fetch messages from mdk: {0}")]
+    #[error("Failed to fetch messages: {0}")]
     FetchFailed(String),
 
     #[error("Internal processing error: {0}")]
@@ -240,7 +240,7 @@ mod tests {
             );
             assert_eq!(
                 ProcessingError::FetchFailed("connection timeout".to_string()).to_string(),
-                "Failed to fetch messages from mdk: connection timeout"
+                "Failed to fetch messages: connection timeout"
             );
             assert_eq!(
                 ProcessingError::Internal("unexpected state".to_string()).to_string(),

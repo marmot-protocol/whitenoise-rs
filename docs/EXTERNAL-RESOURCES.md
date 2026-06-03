@@ -32,7 +32,7 @@ This file provides a comprehensive index of external resources, specifications, 
 ### MLS on Nostr
 - **NIP-EE - MLS over Nostr**: https://github.com/nostr-protocol/nips/blob/master/EE.md (legacy specification)
 - Marmot - Official Specification: https://github.com/marmot-protocol/marmot
-- MDK (Marmot Development Kit)- https://github.com/marmot-protocol/mdk
+- Darkmatter implementation and draft spec: https://github.com/marmot-protocol/darkmatter
 
 ### Rust Nostr Implementation
 - **rust-nostr Repository**: https://github.com/rust-nostr/nostr

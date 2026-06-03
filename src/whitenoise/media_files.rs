@@ -1,16 +1,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use mdk_core::{
-    GroupId,
-    encrypted_media::{manager::EncryptedMediaManager, types::MediaReference},
-    prelude::MdkStorageProvider,
-};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 
 pub use crate::whitenoise::database::media_files::MediaFile;
 use crate::{
+    marmot::GroupId,
     perf_instrument,
     whitenoise::{
         database::{
@@ -167,18 +163,19 @@ fn format_waveform(waveform: &[u8]) -> Option<String> {
     )
 }
 
-/// Parsed media reference with additional fields not in MDK's MediaReference
-///
-/// Wraps MDK's MediaReference and adds fields we need that MDK doesn't parse.
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedMediaReference {
-    /// MDK's parsed reference (url, original_hash, mime_type, filename, dimensions, audio metadata)
-    reference: MediaReference,
-    /// Encrypted hash extracted from Blossom URL (needed for our DB schema)
+    url: String,
+    original_hash: [u8; 32],
+    mime_type: String,
+    filename: String,
+    dimensions: Option<(u32, u32)>,
+    duration_ms: Option<u64>,
+    waveform: Option<Vec<u8>>,
+    nonce: [u8; 12],
+    scheme_version: String,
     encrypted_hash: [u8; 32],
-    /// Blurhash for image preview (optional, not parsed by MDK)
     blurhash: Option<String>,
-    /// Thumbhash for image preview (optional, not parsed by MDK)
     thumbhash: Option<String>,
 }
 
@@ -186,6 +183,150 @@ pub(crate) struct ParsedMediaReference {
 struct ParsedDisplayMetadata {
     blurhash: Option<String>,
     thumbhash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ImetaFields {
+    url: Option<String>,
+    mime_type: Option<String>,
+    filename: Option<String>,
+    original_hash: Option<String>,
+    nonce: Option<String>,
+    scheme_version: Option<String>,
+    dimensions: Option<String>,
+    duration: Option<String>,
+    waveform: Option<String>,
+}
+
+impl ImetaFields {
+    fn from_tag(tag: &Tag) -> Self {
+        let mut fields = Self::default();
+
+        for value in tag.clone().to_vec().iter().skip(1) {
+            let Some((key, raw_value)) = split_imeta_field(value) else {
+                continue;
+            };
+
+            match key {
+                "url" if fields.url.is_none() => fields.url = Some(raw_value.to_string()),
+                "m" if fields.mime_type.is_none() => {
+                    fields.mime_type = Some(raw_value.to_string());
+                }
+                "filename" if fields.filename.is_none() => {
+                    fields.filename = Some(raw_value.to_string());
+                }
+                "x" if fields.original_hash.is_none() => {
+                    fields.original_hash = Some(raw_value.to_string());
+                }
+                "n" if fields.nonce.is_none() => fields.nonce = Some(raw_value.to_string()),
+                "v" if fields.scheme_version.is_none() => {
+                    fields.scheme_version = Some(raw_value.to_string());
+                }
+                "dim" if fields.dimensions.is_none() => {
+                    fields.dimensions = Some(raw_value.to_string());
+                }
+                "duration" if fields.duration.is_none() => {
+                    fields.duration = Some(raw_value.to_string());
+                }
+                "waveform" if fields.waveform.is_none() => {
+                    fields.waveform = Some(raw_value.to_string());
+                }
+                _ => {}
+            }
+        }
+
+        fields
+    }
+}
+
+fn split_imeta_field(value: &str) -> Option<(&str, &str)> {
+    let trimmed = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let separator = trimmed.find(|c: char| c.is_ascii_whitespace())?;
+    let key = &trimmed[..separator];
+    let raw_value = trimmed[separator..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+    Some((key, raw_value))
+}
+
+fn required_imeta_field(value: Option<String>, name: &str) -> Result<String> {
+    value
+        .filter(|value| {
+            !value
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .is_empty()
+        })
+        .ok_or_else(|| WhitenoiseError::InvalidInput(format!("imeta tag missing {name} field")))
+}
+
+fn canonical_media_type(value: String) -> Result<String> {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .to_ascii_lowercase();
+    if media_type.is_empty() || !media_type.contains('/') {
+        return Err(WhitenoiseError::InvalidInput(
+            "imeta media type must be a MIME type".to_string(),
+        ));
+    }
+
+    Ok(match media_type.as_str() {
+        "image/jpg" => "image/jpeg".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn parse_fixed_hex_field<const N: usize>(value: String, field_name: &str) -> Result<[u8; N]> {
+    let bytes =
+        hex::decode(value.trim_matches(|c: char| c.is_ascii_whitespace())).map_err(|error| {
+            WhitenoiseError::InvalidInput(format!("imeta {field_name} field must be hex: {error}"))
+        })?;
+    let actual_len = bytes.len();
+    bytes.try_into().map_err(|_| {
+        WhitenoiseError::InvalidInput(format!(
+            "imeta {field_name} field must be {N} bytes, got {actual_len}"
+        ))
+    })
+}
+
+fn parse_dimensions(value: String) -> Option<(u32, u32)> {
+    let (width, height) = value.split_once('x')?;
+    let width = width.parse::<u32>().ok()?;
+    let height = height.parse::<u32>().ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
+}
+
+fn parse_duration_ms(value: String) -> Option<u64> {
+    let trimmed = value.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (seconds, millis) = match trimmed.split_once('.') {
+        Some((seconds, fraction)) => {
+            if fraction.is_empty() || fraction.len() > 3 {
+                return None;
+            }
+            let mut padded = fraction.to_string();
+            while padded.len() < 3 {
+                padded.push('0');
+            }
+            (seconds, padded)
+        }
+        None => (trimmed, "000".to_string()),
+    };
+
+    let seconds = seconds.parse::<u64>().ok()?;
+    let millis = millis.parse::<u64>().ok()?;
+    seconds.checked_mul(1000)?.checked_add(millis)
+}
+
+fn parse_waveform(value: String) -> Option<Vec<u8>> {
+    let samples: Vec<u8> = value
+        .split_whitespace()
+        .map(str::parse::<u8>)
+        .collect::<std::result::Result<_, _>>()
+        .ok()?;
+    FileMetadata::is_valid_waveform(&samples).then_some(samples)
 }
 
 /// Extracts encrypted hash from Blossom URL
@@ -246,13 +387,13 @@ fn extract_hash_from_blossom_url(url: &str) -> Result<[u8; 32]> {
 
 /// Intermediate type for media file storage operations
 ///
-/// This type abstracts over different MDK upload types (GroupImageUpload, EncryptedMediaUpload)
-/// and provides a unified interface for storing media files.
+/// This type abstracts over different upload sources and provides a unified
+/// interface for storing media files.
 pub(crate) struct MediaFileUpload<'a> {
     /// The decrypted file data to store
     pub data: &'a [u8],
-    /// SHA-256 hash of the original/decrypted content (for MIP-04 x field, MDK key derivation)
-    /// None for group images (which use key/nonce encryption), Some for chat media (MDK)
+    /// SHA-256 hash of the original/decrypted content for the MIP-04 `x` field.
+    /// None for group images, Some for chat media.
     pub original_file_hash: Option<&'a [u8; 32]>,
     /// SHA-256 hash of the encrypted file (for Blossom verification)
     pub encrypted_file_hash: [u8; 32],
@@ -268,10 +409,10 @@ pub(crate) struct MediaFileUpload<'a> {
     pub nostr_key: Option<String>,
     /// Optional file metadata (original filename, dimensions, blurhash, duration, etc.)
     pub file_metadata: Option<&'a FileMetadata>,
-    /// Encryption nonce (hex-encoded, for chat_media with MDK encryption)
+    /// Encryption nonce (hex-encoded) for chat media.
     /// None for group images (which use key/nonce encryption), Some for chat media
     pub nonce: Option<String>,
-    /// Encryption scheme version (e.g., "mip04-v2", for chat_media with MDK encryption)
+    /// Encryption scheme version (e.g., "mip04-v2") for chat media.
     /// None for group images, Some for chat media
     pub scheme_version: Option<&'a str>,
 }
@@ -403,50 +544,28 @@ impl<'a> MediaFiles<'a> {
     /// # Returns
     /// The path to the first matching file, if any
     #[perf_instrument("media_files")]
+    #[cfg(test)]
     pub(crate) async fn find_file_with_prefix(&self, prefix: &str) -> Option<PathBuf> {
         self.storage.media_files.find_file_with_prefix(prefix).await
     }
 
-    /// Parses imeta tags from an event using MDK's MIP-04 compliant parser
+    /// Parses MIP-04/NIP-92 `imeta` tags from a decrypted chat event.
     ///
-    /// This is a synchronous operation that doesn't involve I/O.
-    /// Individual malformed imeta tags are logged and skipped.
-    ///
-    /// Uses MDK's `parse_imeta_tag` which validates:
-    /// - Required fields (url, m, filename, x, v)
-    /// - MIME type canonicalization
-    /// - Filename validation
-    /// - Version compatibility
-    /// - Optional audio display metadata (duration, waveform) as best-effort fields
-    ///
-    /// Additionally extracts fields that MDK doesn't parse:
-    /// - encrypted_hash (from Blossom URL)
-    /// - blurhash/thumbhash (optional fields for image previews)
-    ///
-    /// # Arguments
-    /// * `inner_event` - The decrypted inner event containing imeta tags
-    /// * `media_manager` - MDK's EncryptedMediaManager for parsing
-    ///
-    /// # Returns
-    /// Vector of ParsedMediaReference ready for storage
-    pub(crate) fn parse_imeta_tags_from_event<S>(
+    /// This is a synchronous app-level parser. Individual malformed `imeta`
+    /// tags are logged and skipped so one bad attachment does not drop the
+    /// enclosing chat message.
+    pub(crate) fn parse_imeta_tags_from_event(
         &self,
         inner_event: &UnsignedEvent,
-        media_manager: &EncryptedMediaManager<'_, S>,
-    ) -> Result<Vec<ParsedMediaReference>>
-    where
-        S: MdkStorageProvider,
-    {
+    ) -> Result<Vec<ParsedMediaReference>> {
         let mut parsed = Vec::new();
 
-        // Filter for imeta tags and parse using MDK
         for tag in inner_event.tags.iter() {
             if tag.kind() != TagKind::Custom("imeta".into()) {
                 continue;
             }
 
-            // Parse using MDK's MIP-04 compliant parser
-            let reference = match media_manager.parse_imeta_tag(tag) {
+            let reference = match Self::parse_imeta_tag(tag) {
                 Ok(ref_) => ref_,
                 Err(e) => {
                     tracing::warn!(
@@ -458,45 +577,65 @@ impl<'a> MediaFiles<'a> {
                 }
             };
 
-            // Extract encrypted_file_hash from Blossom URL (REQUIRED - NOT NULL in DB)
-            // MDK's MediaReference stores URL as-is, but we need the hash for our database schema
-            let encrypted_file_hash = match extract_hash_from_blossom_url(&reference.url) {
-                Ok(hash) => hash,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::store_media_references",
-                        "Skipping imeta tag: failed to extract encrypted hash from Blossom URL '{}': {}",
-                        reference.url,
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            // Extract optional preview hashes not exposed by MDK's MediaReference.
-            let display_metadata = Self::extract_display_metadata_from_tag(tag);
-
-            parsed.push(ParsedMediaReference {
-                reference,
-                encrypted_hash: encrypted_file_hash,
-                blurhash: display_metadata.blurhash,
-                thumbhash: display_metadata.thumbhash,
-            });
+            parsed.push(reference);
         }
 
         Ok(parsed)
     }
 
+    fn parse_imeta_tag(tag: &Tag) -> Result<ParsedMediaReference> {
+        let fields = ImetaFields::from_tag(tag);
+
+        let url = required_imeta_field(fields.url, "url")?;
+        let mime_type = canonical_media_type(required_imeta_field(fields.mime_type, "m")?)?;
+        let filename = required_imeta_field(fields.filename, "filename")?
+            .trim()
+            .to_string();
+        if filename.is_empty() {
+            return Err(WhitenoiseError::InvalidInput(
+                "imeta filename cannot be empty".to_string(),
+            ));
+        }
+
+        let original_hash =
+            parse_fixed_hex_field::<32>(required_imeta_field(fields.original_hash, "x")?, "x")?;
+        let nonce = parse_fixed_hex_field::<12>(required_imeta_field(fields.nonce, "n")?, "n")?;
+        let scheme_version = required_imeta_field(fields.scheme_version, "v")?;
+        if scheme_version != "mip04-v2" {
+            return Err(WhitenoiseError::InvalidInput(format!(
+                "unsupported imeta media scheme version: {scheme_version}"
+            )));
+        }
+
+        let encrypted_hash = extract_hash_from_blossom_url(&url)?;
+        let display_metadata = Self::extract_display_metadata_from_tag(tag);
+
+        Ok(ParsedMediaReference {
+            url,
+            original_hash,
+            mime_type,
+            filename,
+            dimensions: fields.dimensions.and_then(parse_dimensions),
+            duration_ms: fields.duration.and_then(parse_duration_ms),
+            waveform: fields.waveform.and_then(parse_waveform),
+            nonce,
+            scheme_version,
+            encrypted_hash,
+            blurhash: display_metadata.blurhash,
+            thumbhash: display_metadata.thumbhash,
+        })
+    }
+
     /// Extracts optional preview hashes from an imeta tag in a single pass.
     ///
-    /// MDK's parser handles required MIP-04 fields and audio display metadata,
-    /// but it does not expose preview hashes on `MediaReference`.
+    /// Required MIP-04 fields are parsed separately; preview hashes remain
+    /// optional display metadata.
     fn extract_display_metadata_from_tag(tag: &Tag) -> ParsedDisplayMetadata {
         let tag_vec = tag.clone().to_vec();
         let mut metadata = ParsedDisplayMetadata::default();
 
         for value in tag_vec.iter().skip(1) {
-            let Some((key, raw_value)) = value.split_once(' ') else {
+            let Some((key, raw_value)) = split_imeta_field(value) else {
                 continue;
             };
             match key {
@@ -620,25 +759,17 @@ impl<'a> MediaFiles<'a> {
         parsed_references: Vec<ParsedMediaReference>,
     ) -> Result<()> {
         for parsed in parsed_references {
-            let reference = parsed.reference;
-            let encrypted_hash = parsed.encrypted_hash;
+            let dimensions = parsed.dimensions.map(|(w, h)| format!("{}x{}", w, h));
 
-            // Convert dimensions from MDK format (width, height) to our string format
-            let dimensions = reference.dimensions.map(|(w, h)| format!("{}x{}", w, h));
-
-            // Create file metadata
-            // MIP-04 requires filename, so it's always present
             let file_metadata = Some(FileMetadata {
-                original_filename: Some(reference.filename.clone()),
+                original_filename: Some(parsed.filename.clone()),
                 dimensions,
                 blurhash: parsed.blurhash,
                 thumbhash: parsed.thumbhash,
-                duration_ms: reference.duration_ms,
-                waveform: reference.waveform.clone(),
+                duration_ms: parsed.duration_ms,
+                waveform: parsed.waveform.clone(),
             });
 
-            // Create MediaFile record (without file yet - empty path until downloaded)
-            // Store nonce and scheme_version for MDK decryption
             MediaFile::save(
                 self.account_pool,
                 self.shared_db,
@@ -646,15 +777,15 @@ impl<'a> MediaFiles<'a> {
                 account_pubkey,
                 MediaFileParams {
                     file_path: &PathBuf::from(""), // Empty until downloaded
-                    original_file_hash: Some(&reference.original_hash),
-                    encrypted_file_hash: &encrypted_hash,
-                    mime_type: &reference.mime_type,
+                    original_file_hash: Some(&parsed.original_hash),
+                    encrypted_file_hash: &parsed.encrypted_hash,
+                    mime_type: &parsed.mime_type,
                     media_type: "chat_media",
-                    blossom_url: Some(&reference.url),
-                    nostr_key: None, // Chat media uses MDK, not key/nonce
+                    blossom_url: Some(&parsed.url),
+                    nostr_key: None,
                     file_metadata: file_metadata.as_ref(),
-                    nonce: Some(&hex::encode(reference.nonce)),
-                    scheme_version: Some(&reference.scheme_version),
+                    nonce: Some(&hex::encode(parsed.nonce)),
+                    scheme_version: Some(&parsed.scheme_version),
                 },
             )
             .await?;
@@ -663,9 +794,9 @@ impl<'a> MediaFiles<'a> {
                 target: "whitenoise::store_media_references",
                 "Stored media reference for account {}: original_hash={}, encrypted_hash={}, mime_type={}",
                 account_pubkey.to_hex(),
-                hex::encode(reference.original_hash),
-                hex::encode(encrypted_hash),
-                reference.mime_type
+                hex::encode(parsed.original_hash),
+                hex::encode(parsed.encrypted_hash),
+                parsed.mime_type
             );
         }
 
@@ -1015,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_and_store_imeta_persists_mdk_audio_metadata() {
+    async fn test_parse_and_store_imeta_persists_audio_metadata_without_obsolete_mls_storage() {
         let t = setup().await;
         let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
         let group_id = GroupId::from_slice(&[7u8; 8]);
@@ -1029,18 +1160,11 @@ mod tests {
             ["duration 12.345", "waveform 0 8 42 100"],
         );
         let event = event_with_tag(t.pubkey, tag);
-        let mdk = crate::whitenoise::accounts::test_utils::create_mdk(t.pubkey);
-        let media_manager = mdk.media_manager(group_id.clone());
-        let parsed_references = media_files
-            .parse_imeta_tags_from_event(&event, &media_manager)
-            .unwrap();
+        let parsed_references = media_files.parse_imeta_tags_from_event(&event).unwrap();
 
         assert_eq!(parsed_references.len(), 1);
-        assert_eq!(parsed_references[0].reference.duration_ms, Some(12_345));
-        assert_eq!(
-            parsed_references[0].reference.waveform,
-            Some(vec![0, 8, 42, 100])
-        );
+        assert_eq!(parsed_references[0].duration_ms, Some(12_345));
+        assert_eq!(parsed_references[0].waveform, Some(vec![0, 8, 42, 100]));
 
         media_files
             .store_parsed_media_references(&group_id, &t.pubkey, parsed_references)
@@ -1080,16 +1204,12 @@ mod tests {
             ["duration not-a-number", "waveform 0 101", "thumbhash thumb"],
         );
         let event = event_with_tag(t.pubkey, tag);
-        let mdk = crate::whitenoise::accounts::test_utils::create_mdk(t.pubkey);
-        let media_manager = mdk.media_manager(group_id.clone());
-        let parsed_references = media_files
-            .parse_imeta_tags_from_event(&event, &media_manager)
-            .unwrap();
+        let parsed_references = media_files.parse_imeta_tags_from_event(&event).unwrap();
 
         assert_eq!(parsed_references.len(), 1);
         assert_eq!(parsed_references[0].thumbhash, Some("thumb".to_string()));
-        assert!(parsed_references[0].reference.duration_ms.is_none());
-        assert!(parsed_references[0].reference.waveform.is_none());
+        assert!(parsed_references[0].duration_ms.is_none());
+        assert!(parsed_references[0].waveform.is_none());
 
         media_files
             .store_parsed_media_references(&group_id, &t.pubkey, parsed_references)
@@ -1151,11 +1271,34 @@ mod tests {
         assert!(tag_values.contains(&"waveform 0 8 42 100".to_string()));
         assert!(tag_values.contains(&"v mip04-v2".to_string()));
 
-        let mdk = crate::whitenoise::accounts::test_utils::create_mdk(media_file.account_pubkey);
-        let media_manager = mdk.media_manager(media_file.mls_group_id.clone());
-        let parsed = media_manager.parse_imeta_tag(&tag).unwrap();
+        let parsed = MediaFiles::parse_imeta_tag(&tag).unwrap();
         assert_eq!(parsed.duration_ms, Some(12_345));
         assert_eq!(parsed.waveform, Some(vec![0, 8, 42, 100]));
+    }
+
+    #[test]
+    fn test_parse_imeta_canonicalizes_mime_type_without_obsolete_mls_storage() {
+        let original_hash = [9u8; 32];
+        let encrypted_hash = [10u8; 32];
+        let nonce = [11u8; 12];
+        let tag = Tag::custom(
+            TagKind::Custom("imeta".into()),
+            [
+                format!(
+                    "url https://blossom.example.com/{}",
+                    hex::encode(encrypted_hash)
+                ),
+                "m Image/JPG ; charset=utf-8".to_string(),
+                "filename photo.jpg".to_string(),
+                format!("x {}", hex::encode(original_hash)),
+                format!("n {}", hex::encode(nonce)),
+                "v mip04-v2".to_string(),
+            ],
+        );
+
+        let parsed = MediaFiles::parse_imeta_tag(&tag).unwrap();
+
+        assert_eq!(parsed.mime_type, "image/jpeg");
     }
 
     #[test]

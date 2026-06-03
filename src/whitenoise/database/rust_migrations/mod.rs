@@ -51,6 +51,10 @@ mod m0043_drop_shared_mute_list;
 mod m0044_reparse_content_tokens;
 mod m0045_product_analytics_settings;
 mod m0046_account_maintenance_tasks;
+mod m0047_darkmatter_key_package_metadata;
+mod m0048_darkmatter_key_package_content_cache;
+mod m0049_marmot_message_projections;
+mod m0050_group_push_token_metadata;
 
 /// All global migrations, in version order. Lifted from individual modules
 /// so the test suite can build a globals-only `Migrator` for narrow tests.
@@ -109,6 +113,10 @@ pub fn all_local_migrations() -> Vec<Box<dyn LocalMigration>> {
         Box::new(m0042_move_mute_list::Migration),
         Box::new(m0044_reparse_content_tokens::Migration),
         Box::new(m0046_account_maintenance_tasks::Migration),
+        Box::new(m0047_darkmatter_key_package_metadata::Migration),
+        Box::new(m0048_darkmatter_key_package_content_cache::Migration),
+        Box::new(m0049_marmot_message_projections::Migration),
+        Box::new(m0050_group_push_token_metadata::Migration),
     ]
 }
 

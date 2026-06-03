@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
+use crate::marmot::GroupId;
 use chrono::Utc;
-use mdk_core::prelude::GroupId;
 
 use super::{Database, utils::parse_timestamp};
 use crate::perf_instrument;
@@ -207,8 +207,8 @@ impl GroupInformation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::marmot::GroupId;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
-    use mdk_core::prelude::GroupId;
 
     #[tokio::test]
     async fn test_find_by_mls_group_id_not_found() {

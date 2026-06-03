@@ -9,8 +9,10 @@ use futures::stream::{self, StreamExt};
 use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
+use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::scheduled_tasks::Task;
+use crate::whitenoise::session::AccountSession;
 
 /// Quiet period before cleaning up consumed key package local key material.
 /// After this many seconds with no new welcomes for an account, it's safe
@@ -150,7 +152,6 @@ async fn cleanup_consumed_key_packages(
         account.pubkey.to_hex()
     );
 
-    let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
     let mut cleaned_hash_refs = HashSet::new();
     let mut cleaned = 0usize;
 
@@ -159,20 +160,8 @@ async fn cleanup_consumed_key_packages(
             continue;
         }
 
-        match mdk.delete_key_package_from_storage_by_hash_ref(&consumed.key_package_hash_ref) {
+        match cleanup_consumed_key_package_material(&session, consumed).await {
             Ok(()) => {
-                if let Err(e) = session
-                    .repos
-                    .published_key_packages
-                    .mark_key_material_deleted_by_hash_ref(&consumed.key_package_hash_ref)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::scheduler::consumed_key_package_cleanup",
-                        "Deleted key material but failed to mark hash_ref group: {}",
-                        e
-                    );
-                }
                 cleaned += 1;
             }
             Err(e) => {
@@ -189,9 +178,31 @@ async fn cleanup_consumed_key_packages(
     Ok(cleaned)
 }
 
+async fn cleanup_consumed_key_package_material(
+    session: &std::sync::Arc<AccountSession>,
+    consumed: &PublishedKeyPackage,
+) -> Result<(), WhitenoiseError> {
+    session
+        .key_packages()
+        .delete_tracked_key_material(consumed)
+        .await?;
+    session
+        .repos
+        .published_key_packages
+        .mark_key_material_deleted_by_hash_ref(&consumed.key_package_hash_ref)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use nostr_sdk::{EventBuilder, Keys, RelayUrl};
+
     use super::*;
+    use crate::marmot::key_packages::key_package_from_base64_content;
+    use crate::whitenoise::database::published_key_packages::PublishedKeyPackageProtocolData;
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
+    use crate::whitenoise::session::test_helpers::test_session_with_marmot_keys;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
 
     #[test]
@@ -241,5 +252,70 @@ mod tests {
     fn test_constants() {
         assert_eq!(CONSUMED_KP_QUIET_PERIOD_SECS, 30);
         assert_eq!(MAX_CONCURRENT_ACCOUNTS, 5);
+    }
+
+    #[tokio::test]
+    async fn cleanup_consumed_key_package_material_handles_darkmatter_v2_records() {
+        let keys = Keys::generate();
+        let session = test_session_with_marmot_keys(keys.clone()).await;
+        let relay_url = RelayUrl::parse("wss://kp.example").unwrap();
+        let key_package_data = {
+            let mut marmot = session.marmot.as_ref().unwrap().lock().await;
+            marmot
+                .fresh_key_package_event("cleanup-slot".to_string(), &[relay_url])
+                .await
+                .unwrap()
+        };
+        let key_package = key_package_from_base64_content(&key_package_data.content).unwrap();
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &key_package_data.content)
+            .tags(key_package_data.tags.clone())
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        session
+            .repos
+            .published_key_packages
+            .create_with_protocol_data(
+                &key_package_data.key_package_ref,
+                &event.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(&key_package_data.d_tag),
+                PublishedKeyPackageProtocolData::darkmatter_v2_last_resort(
+                    key_package_data.key_package_ref.clone(),
+                    key_package_data.content.clone(),
+                    key_package_data.app_components.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        {
+            let marmot = session.marmot.as_ref().unwrap().lock().await;
+            assert!(marmot.has_key_package_material(&key_package).unwrap());
+        }
+        let record = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&event.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+
+        cleanup_consumed_key_package_material(&session, &record)
+            .await
+            .unwrap();
+
+        {
+            let marmot = session.marmot.as_ref().unwrap().lock().await;
+            assert!(!marmot.has_key_package_material(&key_package).unwrap());
+        }
+        let record = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&event.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.key_material_deleted);
     }
 }

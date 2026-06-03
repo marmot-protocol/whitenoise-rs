@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::marmot::GroupId;
 use chrono::{DateTime, Utc};
-use mdk_core::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
@@ -104,7 +104,7 @@ impl FileMetadata {
 #[derive(Debug, Clone)]
 pub struct MediaFileParams<'a> {
     pub file_path: &'a Path,
-    pub original_file_hash: Option<&'a [u8; 32]>, // SHA-256 of decrypted content (for chat_media with MDK)
+    pub original_file_hash: Option<&'a [u8; 32]>, // SHA-256 of decrypted chat_media content
     pub encrypted_file_hash: &'a [u8; 32],        // SHA-256 of encrypted blob (for Blossom)
     pub mime_type: &'a str,
     pub media_type: &'a str,
@@ -122,7 +122,7 @@ pub struct MediaFile {
     pub mls_group_id: GroupId,
     pub account_pubkey: PublicKey,
     pub file_path: PathBuf,
-    pub original_file_hash: Option<Vec<u8>>, // SHA-256 of decrypted content (MIP-04 x field, MDK key derivation)
+    pub original_file_hash: Option<Vec<u8>>, // SHA-256 of decrypted content (MIP-04 x field)
     pub encrypted_file_hash: Vec<u8>,        // SHA-256 of encrypted blob (Blossom verification)
     pub mime_type: String,
     pub media_type: String,
@@ -744,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_media_file() {
         let t = setup_test_dbs().await;
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let encrypted_file_hash = [3u8; 32];
         let file_path = t._dir.path().join("test.jpg");
 
@@ -783,7 +783,7 @@ mod tests {
     async fn test_upsert_on_conflict() {
         let t = setup_test_dbs().await;
 
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let encrypted_file_hash = [3u8; 32];
         let file_path = t._dir.path().join("test.jpg");
 
@@ -854,8 +854,8 @@ mod tests {
         let pool2 = add_account(&t.shared, &t._dir, &pubkey2).await;
 
         // Test with two accounts having the same encrypted hash in different groups
-        let group_id1 = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let group_id2 = mdk_core::GroupId::from_slice(&[2u8; 8]);
+        let group_id1 = GroupId::from_slice(&[1u8; 8]);
+        let group_id2 = GroupId::from_slice(&[2u8; 8]);
         let encrypted_file_hash = [42u8; 32];
         let file_path1 = t._dir.path().join("test1.jpg");
         let file_path2 = t._dir.path().join("test2.jpg");
@@ -973,7 +973,7 @@ mod tests {
     async fn test_find_by_group_empty_result() {
         let t = setup_test_dbs().await;
 
-        let nonexistent_group_id = mdk_core::GroupId::from_slice(&[99u8; 8]);
+        let nonexistent_group_id = GroupId::from_slice(&[99u8; 8]);
 
         // Try to find media for a group that doesn't exist
         let media_files = MediaFile::find_by_group(
@@ -994,8 +994,8 @@ mod tests {
         let pubkey2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
         let pool2 = add_account(&t.shared, &t._dir, &pubkey2).await;
 
-        let group_id1 = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let group_id2 = mdk_core::GroupId::from_slice(&[2u8; 8]);
+        let group_id1 = GroupId::from_slice(&[1u8; 8]);
+        let group_id2 = GroupId::from_slice(&[2u8; 8]);
 
         // Create metadata for one file
         let metadata = FileMetadata::new()
@@ -1147,7 +1147,7 @@ mod tests {
 
     #[test]
     fn test_is_image() {
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
         let encrypted_file_hash = vec![3u8; 32];
 
@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_is_video() {
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
         let encrypted_file_hash = vec![3u8; 32];
 
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn test_is_audio() {
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
         let encrypted_file_hash = vec![3u8; 32];
 
@@ -1319,7 +1319,7 @@ mod tests {
 
     #[test]
     fn test_is_document() {
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
         let encrypted_file_hash = vec![3u8; 32];
 
@@ -1371,7 +1371,7 @@ mod tests {
 
     #[test]
     fn test_media_type_edge_cases() {
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
         let encrypted_file_hash = vec![3u8; 32];
 
@@ -1424,7 +1424,7 @@ mod tests {
     async fn test_update_file_path() {
         let t = setup_test_dbs().await;
 
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let original_hash = [11u8; 32];
         let encrypted_hash = [111u8; 32];
         let initial_path = t._dir.path().join("initial.jpg");
@@ -1545,8 +1545,8 @@ mod tests {
     async fn test_find_by_original_hash_and_group() {
         let t = setup_test_dbs().await;
 
-        let group_id1 = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let group_id2 = mdk_core::GroupId::from_slice(&[2u8; 8]);
+        let group_id1 = GroupId::from_slice(&[1u8; 8]);
+        let group_id2 = GroupId::from_slice(&[2u8; 8]);
         let original_hash1 = [11u8; 32];
         let original_hash2 = [12u8; 32];
         let encrypted_hash1 = [111u8; 32];
@@ -1726,7 +1726,7 @@ mod tests {
         let account2_pubkey = PublicKey::from_slice(&[20u8; 32]).unwrap();
         let pool2 = add_account(&t.shared, &t._dir, &account2_pubkey).await;
 
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let original_hash = [11u8; 32]; // Same media file
         let encrypted_hash = [111u8; 32]; // Same encrypted hash
         let file_path1 = t._dir.path().join("account1_media.jpg");
@@ -1844,7 +1844,7 @@ mod tests {
     async fn test_file_metadata_with_thumbhash() {
         let t = setup_test_dbs().await;
 
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let encrypted_hash = [42u8; 32];
         let file_path = t._dir.path().join("test.jpg");
 
@@ -1945,7 +1945,7 @@ mod tests {
         let account2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
         let pool2 = add_account(&t.shared, &t._dir, &account2).await;
 
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let encrypted_hash = [42u8; 32];
         let file_path = t._dir.path().join("shared.jpg");
 
@@ -2023,7 +2023,7 @@ mod tests {
     async fn test_file_metadata_without_thumbhash_backwards_compat() {
         let t = setup_test_dbs().await;
 
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let group_id = GroupId::from_slice(&[1u8; 8]);
         let encrypted_hash = [42u8; 32];
         let file_path = t._dir.path().join("test.jpg");
 
@@ -2086,7 +2086,7 @@ mod tests {
     async fn test_file_metadata_blob_column_roundtrip() {
         let t = setup_test_dbs().await;
 
-        let group_id = mdk_core::GroupId::from_slice(&[7u8; 8]);
+        let group_id = GroupId::from_slice(&[7u8; 8]);
         let encrypted_hash = [77u8; 32];
         let file_path = t._dir.path().join("blob_roundtrip.jpg");
 

@@ -6,26 +6,41 @@ pub use self::media::MediaOps;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
 
-use futures::future::{join_all, try_join_all};
-use mdk_core::prelude::*;
+use ::rand::RngCore;
+use cgka_traits::TransportEndpoint;
+use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    encode_component_vectors, encode_nostr_routing_v1, encode_quic_varint,
+};
+use cgka_traits::engine::CreateGroupRequest;
+use cgka_traits::engine::KeyPackage;
+use cgka_traits::types::{GroupId as MarmotGroupId, MemberId};
+use chrono::Utc;
+use futures::future::try_join_all;
 use nostr_sdk::prelude::*;
 
 use super::AccountSession;
+use crate::marmot::key_packages::key_package_from_v2_event;
+use crate::marmot::publish::{
+    MarmotMessagePublisher, MarmotPendingResolution, MarmotPublishedEffects, publish_effects,
+};
+use crate::marmot::session::MarmotSessionEffects;
+use crate::marmot::transport::{
+    MarmotGroupPublishRoute, MarmotPublishRoutes, MarmotRelayControlPublisher,
+};
+use crate::marmot::{
+    GroupConfig, GroupDataUpdate, GroupId, MarmotCreatedGroupProjection, group_types,
+};
+use crate::relay_control::ephemeral::KeyPackageLookup;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::group_information::{GroupInformation, GroupType};
-use crate::whitenoise::groups::{
-    GroupWithInfoAndMembership, GroupWithMembership, KeyPackageCapabilities, RequiredProposal,
-    find_member_missing_required_proposal,
-};
-use crate::whitenoise::key_packages::{
-    marmot_key_package_capabilities, validate_fetched_member_key_package,
-};
-use crate::whitenoise::relays::{Relay, RelayType};
-use crate::whitenoise::shared::SharedServices;
+use crate::whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership};
+use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
 
 /// View over [`AccountSession`] for group operations.
@@ -33,6 +48,20 @@ use crate::whitenoise::users::User;
 /// Obtain via [`AccountSession::groups`].
 pub struct GroupOps<'a> {
     session: &'a AccountSession,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "phase 7"))]
+pub(crate) struct MarmotResolvedMemberKeyPackage {
+    pub(crate) user: User,
+    pub(crate) event: Event,
+    pub(crate) key_package: KeyPackage,
+}
+
+pub(crate) struct MarmotGroupCreationPlan {
+    pub(crate) request: CreateGroupRequest,
+    pub(crate) routing: NostrRoutingV1,
+    pub(crate) member_pubkeys: Vec<PublicKey>,
+    pub(crate) resolved_members: Vec<MarmotResolvedMemberKeyPackage>,
 }
 
 impl<'a> GroupOps<'a> {
@@ -47,14 +76,8 @@ impl<'a> GroupOps<'a> {
     /// When `active_filter` is `true`, only groups in `Active` state are
     /// returned. When `false`, all groups (including inactive) are included.
     pub fn all(&self, active_filter: bool) -> Result<Vec<group_types::Group>> {
-        let groups: Vec<group_types::Group> = self
-            .session
-            .mdk
-            .get_groups()
-            .map_err(WhitenoiseError::from)?
-            .into_iter()
-            .filter(|group| !active_filter || group.state == group_types::GroupState::Active)
-            .collect();
+        let mut groups = self.marmot_groups()?;
+        groups.retain(|group| !active_filter || group.state == group_types::GroupState::Active);
 
         Ok(groups)
     }
@@ -69,9 +92,8 @@ impl<'a> GroupOps<'a> {
     ///   kicked by admin; stays visible until archived
     /// - **Declined** (`user_confirmation = false`) — hidden, never shown
     ///
-    /// All MDK groups (including inactive) are fetched so that removed groups,
-    /// which MDK marks as `Inactive`, are still paired with their
-    /// `AccountGroup` records.
+    /// All projected groups are read so removed groups can stay paired with
+    /// their `AccountGroup` records.
     pub async fn visible(&self) -> Result<Vec<GroupWithMembership>> {
         let all_groups = self.all(false)?;
 
@@ -102,7 +124,9 @@ impl<'a> GroupOps<'a> {
     /// Return visible groups paired with their [`GroupInformation`].
     ///
     /// Eliminates the N+1 pattern of calling [`Self::visible`] then fetching
-    /// info individually. Groups with no `group_information` row are excluded.
+    /// info individually. Missing `group_information` rows are repaired from
+    /// confirmed Marmot group projections when possible; groups with no
+    /// available information are excluded.
     pub async fn visible_with_info(&self) -> Result<Vec<GroupWithInfoAndMembership>> {
         let visible = self.visible().await?;
 
@@ -114,9 +138,12 @@ impl<'a> GroupOps<'a> {
             .iter()
             .map(|gwm| gwm.group.mls_group_id.clone())
             .collect();
-        let info_list =
-            GroupInformation::find_by_mls_group_ids(&group_ids, &self.session.shared.database)
-                .await?;
+        let info_list = GroupInformation::get_by_mls_group_ids_with_marmot_storage(
+            &group_ids,
+            &self.session.marmot_storage,
+            &self.session.shared.database,
+        )
+        .await?;
         let info_by_id: HashMap<_, _> = info_list
             .into_iter()
             .map(|gi| (gi.mls_group_id.clone(), gi))
@@ -139,35 +166,98 @@ impl<'a> GroupOps<'a> {
 
     /// Retrieve a single group by its MLS group ID.
     pub fn get(&self, group_id: &GroupId) -> Result<group_types::Group> {
-        self.session
-            .mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)
+        if let Some(group) = self.marmot_group(group_id)? {
+            return Ok(group);
+        }
+
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Return the members of a group.
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
-        Ok(self
-            .session
-            .mdk
-            .get_members(group_id)
-            .map_err(WhitenoiseError::from)?
-            .into_iter()
-            .collect())
+        if let Some(projection) = self.marmot_group_projection(group_id)? {
+            return Ok(projection.member_pubkeys.into_iter().collect());
+        }
+
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Return the relay URLs for a group.
     pub fn relays(&self, group_id: &GroupId) -> Result<BTreeSet<RelayUrl>> {
-        self.session
-            .mdk
-            .get_relays(group_id)
-            .map_err(WhitenoiseError::from)
+        if let Some(projection) = self.marmot_group_projection(group_id)? {
+            return Self::marmot_projection_relays(projection);
+        }
+
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Return the admin public keys for a group.
     pub fn admins(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
         Ok(self.get(group_id)?.admin_pubkeys.into_iter().collect())
+    }
+
+    fn marmot_groups(&self) -> Result<Vec<group_types::Group>> {
+        self.session
+            .marmot_storage
+            .list_group_projections()?
+            .into_iter()
+            .map(Self::marmot_projection_to_group)
+            .collect()
+    }
+
+    fn marmot_group(&self, group_id: &GroupId) -> Result<Option<group_types::Group>> {
+        self.marmot_group_projection(group_id)?
+            .map(Self::marmot_projection_to_group)
+            .transpose()
+    }
+
+    fn marmot_group_projection(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<MarmotCreatedGroupProjection>> {
+        self.session
+            .marmot_storage
+            .find_group_projection(&cgka_traits::types::GroupId::new(
+                group_id.as_slice().to_vec(),
+            ))
+            .map_err(WhitenoiseError::from)
+    }
+
+    fn marmot_projection_to_group(
+        projection: MarmotCreatedGroupProjection,
+    ) -> Result<group_types::Group> {
+        Ok(group_types::Group {
+            mls_group_id: GroupId::from_slice(projection.group_id.as_slice()),
+            nostr_group_id: projection.routing.nostr_group_id,
+            name: projection.name,
+            description: projection.description,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            admin_pubkeys: projection.admin_pubkeys,
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: projection.epoch,
+            state: group_types::GroupState::Active,
+            // Public read shape retained for callers that still display the
+            // upgrade state; confirmed Darkmatter groups project as completed.
+            self_update_state: group_types::SelfUpdateState::CompletedAt(Timestamp::from_secs(
+                projection.self_update_completed_at_secs,
+            )),
+            disappearing_message_secs: projection.disappearing_message_secs,
+        })
+    }
+
+    fn marmot_projection_relays(
+        projection: MarmotCreatedGroupProjection,
+    ) -> Result<BTreeSet<RelayUrl>> {
+        projection
+            .routing
+            .relays
+            .into_iter()
+            .map(|relay| RelayUrl::parse(&relay).map_err(WhitenoiseError::from))
+            .collect()
     }
 
     // ── Mutation helpers ──────────────────────────────────────────────
@@ -181,238 +271,22 @@ impl<'a> GroupOps<'a> {
         Ok(())
     }
 
-    /// Return the relay URLs configured for the group, or error if none.
-    pub(crate) fn ensure_relays(&self, group_id: &GroupId) -> Result<Vec<RelayUrl>> {
-        let relays = self
-            .session
-            .mdk
-            .get_relays(group_id)
-            .map_err(WhitenoiseError::from)?;
-        if relays.is_empty() {
-            return Err(WhitenoiseError::GroupMissingRelays);
-        }
-        Ok(relays.into_iter().collect())
-    }
-
-    /// Publish an evolution event and merge the pending commit on success.
-    ///
-    /// Per MIP-03 this is the canonical ordering for MLS state evolution:
-    /// 1. Caller creates the pending commit via an MDK operation
-    /// 2. This method publishes the evolution event (with retry)
-    /// 3. Only after at least one relay accepts, the pending commit is merged
-    ///
-    /// If all publish attempts fail, the pending commit is cleared via
-    /// `clear_pending_commit`, rolling back the MLS group to its pre-commit
-    /// state.
-    pub(crate) async fn publish_and_merge_commit(
-        &self,
-        evolution_event: Event,
-        group_id: &GroupId,
-        relay_urls: &[RelayUrl],
-    ) -> Result<()> {
-        if let Err(publish_err) = self
-            .session
-            .shared
-            .relay_control
-            .publish_event_to(evolution_event, &self.session.account_pubkey, relay_urls)
-            .await
-        {
-            if let Err(clear_err) = self.session.mdk.clear_pending_commit(group_id) {
-                tracing::warn!(
-                    target: "whitenoise::session::groups",
-                    "Failed to clear pending commit after publish failure for group {}: {}",
-                    hex::encode(group_id.as_slice()),
-                    clear_err,
-                );
-            }
-            return Err(publish_err.into());
-        }
-        self.session.mdk.merge_pending_commit(group_id)?;
-        Ok(())
-    }
-
     // ── Mutation operations ───────────────────────────────────────────
 
     /// Adds new members to an existing MLS group.
     ///
-    /// Performs the complete workflow: fetch key packages, add members via MDK,
-    /// publish evolution event, merge commit, and send welcome messages.
+    /// Performs the complete workflow: fetch v2 key packages, add members via
+    /// Darkmatter, publish evolution effects, and send welcome messages.
     pub async fn add_members(
         &self,
         group_id: &GroupId,
         member_pubkeys: Vec<PublicKey>,
     ) -> Result<()> {
-        self.ensure_admin(group_id)?;
-
-        let shared = &self.session.shared;
-        let signer = self
-            .session
-            .get_signer()
-            .ok_or(WhitenoiseError::SignerUnavailable(
-                self.session.account_pubkey,
-            ))?;
-        let database = &shared.database;
-        let account = Account::find_by_pubkey(&self.session.account_pubkey, database).await?;
-
-        let mut key_package_events: Vec<Event> = Vec::new();
-        let mut users = Vec::new();
-        let mut member_caps: Vec<(PublicKey, KeyPackageCapabilities)> = Vec::new();
-
-        for pk in member_pubkeys.iter() {
-            let (user, newly_created) = User::find_or_create_by_pubkey(pk, database).await?;
-
-            if newly_created && let Err(e) = user.update_relay_lists(shared).await {
-                tracing::warn!(
-                    target: "whitenoise::session::groups",
-                    "Failed to update relay lists for new user {}: {}",
-                    user.pubkey,
-                    e
-                );
-            }
-
-            let mut relays_to_use = user.relays(RelayType::KeyPackage, database).await?;
-            if relays_to_use.is_empty() {
-                tracing::warn!(
-                    target: "whitenoise::session::groups",
-                    "User {} has no relays configured, using account's default relays",
-                    user.pubkey
-                );
-                relays_to_use = account.nip65_relays(shared).await?;
-            }
-            let relays_to_use_urls = Relay::urls(&relays_to_use);
-            let some_event = self
-                .session
-                .shared
-                .relay_control
-                .fetch_user_key_package(*pk, &relays_to_use_urls)
-                .await?;
-            let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-                mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-            ))?;
-
-            validate_fetched_member_key_package(&event, pk)?;
-
-            let caps = marmot_key_package_capabilities(&event);
-            key_package_events.push(event);
-            users.push(user);
-            member_caps.push((*pk, caps));
+        if self.marmot_group_projection(group_id)?.is_some() {
+            return self.add_marmot_members(group_id, member_pubkeys).await;
         }
 
-        // Pre-validate each invitee's advertised proposals against the group's
-        // `RequiredCapabilities` BEFORE invoking MDK so we can attribute the
-        // rejection to the offending member. MDK's typed error
-        // (`InviteeMissingRequiredProposal`) is a unit variant carrying no
-        // attribution; we keep it as defense-in-depth via
-        // `map_mdk_add_members_error`.
-        //
-        // Only pre-check proposals we model explicitly. `RequiredProposal::Unknown`
-        // collapses distinct unmodelled MLS proposal codepoints, so set-difference
-        // on it would yield false negatives. MDK's leaf-node validation is
-        // authoritative for those cases.
-        let required = self
-            .session
-            .mdk
-            .group_required_proposals(group_id)
-            .map_err(|e| match e {
-                mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
-                other => WhitenoiseError::from(other),
-            })?
-            .into_iter()
-            .map(RequiredProposal::from)
-            .collect::<BTreeSet<_>>();
-        let modeled_required: BTreeSet<RequiredProposal> = required
-            .iter()
-            .copied()
-            .filter(|p| !matches!(p, RequiredProposal::Unknown))
-            .collect();
-        if !modeled_required.is_empty()
-            && let Some((member_pubkey, missing)) =
-                find_member_missing_required_proposal(&member_caps, &modeled_required)
-        {
-            return Err(match missing {
-                RequiredProposal::SelfRemove => {
-                    WhitenoiseError::KeyPackageMissingSelfRemove { member_pubkey }
-                }
-                other => WhitenoiseError::GroupRejectedMember {
-                    member_pubkey: Some(member_pubkey),
-                    reason: format!("does not advertise {other:?}"),
-                },
-            });
-        }
-
-        let relay_urls = self.ensure_relays(group_id)?;
-
-        let update_result = self
-            .session
-            .mdk
-            .add_members(group_id, &key_package_events)
-            .map_err(map_mdk_add_members_error)?;
-
-        let evolution_event = update_result.evolution_event;
-        let welcome_rumors = match update_result.welcome_rumors {
-            None => {
-                return Err(WhitenoiseError::MdkCoreError(mdk_core::Error::Group(
-                    "Missing welcome message".to_owned(),
-                )));
-            }
-            Some(wr) => wr,
-        };
-
-        if welcome_rumors.len() != users.len() {
-            return Err(WhitenoiseError::Internal(
-                "Welcome rumours are missing for some of the members".to_string(),
-            ));
-        }
-
-        self.publish_and_merge_commit(evolution_event, group_id, &relay_urls)
-            .await?;
-
-        for (welcome_rumor, user) in welcome_rumors.iter().zip(users) {
-            let key_package_event_id =
-                welcome_rumor
-                    .tags
-                    .event_ids()
-                    .next()
-                    .ok_or(WhitenoiseError::Internal(
-                        "No event ID found in welcome rumor".to_string(),
-                    ))?;
-
-            let member_pubkey = key_package_events
-                .iter()
-                .find(|event| event.id == *key_package_event_id)
-                .map(|event| event.pubkey)
-                .ok_or(WhitenoiseError::Internal(
-                    "No public key found in key package event".to_string(),
-                ))?;
-
-            let one_month_future = Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
-
-            let relays_to_use = shared
-                .resolve_member_delivery_relays(
-                    &user,
-                    &account,
-                    "whitenoise::session::groups::add_members",
-                )
-                .await?;
-
-            let relay_urls = Relay::urls(&relays_to_use);
-
-            self.session
-                .shared
-                .relay_control
-                .publish_welcome(
-                    &member_pubkey,
-                    welcome_rumor.clone(),
-                    &[Tag::expiration(one_month_future)],
-                    account.pubkey,
-                    &relay_urls,
-                    signer.clone(),
-                )
-                .await
-                .map_err(WhitenoiseError::from)?;
-        }
-
-        Ok(())
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Removes members from an existing MLS group.
@@ -420,13 +294,11 @@ impl<'a> GroupOps<'a> {
     /// Creates an MLS remove-members proposal, publishes the evolution event,
     /// and merges the pending commit on success.
     pub async fn remove_members(&self, group_id: &GroupId, members: Vec<PublicKey>) -> Result<()> {
-        self.ensure_admin(group_id)?;
+        if self.marmot_group_projection(group_id)?.is_some() {
+            return self.remove_marmot_members(group_id, members).await;
+        }
 
-        let relay_urls = self.ensure_relays(group_id)?;
-        let update_result = self.session.mdk.remove_members(group_id, &members)?;
-
-        self.publish_and_merge_commit(update_result.evolution_event, group_id, &relay_urls)
-            .await
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Updates group metadata and publishes the change to group relays.
@@ -436,26 +308,15 @@ impl<'a> GroupOps<'a> {
     pub async fn update_group_data(
         &self,
         group_id: &GroupId,
-        group_data: NostrGroupDataUpdate,
+        group_data: GroupDataUpdate,
     ) -> Result<()> {
-        self.ensure_admin(group_id)?;
+        if let Some(projection) = self.marmot_group_projection(group_id)? {
+            return self
+                .update_marmot_group_data(group_id, group_data, projection)
+                .await;
+        }
 
-        let relay_urls = self.ensure_relays(group_id)?;
-        let update_result = self.session.mdk.update_group_data(group_id, group_data)?;
-
-        self.publish_and_merge_commit(update_result.evolution_event, group_id, &relay_urls)
-            .await?;
-
-        let account =
-            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
-                .await?;
-        // background_refresh_account_group_subscriptions still genuinely needs
-        // Whitenoise (account_manager + tokio::spawn). Inline upgrade keeps the
-        // back-ref scoped to a single call rather than a function-wide binding.
-        self.session
-            .whitenoise()?
-            .background_refresh_account_group_subscriptions(&account);
-        Ok(())
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Removes the caller from the group's admin list.
@@ -464,13 +325,11 @@ impl<'a> GroupOps<'a> {
     /// requires admins to relinquish admin status before sending a SelfRemove
     /// proposal.
     pub async fn self_demote(&self, group_id: &GroupId) -> Result<()> {
-        self.ensure_admin(group_id)?;
+        if let Some(projection) = self.marmot_group_projection(group_id)? {
+            return self.self_demote_marmot(group_id, projection).await;
+        }
 
-        let relay_urls = self.ensure_relays(group_id)?;
-        let update_result = self.session.mdk.self_demote(group_id)?;
-
-        self.publish_and_merge_commit(update_result.evolution_event, group_id, &relay_urls)
-            .await
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Leaves a group by creating a SelfRemove proposal and publishing it.
@@ -479,8 +338,499 @@ impl<'a> GroupOps<'a> {
     /// optimistically marked as departed locally. When another member
     /// auto-commits the proposal, the resulting commit converges local state.
     pub async fn leave(&self, group_id: &GroupId) -> Result<()> {
-        let database = &self.session.shared.database;
+        if self.marmot_group_projection(group_id)?.is_some() {
+            return self.leave_marmot_group(group_id).await;
+        }
 
+        Err(WhitenoiseError::GroupNotFound)
+    }
+
+    // ── Group creation ──────────────────────────────────────────────
+
+    /// Creates a new Marmot group with the specified members and settings.
+    pub async fn create_group(
+        &self,
+        member_pubkeys: Vec<PublicKey>,
+        config: GroupConfig,
+        group_type: Option<GroupType>,
+    ) -> Result<group_types::Group> {
+        self.create_marmot_group(member_pubkeys, config, group_type)
+            .await
+    }
+
+    pub(crate) async fn create_marmot_group(
+        &self,
+        member_pubkeys: Vec<PublicKey>,
+        config: GroupConfig,
+        group_type: Option<GroupType>,
+    ) -> Result<group_types::Group> {
+        let plan = self
+            .prepare_marmot_group_creation(member_pubkeys, config)
+            .await?;
+        self.create_marmot_group_from_plan(plan, group_type).await
+    }
+
+    async fn create_marmot_group_from_plan(
+        &self,
+        plan: MarmotGroupCreationPlan,
+        group_type: Option<GroupType>,
+    ) -> Result<group_types::Group> {
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await?;
+        let marmot_session = self.marmot_session()?;
+        let created = {
+            let mut session = marmot_session.lock().await;
+            session.create_group(plan.request.clone()).await?
+        };
+        let routes = self
+            .marmot_publish_routes_for_group_creation(&plan, &created.group_id, &account)
+            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&self.session.ephemeral, routes);
+
+        self.finish_marmot_group_creation(marmot_session, &plan, group_type, &publisher, created)
+            .await
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "phase 7"))]
+    pub(crate) async fn create_marmot_group_with_publisher<P>(
+        &self,
+        member_pubkeys: Vec<PublicKey>,
+        config: GroupConfig,
+        group_type: Option<GroupType>,
+        publisher: &P,
+    ) -> Result<group_types::Group>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let plan = self
+            .prepare_marmot_group_creation(member_pubkeys, config)
+            .await?;
+        let marmot_session = self.marmot_session()?;
+        let created = {
+            let mut session = marmot_session.lock().await;
+            session.create_group(plan.request.clone()).await?
+        };
+
+        self.finish_marmot_group_creation(marmot_session, &plan, group_type, publisher, created)
+            .await
+    }
+
+    async fn add_marmot_members(
+        &self,
+        group_id: &GroupId,
+        member_pubkeys: Vec<PublicKey>,
+    ) -> Result<()> {
+        self.ensure_admin(group_id)?;
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await?;
+        let resolved_members = self.prepare_marmot_member_addition(member_pubkeys).await?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let routes = self
+            .marmot_publish_routes_for_member_addition(
+                &marmot_group_id,
+                &resolved_members,
+                &account,
+            )
+            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&self.session.ephemeral, routes);
+
+        self.add_marmot_members_with_resolved(&marmot_group_id, resolved_members, &publisher)
+            .await
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "phase 11"))]
+    pub(crate) async fn add_marmot_members_with_publisher<P>(
+        &self,
+        group_id: &GroupId,
+        member_pubkeys: Vec<PublicKey>,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        self.ensure_admin(group_id)?;
+        let resolved_members = self.prepare_marmot_member_addition(member_pubkeys).await?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+
+        self.add_marmot_members_with_resolved(&marmot_group_id, resolved_members, publisher)
+            .await
+    }
+
+    async fn add_marmot_members_with_resolved<P>(
+        &self,
+        marmot_group_id: &MarmotGroupId,
+        resolved_members: Vec<MarmotResolvedMemberKeyPackage>,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let key_packages = resolved_members
+            .into_iter()
+            .map(|resolved| resolved.key_package)
+            .collect();
+        let marmot_session = self.marmot_session()?;
+        let effects = {
+            let mut session = marmot_session.lock().await;
+            session
+                .invite_members(marmot_group_id.clone(), key_packages)
+                .await?
+        };
+
+        self.finish_marmot_group_mutation(marmot_session, marmot_group_id, publisher, effects)
+            .await
+    }
+
+    async fn remove_marmot_members(
+        &self,
+        group_id: &GroupId,
+        members: Vec<PublicKey>,
+    ) -> Result<()> {
+        self.ensure_admin(group_id)?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let routes = self
+            .marmot_publish_routes_for_existing_group(&marmot_group_id)
+            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&self.session.ephemeral, routes);
+
+        self.remove_marmot_members_with_publisher(group_id, members, &publisher)
+            .await
+    }
+
+    pub(crate) async fn remove_marmot_members_with_publisher<P>(
+        &self,
+        group_id: &GroupId,
+        members: Vec<PublicKey>,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        self.ensure_admin(group_id)?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let member_ids = members
+            .into_iter()
+            .map(|member| MemberId::new(member.as_bytes().to_vec()))
+            .collect();
+        let marmot_session = self.marmot_session()?;
+        let effects = {
+            let mut session = marmot_session.lock().await;
+            session
+                .remove_members(marmot_group_id.clone(), member_ids)
+                .await?
+        };
+
+        self.finish_marmot_group_mutation(marmot_session, &marmot_group_id, publisher, effects)
+            .await
+    }
+
+    async fn leave_marmot_group(&self, group_id: &GroupId) -> Result<()> {
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let routes = self
+            .marmot_publish_routes_for_existing_group(&marmot_group_id)
+            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&self.session.ephemeral, routes);
+
+        self.leave_marmot_group_with_publisher(group_id, &publisher)
+            .await
+    }
+
+    pub(crate) async fn leave_marmot_group_with_publisher<P>(
+        &self,
+        group_id: &GroupId,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        self.ensure_group_can_be_left(group_id).await?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let marmot_session = self.marmot_session()?;
+        let effects = {
+            let mut session = marmot_session.lock().await;
+            session.leave_group(marmot_group_id.clone()).await?
+        };
+
+        let published = publish_effects(marmot_session, publisher, effects).await?;
+        Self::ensure_marmot_leave_published(&published)?;
+
+        self.mark_local_departure_after_self_remove(group_id).await
+    }
+
+    async fn update_marmot_group_data(
+        &self,
+        group_id: &GroupId,
+        group_data: GroupDataUpdate,
+        projection: MarmotCreatedGroupProjection,
+    ) -> Result<()> {
+        self.ensure_admin(group_id)?;
+        let updates = Self::marmot_group_data_update_components(group_data, &projection)?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let routes = self
+            .marmot_publish_routes_for_existing_group(&marmot_group_id)
+            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&self.session.ephemeral, routes);
+
+        self.update_marmot_group_data_with_components(&marmot_group_id, updates, &publisher)
+            .await
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "phase 11"))]
+    pub(crate) async fn update_marmot_group_data_with_publisher<P>(
+        &self,
+        group_id: &GroupId,
+        group_data: GroupDataUpdate,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        self.ensure_admin(group_id)?;
+        let projection = self
+            .marmot_group_projection(group_id)?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let updates = Self::marmot_group_data_update_components(group_data, &projection)?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+
+        self.update_marmot_group_data_with_components(&marmot_group_id, updates, publisher)
+            .await
+    }
+
+    async fn update_marmot_group_data_with_components<P>(
+        &self,
+        marmot_group_id: &MarmotGroupId,
+        updates: Vec<AppComponentData>,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let marmot_session = self.marmot_session()?;
+        let effects = {
+            let mut session = marmot_session.lock().await;
+            session
+                .update_app_components((*marmot_group_id).clone(), updates)
+                .await?
+        };
+
+        self.finish_marmot_group_mutation(marmot_session, marmot_group_id, publisher, effects)
+            .await
+    }
+
+    async fn self_demote_marmot(
+        &self,
+        group_id: &GroupId,
+        projection: MarmotCreatedGroupProjection,
+    ) -> Result<()> {
+        self.ensure_admin(group_id)?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+        let routes = self
+            .marmot_publish_routes_for_existing_group(&marmot_group_id)
+            .await?;
+        let publisher = MarmotRelayControlPublisher::new(&self.session.ephemeral, routes);
+
+        self.self_demote_marmot_with_projection(&marmot_group_id, projection, &publisher)
+            .await
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "phase 11"))]
+    pub(crate) async fn self_demote_marmot_with_publisher<P>(
+        &self,
+        group_id: &GroupId,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        self.ensure_admin(group_id)?;
+        let projection = self
+            .marmot_group_projection(group_id)?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let marmot_group_id = MarmotGroupId::new(group_id.as_slice().to_vec());
+
+        self.self_demote_marmot_with_projection(&marmot_group_id, projection, publisher)
+            .await
+    }
+
+    async fn self_demote_marmot_with_projection<P>(
+        &self,
+        marmot_group_id: &MarmotGroupId,
+        projection: MarmotCreatedGroupProjection,
+        publisher: &P,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let admins = projection
+            .admin_pubkeys
+            .iter()
+            .copied()
+            .filter(|admin| *admin != self.session.account_pubkey)
+            .collect::<Vec<_>>();
+        let update = AppComponentData {
+            component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+            data: Self::encode_marmot_admin_policy(&admins, &projection.member_pubkeys)?,
+        };
+
+        self.update_marmot_group_data_with_components(marmot_group_id, vec![update], publisher)
+            .await
+    }
+
+    fn marmot_group_data_update_components(
+        group_data: GroupDataUpdate,
+        projection: &MarmotCreatedGroupProjection,
+    ) -> Result<Vec<AppComponentData>> {
+        if group_data.image_hash.is_some()
+            || group_data.image_key.is_some()
+            || group_data.image_nonce.is_some()
+            || group_data.image_upload_key.is_some()
+        {
+            return Err(WhitenoiseError::InvalidInput(
+                "Darkmatter group image updates require media type support".to_string(),
+            ));
+        }
+
+        let mut updates = Vec::new();
+
+        if group_data.name.is_some() || group_data.description.is_some() {
+            let name = group_data.name.unwrap_or_else(|| projection.name.clone());
+            let description = group_data
+                .description
+                .unwrap_or_else(|| projection.description.clone());
+            updates.push(AppComponentData {
+                component_id: GROUP_PROFILE_COMPONENT_ID,
+                data: encode_component_vectors(&[name.as_bytes(), description.as_bytes()]),
+            });
+        }
+
+        if group_data.relays.is_some() || group_data.nostr_group_id.is_some() {
+            let nostr_group_id = group_data
+                .nostr_group_id
+                .unwrap_or(projection.routing.nostr_group_id);
+            let relays = group_data
+                .relays
+                .map(|relays| relays.into_iter().map(|relay| relay.to_string()).collect())
+                .unwrap_or_else(|| projection.routing.relays.clone());
+            let routing = NostrRoutingV1::new(nostr_group_id, relays).map_err(|error| {
+                WhitenoiseError::InvalidInput(format!(
+                    "invalid marmot.transport.nostr.routing.v1: {error}"
+                ))
+            })?;
+            updates.push(AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&routing).map_err(|error| {
+                    WhitenoiseError::InvalidInput(format!(
+                        "invalid marmot.transport.nostr.routing.v1: {error}"
+                    ))
+                })?,
+            });
+        }
+
+        if let Some(admins) = group_data.admins {
+            updates.push(AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: Self::encode_marmot_admin_policy(&admins, &projection.member_pubkeys)?,
+            });
+        }
+
+        if let Some(disappearing_message_secs) = group_data.disappearing_message_secs {
+            updates.push(AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: disappearing_message_secs
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec(),
+            });
+        }
+
+        if updates.is_empty() {
+            return Err(WhitenoiseError::InvalidInput(
+                "group_data contains no fields to update".to_string(),
+            ));
+        }
+
+        Ok(updates)
+    }
+
+    fn encode_marmot_admin_policy(
+        admins: &[PublicKey],
+        members: &BTreeSet<PublicKey>,
+    ) -> Result<Vec<u8>> {
+        if admins.is_empty() {
+            return Err(WhitenoiseError::InvalidInput(
+                "admin policy must contain at least one admin".to_string(),
+            ));
+        }
+
+        let mut unique_admins = BTreeSet::new();
+        for admin in admins {
+            if !unique_admins.insert(*admin) {
+                return Err(WhitenoiseError::InvalidInput(
+                    "admin list contains duplicates".to_string(),
+                ));
+            }
+            if !members.contains(admin) {
+                return Err(WhitenoiseError::InvalidInput(
+                    "admin must be a group member".to_string(),
+                ));
+            }
+        }
+
+        let mut admin_bytes = Vec::with_capacity(unique_admins.len() * 32);
+        encode_quic_varint((unique_admins.len() * 32) as u64, &mut admin_bytes);
+        for admin in unique_admins {
+            admin_bytes.extend_from_slice(admin.as_bytes());
+        }
+
+        Ok(admin_bytes)
+    }
+
+    async fn finish_marmot_group_creation<P>(
+        &self,
+        marmot_session: Arc<tokio::sync::Mutex<crate::marmot::session::MarmotSession>>,
+        plan: &MarmotGroupCreationPlan,
+        group_type: Option<GroupType>,
+        publisher: &P,
+        created: crate::marmot::session::CreateGroupEffects,
+    ) -> Result<group_types::Group>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let published = publish_effects(marmot_session.clone(), publisher, created.effects).await?;
+        Self::ensure_marmot_group_creation_published(&published)?;
+
+        let projection = {
+            let session = marmot_session.lock().await;
+            session.created_group_projection(&created.group_id)?
+        };
+        let group_id = self
+            .project_created_marmot_group(&projection, &plan.member_pubkeys, group_type)
+            .await?;
+
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await?;
+        self.session
+            .whitenoise()?
+            .background_refresh_account_group_subscriptions(&account);
+
+        self.get(&group_id)
+    }
+
+    fn marmot_session(
+        &self,
+    ) -> Result<Arc<tokio::sync::Mutex<crate::marmot::session::MarmotSession>>> {
+        self.session
+            .marmot
+            .clone()
+            .ok_or(WhitenoiseError::MarmotSessionUnavailable(
+                self.session.account_pubkey,
+            ))
+    }
+
+    async fn ensure_group_can_be_left(&self, group_id: &GroupId) -> Result<()> {
         let account_group = AccountGroup::find_by_account_and_group(
             &self.session.account_pubkey,
             group_id,
@@ -493,20 +843,130 @@ impl<'a> GroupOps<'a> {
             return Err(WhitenoiseError::AlreadyDepartedFromGroup);
         }
 
-        let relay_urls = self.ensure_relays(group_id)?;
-        let update_result = self.session.mdk.leave_group(group_id)?;
+        Ok(())
+    }
 
-        self.session
-            .shared
-            .relay_control
-            .publish_event_to(
-                update_result.evolution_event,
-                &self.session.account_pubkey,
-                &relay_urls,
-            )
+    fn ensure_marmot_group_creation_published(published: &MarmotPublishedEffects) -> Result<()> {
+        if let Some(failure) = published.failures.first() {
+            return Err(WhitenoiseError::MarmotPublishFailed(failure.reason.clone()));
+        }
+
+        if published
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, MarmotPendingResolution::RolledBack { .. }))
+        {
+            return Err(WhitenoiseError::MarmotPublishFailed(
+                "pending group creation was rolled back".to_string(),
+            ));
+        }
+
+        if !published
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, MarmotPendingResolution::Confirmed { .. }))
+        {
+            return Err(WhitenoiseError::Internal(
+                "Marmot group creation produced no confirmed pending state".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_marmot_group_mutation_published(published: &MarmotPublishedEffects) -> Result<()> {
+        if !published.queued.is_empty() {
+            return Err(WhitenoiseError::MarmotPublishFailed(
+                "Marmot group mutation was queued; queued mutation projection is not implemented"
+                    .to_string(),
+            ));
+        }
+
+        if published
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, MarmotPendingResolution::RolledBack { .. }))
+        {
+            let reason = published
+                .failures
+                .first()
+                .map(|failure| failure.reason.clone())
+                .unwrap_or_else(|| "pending group mutation was rolled back".to_string());
+            return Err(WhitenoiseError::MarmotPublishFailed(reason));
+        }
+
+        if !published
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, MarmotPendingResolution::Confirmed { .. }))
+        {
+            return Err(WhitenoiseError::Internal(
+                "Marmot group mutation produced no confirmed pending state".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_marmot_leave_published(published: &MarmotPublishedEffects) -> Result<()> {
+        if !published.queued.is_empty() {
+            return Err(WhitenoiseError::MarmotPublishFailed(
+                "Marmot leave was queued; queued leave projection is not implemented".to_string(),
+            ));
+        }
+
+        if let Some(failure) = published.failures.first() {
+            return Err(WhitenoiseError::MarmotPublishFailed(failure.reason.clone()));
+        }
+
+        if published.reports.is_empty() {
+            return Err(WhitenoiseError::Internal(
+                "Marmot leave produced no SelfRemove proposal to publish".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn finish_marmot_group_mutation<P>(
+        &self,
+        marmot_session: Arc<tokio::sync::Mutex<crate::marmot::session::MarmotSession>>,
+        marmot_group_id: &MarmotGroupId,
+        publisher: &P,
+        effects: MarmotSessionEffects,
+    ) -> Result<()>
+    where
+        P: MarmotMessagePublisher + Sync + ?Sized,
+    {
+        let published = publish_effects(marmot_session.clone(), publisher, effects).await?;
+        Self::ensure_marmot_group_mutation_published(&published)?;
+
+        for failure in &published.failures {
+            tracing::warn!(
+                target: "whitenoise::session::groups",
+                group_id = %hex::encode(marmot_group_id.as_slice()),
+                message_id = %hex::encode(failure.message_id.as_slice()),
+                reason = %failure.reason,
+                "Marmot group mutation committed, but an auxiliary publish failed"
+            );
+        }
+
+        self.refresh_marmot_group_projection(marmot_session, marmot_group_id)
             .await?;
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await?;
+        self.session
+            .whitenoise()?
+            .background_refresh_account_group_subscriptions(&account);
 
-        let account = Account::find_by_pubkey(&self.session.account_pubkey, database).await?;
+        Ok(())
+    }
+
+    async fn mark_local_departure_after_self_remove(&self, group_id: &GroupId) -> Result<()> {
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await?;
 
         if let Err(error) = self
             .session
@@ -533,90 +993,354 @@ impl<'a> GroupOps<'a> {
         Ok(())
     }
 
-    // ── Group creation ──────────────────────────────────────────────
+    async fn refresh_marmot_group_projection(
+        &self,
+        marmot_session: Arc<tokio::sync::Mutex<crate::marmot::session::MarmotSession>>,
+        marmot_group_id: &MarmotGroupId,
+    ) -> Result<()> {
+        let projection = {
+            let session = marmot_session.lock().await;
+            session.group_projection(marmot_group_id)?
+        };
+        self.session
+            .marmot_storage
+            .put_group_projection(&projection)?;
 
-    /// Creates a new MLS group with the specified members and settings.
-    ///
-    /// Welcome messages are delivered inline after the group is committed locally.
-    /// If welcome delivery fails for a member, the failure is logged but does not
-    /// prevent `Ok(group)` from being returned.
-    pub async fn create_group(
+        Ok(())
+    }
+
+    async fn marmot_publish_routes_for_group_creation(
+        &self,
+        plan: &MarmotGroupCreationPlan,
+        group_id: &MarmotGroupId,
+        account: &Account,
+    ) -> Result<MarmotPublishRoutes> {
+        let mut routes = MarmotPublishRoutes::new().with_group_publish_route(
+            MarmotGroupPublishRoute::from_nostr_routing(group_id.clone(), plan.routing.clone()),
+        );
+
+        for resolved in &plan.resolved_members {
+            let relays = self
+                .session
+                .shared
+                .resolve_member_delivery_relays(
+                    &resolved.user,
+                    account,
+                    "whitenoise::session::groups::create_marmot_group",
+                )
+                .await?;
+            let endpoints = Relay::urls(&relays)
+                .into_iter()
+                .map(|relay| TransportEndpoint(relay.to_string()))
+                .collect();
+            routes = routes.with_inbox_route(
+                MemberId::new(resolved.user.pubkey.as_bytes().to_vec()),
+                endpoints,
+            );
+        }
+
+        Ok(routes)
+    }
+
+    async fn marmot_publish_routes_for_member_addition(
+        &self,
+        group_id: &MarmotGroupId,
+        resolved_members: &[MarmotResolvedMemberKeyPackage],
+        account: &Account,
+    ) -> Result<MarmotPublishRoutes> {
+        let mut routes = self
+            .marmot_publish_routes_for_existing_group(group_id)
+            .await?;
+
+        for resolved in resolved_members {
+            let relays = self
+                .session
+                .shared
+                .resolve_member_delivery_relays(
+                    &resolved.user,
+                    account,
+                    "whitenoise::session::groups::add_marmot_members",
+                )
+                .await?;
+            let endpoints = Relay::urls(&relays)
+                .into_iter()
+                .map(|relay| TransportEndpoint(relay.to_string()))
+                .collect();
+            routes = routes.with_inbox_route(
+                MemberId::new(resolved.user.pubkey.as_bytes().to_vec()),
+                endpoints,
+            );
+        }
+
+        Ok(routes)
+    }
+
+    async fn marmot_publish_routes_for_existing_group(
+        &self,
+        group_id: &MarmotGroupId,
+    ) -> Result<MarmotPublishRoutes> {
+        let marmot_session = self.marmot_session()?;
+        let group_route = {
+            let session = marmot_session.lock().await;
+            session.group_publish_route(group_id)?
+        };
+
+        Ok(MarmotPublishRoutes::new().with_group_publish_route(group_route))
+    }
+
+    pub(crate) async fn prepare_marmot_group_creation(
         &self,
         member_pubkeys: Vec<PublicKey>,
-        config: NostrGroupConfigData,
-        group_type: Option<GroupType>,
-    ) -> Result<group_types::Group> {
-        let signer = self
-            .session
-            .get_signer()
-            .ok_or(WhitenoiseError::SignerUnavailable(
-                self.session.account_pubkey,
-            ))?;
+        config: GroupConfig,
+    ) -> Result<MarmotGroupCreationPlan> {
+        self.prepare_marmot_group_creation_with_nostr_group_id(
+            member_pubkeys,
+            config,
+            random_nostr_group_id(),
+        )
+        .await
+    }
 
-        // Reject duplicate member pubkeys before doing any async work
-        let unique: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
-        if unique.len() != member_pubkeys.len() {
+    pub(crate) async fn prepare_marmot_group_creation_with_nostr_group_id(
+        &self,
+        member_pubkeys: Vec<PublicKey>,
+        config: GroupConfig,
+        nostr_group_id: [u8; 32],
+    ) -> Result<MarmotGroupCreationPlan> {
+        self.validate_marmot_group_create_members(&member_pubkeys, &config.admins)?;
+        Self::validate_marmot_group_create_config(&config)?;
+        let requested_member_pubkeys = member_pubkeys.clone();
+
+        let member_futures = member_pubkeys
+            .iter()
+            .map(|pk| self.resolve_marmot_member_key_package(pk));
+        let resolved_members = try_join_all(member_futures).await?;
+        let key_packages = resolved_members
+            .iter()
+            .map(|resolved| resolved.key_package.clone())
+            .collect();
+
+        let (request, routing) =
+            self.marmot_create_group_request(member_pubkeys, key_packages, config, nostr_group_id)?;
+
+        Ok(MarmotGroupCreationPlan {
+            request,
+            routing,
+            member_pubkeys: requested_member_pubkeys,
+            resolved_members,
+        })
+    }
+
+    fn marmot_create_group_request(
+        &self,
+        member_pubkeys: Vec<PublicKey>,
+        key_packages: Vec<KeyPackage>,
+        config: GroupConfig,
+        nostr_group_id: [u8; 32],
+    ) -> Result<(CreateGroupRequest, NostrRoutingV1)> {
+        let routing = NostrRoutingV1::new(
+            nostr_group_id,
+            config.relays.iter().map(ToString::to_string).collect(),
+        )
+        .map_err(|error| {
+            WhitenoiseError::InvalidInput(format!(
+                "invalid marmot.transport.nostr.routing.v1: {error}"
+            ))
+        })?;
+        let routing_component = AppComponentData {
+            component_id: NOSTR_ROUTING_COMPONENT_ID,
+            data: encode_nostr_routing_v1(&routing).map_err(|error| {
+                WhitenoiseError::InvalidInput(format!(
+                    "invalid marmot.transport.nostr.routing.v1: {error}"
+                ))
+            })?,
+        };
+        let mut app_components = vec![routing_component];
+
+        if let Some(seconds) = config.disappearing_message_secs {
+            if seconds == 0 {
+                return Err(WhitenoiseError::InvalidInput(
+                    "disappearing_message_secs must be greater than zero".to_string(),
+                ));
+            }
+            app_components.push(AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: seconds.to_be_bytes().to_vec(),
+            });
+        }
+
+        app_components.push(
+            AgentTextStreamQuicPolicyV1::user_to_agent_default()
+                .to_app_component_data()
+                .map_err(|error| {
+                    WhitenoiseError::InvalidInput(format!(
+                        "invalid agent text stream policy: {error}"
+                    ))
+                })?,
+        );
+
+        Ok((
+            CreateGroupRequest {
+                name: config.name,
+                description: config.description,
+                members: key_packages,
+                required_features: Vec::new(),
+                app_components,
+                initial_admins: self.marmot_initial_admins(&member_pubkeys, &config.admins),
+            },
+            routing,
+        ))
+    }
+
+    fn validate_marmot_group_create_members(
+        &self,
+        member_pubkeys: &[PublicKey],
+        admin_pubkeys: &[PublicKey],
+    ) -> Result<()> {
+        let unique_members: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
+        if unique_members.len() != member_pubkeys.len() {
             return Err(WhitenoiseError::InvalidInput(
                 "member_pubkeys contains duplicates".to_string(),
             ));
         }
 
-        // Resolve members and fetch key packages concurrently
-        let member_futures = member_pubkeys
-            .iter()
-            .map(|pk| self.resolve_member_key_package(pk));
-        let resolved_members = try_join_all(member_futures).await?;
-        let (members, key_package_events): (Vec<User>, Vec<Event>) =
-            resolved_members.into_iter().unzip();
+        if !admin_pubkeys.contains(&self.session.account_pubkey) {
+            return Err(WhitenoiseError::InvalidInput(
+                "creator must be an admin".to_string(),
+            ));
+        }
 
-        tracing::debug!(
-            target: "whitenoise::session::groups",
-            "Successfully fetched the key packages of members"
-        );
+        if member_pubkeys.contains(&self.session.account_pubkey) {
+            return Err(WhitenoiseError::InvalidInput(
+                "creator must not be included as a member".to_string(),
+            ));
+        }
 
-        let group_name = config.name.clone();
+        for admin in admin_pubkeys {
+            if *admin != self.session.account_pubkey && !member_pubkeys.contains(admin) {
+                return Err(WhitenoiseError::InvalidInput(
+                    "admin must be a member".to_string(),
+                ));
+            }
+        }
 
-        let create_group_result = self.session.mdk.create_group(
-            &self.session.account_pubkey,
-            key_package_events.clone(),
-            config,
-        )?;
-
-        let group = create_group_result.group;
-        let welcome_data = Self::prepare_welcomes(
-            create_group_result.welcome_rumors,
-            members,
-            &key_package_events,
-        )?;
-
-        self.finalize_group_records(&group, &member_pubkeys, group_type, &group_name)
-            .await?;
-
-        Self::publish_welcomes(
-            self.session.shared.clone(),
-            welcome_data,
-            signer,
-            self.session.account_pubkey,
-        )
-        .await;
-
-        let account =
-            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
-                .await?;
-        // background_refresh_account_group_subscriptions still genuinely needs
-        // Whitenoise (account_manager + tokio::spawn). Inline upgrade keeps the
-        // back-ref scoped to a single call rather than a function-wide binding.
-        self.session
-            .whitenoise()?
-            .background_refresh_account_group_subscriptions(&account);
-
-        Ok(group)
+        Ok(())
     }
 
-    /// Resolves a single member for group creation: finds or creates the user
-    /// record, syncs relay lists for new users, fetches and validates the key
-    /// package.
-    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
+    async fn prepare_marmot_member_addition(
+        &self,
+        member_pubkeys: Vec<PublicKey>,
+    ) -> Result<Vec<MarmotResolvedMemberKeyPackage>> {
+        let unique_members: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
+        if unique_members.len() != member_pubkeys.len() {
+            return Err(WhitenoiseError::InvalidInput(
+                "member_pubkeys contains duplicates".to_string(),
+            ));
+        }
+
+        let member_futures = member_pubkeys
+            .iter()
+            .map(|pk| self.resolve_marmot_member_key_package(pk));
+        try_join_all(member_futures).await
+    }
+
+    fn validate_marmot_group_create_config(config: &GroupConfig) -> Result<()> {
+        if Self::requires_legacy_group_image_create(config) {
+            return Err(WhitenoiseError::InvalidInput(
+                "Darkmatter group image creation requires image upload key and media type support"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn requires_legacy_group_image_create(config: &GroupConfig) -> bool {
+        config.image_hash.is_some() || config.image_key.is_some() || config.image_nonce.is_some()
+    }
+
+    fn marmot_initial_admins(
+        &self,
+        member_pubkeys: &[PublicKey],
+        admin_pubkeys: &[PublicKey],
+    ) -> Vec<MemberId> {
+        let member_set: BTreeSet<PublicKey> = member_pubkeys.iter().copied().collect();
+        let admin_set: BTreeSet<PublicKey> = admin_pubkeys.iter().copied().collect();
+
+        admin_set
+            .into_iter()
+            .filter(|admin| *admin != self.session.account_pubkey)
+            .filter(|admin| member_set.contains(admin))
+            .map(|admin| MemberId::new(admin.as_bytes().to_vec()))
+            .collect()
+    }
+
+    pub(crate) async fn project_created_marmot_group(
+        &self,
+        group: &MarmotCreatedGroupProjection,
+        member_pubkeys: &[PublicKey],
+        group_type: Option<GroupType>,
+    ) -> Result<GroupId> {
+        let group_id = GroupId::from_slice(group.group_id.as_slice());
+        self.session.marmot_storage.put_group_projection(group)?;
+        self.finalize_group_records(&group_id, member_pubkeys, group_type, &group.name)
+            .await?;
+
+        Ok(group_id)
+    }
+
+    pub(crate) async fn project_joined_marmot_group(
+        &self,
+        group: &MarmotCreatedGroupProjection,
+        group_type: Option<GroupType>,
+        welcomer_pubkey: PublicKey,
+    ) -> Result<GroupId> {
+        let group_id = GroupId::from_slice(group.group_id.as_slice());
+        let group_type = group_type
+            .unwrap_or_else(|| GroupInformation::infer_group_type_from_group_name(&group.name));
+        let dm_peer_pubkey = if group_type == GroupType::DirectMessage {
+            Some(welcomer_pubkey)
+        } else {
+            None
+        };
+
+        self.session.marmot_storage.put_group_projection(group)?;
+        let (_group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(group_type),
+            &self.session.shared.database,
+        )
+        .await?;
+
+        let now = Utc::now();
+        let account_group = AccountGroup {
+            id: None,
+            account_pubkey: self.session.account_pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: None,
+            welcomer_pubkey: Some(welcomer_pubkey),
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey,
+            archived_at: None,
+            removed_at: None,
+            self_removed: false,
+            muted_until: None,
+            chat_cleared_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        account_group
+            .save(&self.session.account_db.inner.pool)
+            .await?;
+
+        Ok(group_id)
+    }
+
+    pub(crate) async fn resolve_marmot_member_key_package(
+        &self,
+        pk: &PublicKey,
+    ) -> Result<MarmotResolvedMemberKeyPackage> {
         let shared = &self.session.shared;
         let (user, created) = User::find_or_create_by_pubkey(pk, &shared.database).await?;
         if created && let Err(e) = user.update_relay_lists(shared).await {
@@ -628,67 +1352,38 @@ impl<'a> GroupOps<'a> {
             );
         }
 
-        let some_event = user.key_package_event(shared).await?;
-        let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-            mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-        ))?;
+        let lookup = user.key_package_lookup(shared).await?;
+        let event = Self::marmot_member_key_package_from_lookup(*pk, lookup)?;
+        let key_package = key_package_from_v2_event(&event)?;
 
-        validate_fetched_member_key_package(&event, pk)?;
-
-        Ok((user, event))
+        Ok(MarmotResolvedMemberKeyPackage {
+            user,
+            event,
+            key_package,
+        })
     }
 
-    /// Validates and pairs welcome rumors with their target members and key
-    /// package pubkeys.
-    fn prepare_welcomes(
-        welcome_rumors: Vec<UnsignedEvent>,
-        members: Vec<User>,
-        key_package_events: &[Event],
-    ) -> Result<Vec<(UnsignedEvent, User, PublicKey)>> {
-        if welcome_rumors.len() != members.len() {
-            return Err(WhitenoiseError::Internal(
-                "Welcome rumours are missing for some of the members".to_string(),
-            ));
+    fn marmot_member_key_package_from_lookup(
+        member_pubkey: PublicKey,
+        lookup: KeyPackageLookup,
+    ) -> Result<Event> {
+        match lookup {
+            KeyPackageLookup::Found(event) => Ok(event),
+            KeyPackageLookup::NotFound => {
+                Err(WhitenoiseError::MemberKeyPackageNotFound { member_pubkey })
+            }
+            KeyPackageLookup::Incompatible => Err(WhitenoiseError::UnsupportedKeyPackageFormat {
+                member_pubkey,
+                reason: "no Darkmatter v2-compatible package was available".to_string(),
+            }),
         }
-
-        let kp_pubkey_by_event_id: HashMap<EventId, PublicKey> = key_package_events
-            .iter()
-            .map(|event| (event.id, event.pubkey))
-            .collect();
-
-        let mut members_by_pubkey: HashMap<PublicKey, User> = members
-            .into_iter()
-            .map(|member| (member.pubkey, member))
-            .collect();
-
-        welcome_rumors
-            .into_iter()
-            .map(|rumor| {
-                let kp_event_id = rumor.tags.event_ids().next().ok_or_else(|| {
-                    WhitenoiseError::Internal("No event ID found in welcome rumor".to_string())
-                })?;
-                let member_pubkey = kp_pubkey_by_event_id.get(kp_event_id).copied().ok_or(
-                    WhitenoiseError::Internal(
-                        "No public key found in key package event".to_string(),
-                    ),
-                )?;
-                let member =
-                    members_by_pubkey
-                        .remove(&member_pubkey)
-                        .ok_or(WhitenoiseError::Internal(format!(
-                            "No member record found for welcome target {}",
-                            member_pubkey
-                        )))?;
-                Ok((rumor, member, member_pubkey))
-            })
-            .collect()
     }
 
     /// Creates local database records for a newly created group:
     /// GroupInformation and AccountGroup (auto-accepted for the creator).
     async fn finalize_group_records(
         &self,
-        group: &group_types::Group,
+        group_id: &GroupId,
         member_pubkeys: &[PublicKey],
         group_type: Option<GroupType>,
         group_name: &str,
@@ -704,7 +1399,7 @@ impl<'a> GroupOps<'a> {
         };
 
         let (_group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
-            &group.mls_group_id,
+            group_id,
             Some(group_type),
             &self.session.shared.database,
         )
@@ -712,7 +1407,7 @@ impl<'a> GroupOps<'a> {
 
         let (account_group, _) = AccountGroup::find_or_create(
             &self.session.account_pubkey,
-            &group.mls_group_id,
+            group_id,
             dm_peer,
             &self.session.account_db.inner.pool,
         )
@@ -725,13 +1420,13 @@ impl<'a> GroupOps<'a> {
         if let Err(error) = self
             .session
             .push()
-            .share_local_token_to_group(&group.mls_group_id)
+            .share_local_token_to_group(group_id)
             .await
         {
             tracing::warn!(
                 target: "whitenoise::session::groups",
                 account = %self.session.account_pubkey.to_hex(),
-                group = %hex::encode(group.mls_group_id.as_slice()),
+                group = %hex::encode(group_id.as_slice()),
                 error = %error,
                 "Failed to share local push token after group creation"
             );
@@ -740,106 +1435,293 @@ impl<'a> GroupOps<'a> {
         Ok(())
     }
 
-    /// Delivers welcome messages to all group members, attempting every member even if
-    /// individual publishes fail. Errors are logged as warnings rather than propagated —
-    /// missed welcomes are non-fatal; the relay layer retries with exponential backoff.
-    ///
-    /// The caller is responsible for deciding whether to `tokio::spawn` this for
-    /// fire-and-forget behaviour. The view itself does not spawn.
-    async fn publish_welcomes(
-        shared: Arc<SharedServices>,
-        welcome_data: Vec<(UnsignedEvent, User, PublicKey)>,
-        signer: Arc<dyn NostrSigner>,
-        creator_pubkey: PublicKey,
-    ) {
-        let creator_account = match Account::find_by_pubkey(&creator_pubkey, &shared.database).await
-        {
-            Ok(account) => account,
-            Err(error) => {
-                tracing::error!(
-                    target: "whitenoise::session::groups",
-                    "Failed to find creator account for welcome publishing: {}",
-                    error
-                );
-                return;
-            }
-        };
-
-        let futures = welcome_data
-            .into_iter()
-            .map(|(rumor, member, member_pubkey)| {
-                let signer = signer.clone();
-                let creator = &creator_account;
-                let shared = &shared;
-                async move {
-                    let relays_to_use = shared
-                        .resolve_member_delivery_relays(
-                            &member,
-                            creator,
-                            "whitenoise::session::groups::create_group",
-                        )
-                        .await?;
-
-                    let one_month_future =
-                        Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
-
-                    shared
-                        .relay_control
-                        .publish_welcome(
-                            &member_pubkey,
-                            rumor,
-                            &[Tag::expiration(one_month_future)],
-                            creator.pubkey,
-                            &Relay::urls(&relays_to_use),
-                            signer,
-                        )
-                        .await
-                        .map_err(WhitenoiseError::from)?;
-
-                    Ok::<(), WhitenoiseError>(())
-                }
-            });
-
-        let results = join_all(futures).await;
-        for result in results {
-            if let Err(error) = result {
-                tracing::warn!(
-                    target: "whitenoise::session::groups",
-                    "Welcome publish failed: {}",
-                    error
-                );
-            }
-        }
-    }
-
     /// Return a view for group media operations scoped to this session.
     pub fn media(&self) -> MediaOps<'_> {
         MediaOps::new(self.session)
     }
 }
 
-/// Defense-in-depth mapping for `mdk.add_members` errors.
-///
-/// `add_members` pre-validates each invitee's [`KeyPackageCapabilities`]
-/// against the group's required proposals before invoking MDK, so an
-/// `InviteeMissingRequiredProposal` from MDK means the pre-check missed an
-/// edge case (e.g. an `openmls` enforcement rule that diverges from our
-/// projection). We surface it as [`WhitenoiseError::GroupRejectedMember`]
-/// with no member attribution (the MDK variant is a unit, no payload) and
-/// emit a `warn!` so the gap is visible in logs.
-fn map_mdk_add_members_error(err: mdk_core::Error) -> WhitenoiseError {
-    match err {
-        mdk_core::Error::InviteeMissingRequiredProposal => {
-            tracing::warn!(
-                target: "whitenoise::session::groups::add_members",
-                "MDK rejected add despite passing pre-validation; pre-check has a gap"
-            );
-            WhitenoiseError::GroupRejectedMember {
-                member_pubkey: None,
-                reason: "invitee KeyPackage is missing a proposal type required by the group"
-                    .to_string(),
-            }
+fn random_nostr_group_id() -> [u8; 32] {
+    let mut id = [0_u8; 32];
+    ::rand::rng().fill_bytes(&mut id);
+    id
+}
+
+#[cfg(test)]
+mod tests {
+    use cgka_traits::storage::GroupStorage;
+
+    use super::*;
+    use crate::whitenoise::session::test_helpers::test_session_with_marmot_keys;
+    use crate::whitenoise::test_utils::{
+        ObsoleteMlsArtifacts, assert_obsolete_mls_artifacts_absent, create_mock_whitenoise,
+        setup_unprojected_accepted_group, wait_for_key_package_publication,
+    };
+
+    fn obsolete_mls_artifacts_for_session(session: &AccountSession) -> ObsoleteMlsArtifacts {
+        ObsoleteMlsArtifacts {
+            storage_path: crate::whitenoise::test_utils::obsolete_mls_storage_path(
+                &session.account_pubkey,
+                &session.shared.config.data_dir,
+            ),
         }
-        other => WhitenoiseError::from(other),
+    }
+
+    fn assert_obsolete_mls_artifacts_absent_for_session(session: &AccountSession) {
+        let artifacts = obsolete_mls_artifacts_for_session(session);
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn public_create_group_uses_darkmatter_for_supported_config() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "public darkmatter group".to_string(),
+            "public create_group should use Darkmatter".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+
+        let group = session
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        assert_obsolete_mls_artifacts_absent_for_session(&session);
+
+        let marmot_group_id = MarmotGroupId::new(group.mls_group_id.as_slice().to_vec());
+        assert!(session.marmot_storage.get_group(&marmot_group_id).is_ok());
+        assert!(
+            session
+                .marmot_storage
+                .find_group_projection(&marmot_group_id)
+                .unwrap()
+                .is_some(),
+            "public create_group must project confirmed Darkmatter groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_create_group_rejects_image_config_until_darkmatter_media_exists() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "image-backed group".to_string(),
+            "image metadata needs the Darkmatter image component".to_string(),
+            Some([1; 32]),
+            Some([2; 32]),
+            Some([3; 12]),
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+
+        let result = session
+            .groups()
+            .create_group(vec![member.pubkey], config, None)
+            .await;
+
+        match result {
+            Err(WhitenoiseError::InvalidInput(message)) => {
+                assert!(message.contains("Darkmatter group image creation"))
+            }
+            other => panic!("expected unsupported Darkmatter image creation error, got {other:?}"),
+        }
+        assert!(
+            session.groups().all(false).unwrap().is_empty(),
+            "unsupported image group creation must not create a local group"
+        );
+    }
+
+    #[tokio::test]
+    async fn relays_use_darkmatter_projection_without_obsolete_mls_storage() {
+        let keys = Keys::generate();
+        let session = test_session_with_marmot_keys(keys.clone()).await;
+        let marmot_group_id = MarmotGroupId::new(vec![0xB1; 32]);
+        let group_id = GroupId::from(&marmot_group_id);
+
+        session
+            .marmot_storage
+            .put_group_projection(&MarmotCreatedGroupProjection {
+                group_id: marmot_group_id,
+                name: "projected relays".to_string(),
+                description: "relays should not open obsolete MLS storage".to_string(),
+                epoch: 1,
+                routing: NostrRoutingV1::new(
+                    [0xB2; 32],
+                    vec![
+                        "wss://relay-b.example".to_string(),
+                        "wss://relay-a.example".to_string(),
+                    ],
+                )
+                .unwrap(),
+                admin_pubkeys: BTreeSet::from([keys.public_key()]),
+                member_pubkeys: BTreeSet::from([keys.public_key()]),
+                self_update_completed_at_secs: 1,
+                disappearing_message_secs: None,
+            })
+            .unwrap();
+
+        let relays = session.groups().relays(&group_id).unwrap();
+
+        assert_eq!(
+            relays,
+            BTreeSet::from([
+                RelayUrl::parse("wss://relay-a.example").unwrap(),
+                RelayUrl::parse("wss://relay-b.example").unwrap(),
+            ])
+        );
+        assert_obsolete_mls_artifacts_absent_for_session(&session);
+    }
+
+    #[tokio::test]
+    async fn session_group_reads_skip_unprojected_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[0xC7; 32]);
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+        assert_obsolete_mls_artifacts_absent_for_session(&session);
+
+        assert!(matches!(
+            session.groups().get(&group_id),
+            Err(WhitenoiseError::GroupNotFound)
+        ));
+        assert!(matches!(
+            session.groups().members(&group_id),
+            Err(WhitenoiseError::GroupNotFound)
+        ));
+        assert!(matches!(
+            session.groups().relays(&group_id),
+            Err(WhitenoiseError::GroupNotFound)
+        ));
+        assert!(
+            session
+                .groups()
+                .all(false)
+                .unwrap()
+                .into_iter()
+                .all(|group| group.mls_group_id != group_id),
+            "unprojected groups must not be returned by session group lists"
+        );
+        assert!(
+            session
+                .groups()
+                .visible()
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|group| group.group.mls_group_id != group_id),
+            "unprojected groups must not be visible through account membership"
+        );
+        assert_obsolete_mls_artifacts_absent_for_session(&session);
+    }
+
+    #[tokio::test]
+    async fn add_members_rejects_unprojected_group_without_key_package_lookup() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        let new_member = whitenoise.create_identity().await.unwrap();
+
+        let group_id = setup_unprojected_accepted_group(&whitenoise, &[&creator, &member]).await;
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+
+        let result = session
+            .groups()
+            .add_members(&group_id, vec![new_member.pubkey])
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn remove_members_rejects_unprojected_group_without_mutation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group_id = setup_unprojected_accepted_group(&whitenoise, &[&creator, &member]).await;
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+
+        let result = session
+            .groups()
+            .remove_members(&group_id, vec![member.pubkey])
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn update_group_data_rejects_unprojected_group_without_mutation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group_id = setup_unprojected_accepted_group(&whitenoise, &[&creator, &member]).await;
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let update = GroupDataUpdate {
+            name: Some("darkmatter only".to_string()),
+            description: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            image_upload_key: None,
+            admins: None,
+            relays: None,
+            nostr_group_id: None,
+            disappearing_message_secs: None,
+        };
+
+        let result = session.groups().update_group_data(&group_id, update).await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn self_demote_rejects_unprojected_group_without_mutation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group_id = setup_unprojected_accepted_group(&whitenoise, &[&creator, &member]).await;
+        let session = whitenoise.require_session(&creator.pubkey).unwrap();
+
+        let result = session.groups().self_demote(&group_id).await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn leave_rejects_unprojected_group_without_mutation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group_id = setup_unprojected_accepted_group(&whitenoise, &[&creator, &member]).await;
+        let session = whitenoise.require_session(&member.pubkey).unwrap();
+
+        let result = session.groups().leave(&group_id).await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
     }
 }

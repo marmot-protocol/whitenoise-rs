@@ -57,7 +57,7 @@ CREATE TABLE app_settings (
     theme_mode TEXT NOT NULL DEFAULT 'system',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    language TEXT NOT NULL DEFAULT 'en'
+    language TEXT NOT NULL DEFAULT 'system'
 );
 
 INSERT OR IGNORE INTO app_settings (theme_mode) VALUES ('system');

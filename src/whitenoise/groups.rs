@@ -1,8 +1,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use mdk_core::prelude::*;
+use cgka_traits::capabilities::{Capability, FeatureStatus};
+use cgka_traits::storage::StorageError;
 
+use crate::marmot::GroupId;
+use crate::marmot::capabilities::{SELF_REMOVE_CODEPOINT, SELF_REMOVE_FEATURE};
+use crate::marmot::storage::WhitenoiseMarmotStorage;
 use crate::{
     RelayType, perf_instrument,
     whitenoise::{
@@ -18,7 +22,6 @@ use crate::{
 pub mod blossom_error;
 pub(crate) mod media;
 mod membership;
-mod publish;
 mod required_proposals;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
@@ -27,8 +30,8 @@ pub use required_proposals::{
     GroupCapabilityUpgradeStatus, RequiredProposalUpgradability, RequiredProposalUpgradeStatus,
 };
 pub(crate) use required_proposals::{
-    KeyPackageCapabilities, MlsExtensionId, find_member_missing_required_proposal,
-    project_group_capability_upgrade_status,
+    project_darkmatter_required_proposals, project_darkmatter_self_remove_upgrade_status,
+    validate_required_proposal_upgrade_targets,
 };
 
 impl SharedServices {
@@ -77,6 +80,28 @@ impl SharedServices {
 }
 
 impl Whitenoise {
+    fn has_existing_marmot_group_projection(
+        &self,
+        account: &Account,
+        marmot_group_id: &cgka_traits::types::GroupId,
+    ) -> Result<bool> {
+        let marmot_storage_path =
+            Account::marmot_storage_path(&account.pubkey, &self.config().data_dir);
+        let marmot_db_key_id = Account::marmot_db_key_id(&account.pubkey);
+        let Some(marmot_storage) = WhitenoiseMarmotStorage::open_existing_for_account(
+            marmot_storage_path,
+            self.keyring_service_id(),
+            &marmot_db_key_id,
+        )?
+        else {
+            return Ok(false);
+        };
+
+        Ok(marmot_storage
+            .find_group_projection(marmot_group_id)?
+            .is_some())
+    }
+
     /// Resolves a single member for group creation: finds or creates the user record,
     /// syncs relay lists for new users, fetches and validates the key package.
     /// Resolves a single member for group creation: finds or creates the user record,
@@ -115,14 +140,39 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<BTreeSet<RequiredProposal>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let required = mdk
-            .group_required_proposals(group_id)
-            .map_err(|e| match e {
-                mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
-                other => WhitenoiseError::from(other),
-            })?;
-        Ok(required.into_iter().map(RequiredProposal::from).collect())
+        let marmot_group_id = cgka_traits::types::GroupId::new(group_id.as_slice().to_vec());
+        if let Some(session) = self.session(&account.pubkey) {
+            if let Some(marmot) = &session.marmot {
+                let result = {
+                    let marmot = marmot.lock().await;
+                    marmot.group_required_capabilities(&marmot_group_id)
+                };
+
+                match result {
+                    Ok(required) => {
+                        return Ok(project_darkmatter_required_proposals(required.proposals));
+                    }
+                    Err(WhitenoiseError::MarmotStorage(StorageError::NotFound)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            if session
+                .marmot_storage
+                .find_group_projection(&marmot_group_id)?
+                .is_some()
+            {
+                return Err(WhitenoiseError::MarmotSessionUnavailable(account.pubkey));
+            }
+
+            return Err(WhitenoiseError::GroupNotFound);
+        }
+
+        if self.has_existing_marmot_group_projection(account, &marmot_group_id)? {
+            return Err(WhitenoiseError::MarmotSessionUnavailable(account.pubkey));
+        }
+
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Returns readiness for RequiredCapabilities proposal upgrades.
@@ -132,22 +182,62 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<GroupCapabilityUpgradeStatus> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let status = mdk
-            .group_capability_upgrade_status(group_id)
-            .map_err(|e| match e {
-                mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
-                other => WhitenoiseError::from(other),
-            })?;
-        Ok(project_group_capability_upgrade_status(status))
+        let marmot_group_id = cgka_traits::types::GroupId::new(group_id.as_slice().to_vec());
+        if let Some(session) = self.session(&account.pubkey) {
+            if let Some(marmot) = &session.marmot {
+                let result = {
+                    let marmot = marmot.lock().await;
+                    marmot
+                        .group_required_capabilities(&marmot_group_id)
+                        .and_then(|_| {
+                            let status =
+                                marmot.feature_status(&marmot_group_id, &SELF_REMOVE_FEATURE)?;
+                            let blockers = if matches!(&status, FeatureStatus::Unavailable { .. }) {
+                                marmot.members_missing_capability(
+                                    &marmot_group_id,
+                                    Capability::Proposal(SELF_REMOVE_CODEPOINT),
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+
+                            Ok(project_darkmatter_self_remove_upgrade_status(
+                                status, blockers,
+                            ))
+                        })
+                };
+
+                match result {
+                    Ok(status) => return Ok(status),
+                    Err(WhitenoiseError::MarmotStorage(StorageError::NotFound)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            if session
+                .marmot_storage
+                .find_group_projection(&marmot_group_id)?
+                .is_some()
+            {
+                return Err(WhitenoiseError::MarmotSessionUnavailable(account.pubkey));
+            }
+
+            return Err(WhitenoiseError::GroupNotFound);
+        }
+
+        if self.has_existing_marmot_group_projection(account, &marmot_group_id)? {
+            return Err(WhitenoiseError::MarmotSessionUnavailable(account.pubkey));
+        }
+
+        Err(WhitenoiseError::GroupNotFound)
     }
 
     /// Adds proposal types to a group's `RequiredCapabilities` extension.
     ///
     /// Use [`Self::group_capability_upgrade_status`] first to discover which
-    /// proposals are upgradeable today; this method enforces the same MDK
-    /// gate (every member must already advertise the capability) and surfaces
-    /// blockers as [`WhitenoiseError::CapabilityUpgradeBlocked`].
+    /// proposals are upgradeable today; this method enforces the same
+    /// capability gate (every member must already advertise the capability) and
+    /// surfaces blockers as [`WhitenoiseError::CapabilityUpgradeBlocked`].
     ///
     /// Per MIP-03, the evolution event is published to the group's relays
     /// *before* merging the pending commit locally — local state only
@@ -183,100 +273,140 @@ impl Whitenoise {
             ));
         }
 
+        let marmot_group_id = cgka_traits::types::GroupId::new(group_id.as_slice().to_vec());
         let session = self.require_session(&account.pubkey)?;
 
-        let admins = session.groups().admins(group_id)?;
-        if !admins.contains(&account.pubkey) {
-            return Err(WhitenoiseError::AccountNotAuthorized);
-        }
+        if let Some(marmot) = &session.marmot {
+            let result = {
+                let marmot = marmot.lock().await;
+                marmot
+                    .group_required_capabilities(&marmot_group_id)
+                    .and_then(|_| {
+                        let status =
+                            marmot.feature_status(&marmot_group_id, &SELF_REMOVE_FEATURE)?;
+                        let blockers = if matches!(&status, FeatureStatus::Unavailable { .. }) {
+                            marmot.members_missing_capability(
+                                &marmot_group_id,
+                                Capability::Proposal(SELF_REMOVE_CODEPOINT),
+                            )?
+                        } else {
+                            Vec::new()
+                        };
 
-        let proposal_types = proposals_to_add
-            .iter()
-            .copied()
-            .map(ProposalType::try_from)
-            .collect::<Result<BTreeSet<_>>>()?;
+                        Ok(project_darkmatter_self_remove_upgrade_status(
+                            status, blockers,
+                        ))
+                    })
+            };
 
-        let (relay_urls, evolution_event) = {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
-            let update_result = match mdk.upgrade_group_capabilities(group_id, &proposal_types) {
-                Ok(update_result) => update_result,
-                Err(mdk_core::Error::ProposalAlreadyRequired(proposal)) => {
+            match result {
+                Ok(status) => {
+                    let admins = session.groups().admins(group_id)?;
+                    if !admins.contains(&account.pubkey) {
+                        return Err(WhitenoiseError::AccountNotAuthorized);
+                    }
+                    validate_required_proposal_upgrade_targets(&proposals_to_add)?;
+                    ensure_marmot_required_proposals_upgrade_is_safe(&proposals_to_add, &status)?;
                     tracing::info!(
                         target: "whitenoise::groups::upgrade_group_required_proposals",
-                        proposal = ?proposal,
-                        "proposal already required; treating upgrade as idempotent no-op"
+                        added = ?proposals_to_add,
+                        "marmot group required proposals already satisfy requested upgrade"
                     );
                     return Ok(());
                 }
-                Err(other) => return Err(map_mdk_capability_upgrade_error(other)),
-            };
+                Err(WhitenoiseError::MarmotStorage(StorageError::NotFound)) => {}
+                Err(error) => return Err(error),
+            }
+        }
 
-            (relay_urls, update_result.evolution_event)
-        };
+        if session
+            .marmot_storage
+            .find_group_projection(&marmot_group_id)?
+            .is_some()
+        {
+            let admins = session.groups().admins(group_id)?;
+            if !admins.contains(&account.pubkey) {
+                return Err(WhitenoiseError::AccountNotAuthorized);
+            }
+            validate_required_proposal_upgrade_targets(&proposals_to_add)?;
+            return Err(WhitenoiseError::MarmotSessionUnavailable(account.pubkey));
+        }
 
-        session
-            .groups()
-            .publish_and_merge_commit(evolution_event, group_id, &relay_urls)
-            .await?;
-
-        tracing::info!(
-            target: "whitenoise::groups::upgrade_group_required_proposals",
-            added = ?proposals_to_add,
-            "upgraded group required proposals"
-        );
-
-        Ok(())
+        Err(WhitenoiseError::GroupNotFound)
     }
 }
 
-fn map_mdk_capability_upgrade_error(err: mdk_core::Error) -> WhitenoiseError {
-    match err {
-        mdk_core::Error::EmptyUpgradeSet => {
-            WhitenoiseError::InvalidInput("proposals_to_add must be non-empty".to_string())
-        }
-        mdk_core::Error::ProposalNotInSupportedSet(proposal) => WhitenoiseError::InvalidInput(
-            format!("proposal {proposal:?} is not supported for RequiredCapabilities upgrade"),
-        ),
-        mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
-        mdk_core::Error::NotAdmin => WhitenoiseError::AccountNotAuthorized,
-        mdk_core::Error::ProposalNotAvailableForUpgrade { proposal, blockers } => {
-            tracing::warn!(
-                target: "whitenoise::groups::upgrade_group_required_proposals",
-                proposal = ?proposal,
-                blockers = ?blockers,
-                "required proposal upgrade blocked by current member capabilities"
-            );
-            WhitenoiseError::CapabilityUpgradeBlocked {
-                proposal: RequiredProposal::from(proposal),
-                blockers,
+fn ensure_marmot_required_proposals_upgrade_is_safe(
+    proposals_to_add: &BTreeSet<RequiredProposal>,
+    status: &GroupCapabilityUpgradeStatus,
+) -> Result<()> {
+    for proposal in proposals_to_add {
+        let state = status
+            .per_proposal
+            .iter()
+            .find(|entry| entry.proposal == *proposal)
+            .map(|entry| &entry.state)
+            .ok_or_else(|| {
+                WhitenoiseError::Internal(format!(
+                    "Marmot capability status did not include {proposal:?}"
+                ))
+            })?;
+
+        match state {
+            RequiredProposalUpgradability::AlreadyRequired => {}
+            RequiredProposalUpgradability::Blocked { blockers } => {
+                return Err(WhitenoiseError::CapabilityUpgradeBlocked {
+                    proposal: *proposal,
+                    blockers: blockers.clone(),
+                });
+            }
+            RequiredProposalUpgradability::Available => {
+                return Err(WhitenoiseError::UnsupportedMarmotOperation(
+                    "selective RequiredCapabilities upgrades are not available yet; refusing to \
+                     promote every currently-upgradeable Darkmatter capability"
+                        .to_string(),
+                ));
             }
         }
-        mdk_core::Error::OwnLeafNotFound => WhitenoiseError::Internal(
-            "caller leaf is missing while upgrading group required proposals".to_string(),
-        ),
-        other => WhitenoiseError::from(other),
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
+    use cgka_traits::app_components::{
+        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
+        GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+        decode_nostr_routing_v1, encode_nostr_routing_v1,
+    };
+    use cgka_traits::engine::CreateGroupRequest;
+    use cgka_traits::transport::TransportMessage;
+    use cgka_traits::types::MessageId;
+    use nostr_blossom::bud02::BlobDescriptor;
+    use nostr_sdk::prelude::Url;
+    use nostr_sdk::prelude::hashes::Hash as _;
+    use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
+    use nostr_sdk::{Keys, Kind, PublicKey, RelayUrl, Timestamp};
+
     use super::*;
+    use crate::marmot::publish::{MarmotMessagePublisher, MarmotPublishOutcome};
+    use crate::marmot::session::PublishWork;
+    use crate::marmot::{
+        GroupConfig, GroupDataUpdate, MarmotCreatedGroupProjection, Secret, group_types,
+    };
     use crate::whitenoise::Whitenoise;
     use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::database::media_files::MediaFile;
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
+    use crate::whitenoise::media_processing::MediaProcessingOptions;
+    use crate::whitenoise::message_aggregator::DeliveryStatus;
     use crate::whitenoise::test_utils::*;
-    use mdk_core::media_processing::MediaProcessingOptions;
-    use mdk_storage_traits::Secret;
-    use nostr_blossom::bud02::BlobDescriptor;
-    use nostr_sdk::FromBech32;
-    use nostr_sdk::prelude::Url;
-    use nostr_sdk::prelude::hashes::Hash as _;
-    use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
-    use nostr_sdk::{EventBuilder, Keys, PublicKey, RelayUrl, Timestamp};
 
     fn mock_blossom_url(server: &mockito::Server) -> Url {
         let socket_address = server.socket_address();
@@ -296,41 +426,1068 @@ mod tests {
         }
     }
 
-    async fn create_native_mdk_group_for_testing(
+    async fn create_darkmatter_group_for_testing(
         whitenoise: &Whitenoise,
     ) -> (Account, group_types::Group) {
         let creator_account = whitenoise.create_identity().await.unwrap();
-        let member_account = whitenoise.create_identity().await.unwrap();
-
-        let member_nsec = whitenoise
-            .export_account_nsec(&member_account)
+        let members = setup_multiple_test_accounts(whitenoise, 1).await;
+        let member_pubkeys = vec![members[0].0.pubkey];
+        let config = create_group_config(vec![creator_account.pubkey]);
+        let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(member_pubkeys, config, None)
             .await
             .unwrap();
-        let member_secret = nostr_sdk::SecretKey::from_bech32(&member_nsec).unwrap();
-        let member_keys = Keys::new(member_secret);
-
-        let member_mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let key_package_relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
-        let key_package_data = member_mdk
-            .create_key_package_for_event(&member_account.pubkey, key_package_relays)
-            .unwrap();
-        let key_package_event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &key_package_data.content)
-            .tags(key_package_data.tags_30443)
-            .sign_with_keys(&member_keys)
-            .unwrap();
-
-        let creator_mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
-        let group = creator_mdk
-            .create_group(&creator_account.pubkey, vec![key_package_event], config)
-            .unwrap()
-            .group;
 
         (creator_account, group)
+    }
+
+    #[tokio::test]
+    async fn test_project_created_marmot_group_records() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let member_key_package = {
+            let member_marmot = member_session.marmot.as_ref().unwrap().clone();
+            let mut member_marmot = member_marmot.lock().await;
+            key_package_with_source_event_id(member_marmot.fresh_key_package().await.unwrap(), 0xA1)
+        };
+        let creator_marmot = creator_session.marmot.as_ref().unwrap().clone();
+
+        let created = {
+            let mut creator_marmot = creator_marmot.lock().await;
+            let created = creator_marmot
+                .create_group(CreateGroupRequest {
+                    name: "".to_string(),
+                    description: "darkmatter direct message".to_string(),
+                    members: vec![member_key_package],
+                    required_features: Vec::new(),
+                    app_components: vec![nostr_routing_component_for_testing()],
+                    initial_admins: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+                panic!("Darkmatter group creation should produce GroupCreated publish work");
+            };
+            creator_marmot.confirm_published(*pending).await.unwrap();
+            created
+        };
+
+        let projection = {
+            let creator_marmot = creator_marmot.lock().await;
+            creator_marmot
+                .created_group_projection(&created.group_id)
+                .unwrap()
+        };
+        let projected_group_id = creator_session
+            .groups()
+            .project_created_marmot_group(&projection, &[member_account.pubkey], None)
+            .await
+            .unwrap();
+
+        assert_eq!(projected_group_id.as_slice(), created.group_id.as_slice());
+
+        let group_info = GroupInformation::find_by_mls_group_id(
+            &projected_group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(group_info.mls_group_id, projected_group_id);
+        assert_eq!(group_info.group_type, GroupType::DirectMessage);
+
+        let account_group = AccountGroup::find_by_account_and_group(
+            &creator_account.pubkey,
+            &projected_group_id,
+            &creator_session.account_db.inner.pool,
+        )
+        .await
+        .unwrap()
+        .expect("projected account group");
+        assert!(account_group.is_accepted());
+        assert_eq!(account_group.dm_peer_pubkey, Some(member_account.pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_projected_marmot_group_is_readable_through_group_ops() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let member_key_package = {
+            let member_marmot = member_session.marmot.as_ref().unwrap().clone();
+            let mut member_marmot = member_marmot.lock().await;
+            key_package_with_source_event_id(member_marmot.fresh_key_package().await.unwrap(), 0xA2)
+        };
+        let creator_marmot = creator_session.marmot.as_ref().unwrap().clone();
+
+        let created = {
+            let mut creator_marmot = creator_marmot.lock().await;
+            let created = creator_marmot
+                .create_group(CreateGroupRequest {
+                    name: "readable marmot group".to_string(),
+                    description: "projected into existing group reads".to_string(),
+                    members: vec![member_key_package],
+                    required_features: Vec::new(),
+                    app_components: vec![nostr_routing_component_for_testing()],
+                    initial_admins: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+                panic!("Darkmatter group creation should produce GroupCreated publish work");
+            };
+            creator_marmot.confirm_published(*pending).await.unwrap();
+            created
+        };
+
+        let projection = {
+            let creator_marmot = creator_marmot.lock().await;
+            creator_marmot
+                .created_group_projection(&created.group_id)
+                .unwrap()
+        };
+        let projected_group_id = creator_session
+            .groups()
+            .project_created_marmot_group(&projection, &[member_account.pubkey], None)
+            .await
+            .unwrap();
+
+        let group = creator_session.groups().get(&projected_group_id).unwrap();
+        assert_eq!(group.mls_group_id, projected_group_id);
+        assert_eq!(group.name, "readable marmot group");
+        assert_eq!(group.description, "projected into existing group reads");
+        assert_eq!(group.nostr_group_id, [0xA7; 32]);
+        assert_eq!(group.state, group_types::GroupState::Active);
+        assert!(group.admin_pubkeys.contains(&creator_account.pubkey));
+
+        let all_groups = creator_session.groups().all(true).unwrap();
+        assert!(
+            all_groups
+                .iter()
+                .any(|group| group.mls_group_id == projected_group_id)
+        );
+
+        let visible_groups = creator_session.groups().visible().await.unwrap();
+        assert!(
+            visible_groups
+                .iter()
+                .any(|group| group.group.mls_group_id == projected_group_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_marmot_member_key_package_uses_darkmatter_v2_event() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let resolved = creator_session
+            .groups()
+            .resolve_marmot_member_key_package(&member_account.pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.user.pubkey, member_account.pubkey);
+        assert_eq!(resolved.event.kind, MLS_KEY_PACKAGE_KIND);
+        assert_eq!(resolved.event.pubkey, member_account.pubkey);
+
+        let metadata = cgka_engine::key_package_metadata(&resolved.key_package).unwrap();
+        assert_eq!(
+            metadata.credential_identity_hex,
+            member_account.pubkey.to_hex()
+        );
+
+        let source = resolved
+            .key_package
+            .source
+            .as_ref()
+            .expect("resolved key package should preserve source event id");
+        let event_id_bytes = resolved.event.id.to_bytes();
+        assert_eq!(source.event_id.as_slice(), event_id_bytes.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_marmot_group_creation_maps_public_config() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "mapped group".to_string(),
+            "mapped description".to_string(),
+            None,
+            None,
+            None,
+            vec![
+                RelayUrl::parse("wss://relay-b.example").unwrap(),
+                RelayUrl::parse("wss://relay-a.example").unwrap(),
+                RelayUrl::parse("wss://relay-a.example").unwrap(),
+            ],
+            vec![creator_account.pubkey, member_account.pubkey],
+            Some(3_600),
+        );
+
+        let plan = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .prepare_marmot_group_creation_with_nostr_group_id(
+                vec![member_account.pubkey],
+                config,
+                [0x42; 32],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plan.request.name, "mapped group");
+        assert_eq!(plan.request.description, "mapped description");
+        assert_eq!(plan.request.members.len(), 1);
+        assert_eq!(
+            plan.request.initial_admins,
+            vec![cgka_traits::types::MemberId::new(
+                member_account.pubkey.as_bytes().to_vec()
+            )]
+        );
+        assert_eq!(plan.resolved_members.len(), 1);
+        assert_eq!(plan.resolved_members[0].user.pubkey, member_account.pubkey);
+
+        let routing = plan
+            .request
+            .app_components
+            .iter()
+            .find(|component| component.component_id == NOSTR_ROUTING_COMPONENT_ID)
+            .map(|component| decode_nostr_routing_v1(&component.data).unwrap())
+            .expect("Nostr routing component");
+        assert_eq!(routing.nostr_group_id, [0x42; 32]);
+        assert_eq!(
+            routing.relays,
+            vec![
+                "wss://relay-a.example".to_string(),
+                "wss://relay-b.example".to_string(),
+            ]
+        );
+        assert_eq!(plan.routing, routing);
+
+        let retention = plan
+            .request
+            .app_components
+            .iter()
+            .find(|component| component.component_id == GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .expect("message retention component");
+        assert_eq!(retention.data, 3_600_u64.to_be_bytes().to_vec());
+
+        let agent_text_stream = plan
+            .request
+            .app_components
+            .iter()
+            .find(|component| component.component_id == AGENT_TEXT_STREAM_QUIC_COMPONENT_ID)
+            .expect("agent text stream component");
+        let policy =
+            AgentTextStreamQuicPolicyV1::decode_component_state(&agent_text_stream.data).unwrap();
+        assert_eq!(policy, AgentTextStreamQuicPolicyV1::user_to_agent_default());
+    }
+
+    fn key_package_with_source_event_id(
+        key_package: cgka_traits::engine::KeyPackage,
+        marker: u8,
+    ) -> cgka_traits::engine::KeyPackage {
+        cgka_traits::engine::KeyPackage::with_source_event_id(
+            key_package.bytes().to_vec(),
+            MessageId::new(vec![marker; 32]),
+        )
+    }
+
+    fn nostr_routing_component_for_testing() -> AppComponentData {
+        AppComponentData {
+            component_id: NOSTR_ROUTING_COMPONENT_ID,
+            data: encode_nostr_routing_v1(
+                &NostrRoutingV1::new([0xA7; 32], vec!["wss://group.example".to_string()]).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn unprojected_group_id(marker: u8) -> GroupId {
+        GroupId::from_slice(&[marker; 32])
+    }
+
+    async fn insert_account_fixture(whitenoise: &Whitenoise) -> Account {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        insert_test_account(&whitenoise.shared.database, &pubkey).await;
+        Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
+            .await
+            .unwrap()
+    }
+
+    async fn insert_projected_session_without_marmot(
+        whitenoise: &Arc<Whitenoise>,
+        account: &Account,
+        group_marker: u8,
+    ) -> GroupId {
+        let session_without_marmot = Arc::new(
+            crate::whitenoise::session::AccountSession::new(
+                account.pubkey,
+                whitenoise.shared.clone(),
+                Arc::downgrade(whitenoise),
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(session_without_marmot.marmot.is_none());
+
+        let marmot_group_id = cgka_traits::types::GroupId::new(vec![group_marker; 32]);
+        let group_id = GroupId::from(&marmot_group_id);
+        session_without_marmot
+            .marmot_storage
+            .put_group_projection(&MarmotCreatedGroupProjection {
+                group_id: marmot_group_id,
+                name: "projected group".to_string(),
+                description: "projected without live Marmot session".to_string(),
+                epoch: 1,
+                routing: NostrRoutingV1::new(
+                    [group_marker; 32],
+                    vec!["wss://projected-capabilities.example".to_string()],
+                )
+                .unwrap(),
+                admin_pubkeys: BTreeSet::from([account.pubkey]),
+                member_pubkeys: BTreeSet::from([account.pubkey]),
+                self_update_completed_at_secs: 1,
+                disappearing_message_secs: None,
+            })
+            .unwrap();
+
+        whitenoise
+            .account_manager
+            .insert_session(session_without_marmot);
+
+        group_id
+    }
+
+    #[tokio::test]
+    async fn test_group_required_proposals_missing_group_does_not_create_obsolete_mls_storage() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[0xA9; 32]);
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let result = whitenoise
+            .group_required_proposals(&account, &group_id)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_projected_group_without_marmot_does_not_create_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = insert_account_fixture(&whitenoise).await;
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let group_id = insert_projected_session_without_marmot(&whitenoise, &account, 0xAB).await;
+
+        let result = whitenoise
+            .group_required_proposals(&account, &group_id)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MarmotSessionUnavailable(pubkey)) if pubkey == account.pubkey
+        ));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_projected_group_without_session_does_not_create_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = insert_account_fixture(&whitenoise).await;
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let group_id = insert_projected_session_without_marmot(&whitenoise, &account, 0xAD).await;
+        whitenoise.account_manager.remove_session(&account.pubkey);
+        assert!(whitenoise.session(&account.pubkey).is_none());
+
+        let result = whitenoise
+            .group_required_proposals(&account, &group_id)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MarmotSessionUnavailable(pubkey)) if pubkey == account.pubkey
+        ));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_unprojected_group_returns_group_not_found() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xAF);
+
+        let result = whitenoise
+            .group_required_proposals(&account, &group_id)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_group_capability_upgrade_status_missing_group_does_not_create_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[0xAA; 32]);
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let result = whitenoise
+            .group_capability_upgrade_status(&account, &group_id)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn group_capability_upgrade_status_projected_group_without_marmot_does_not_create_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = insert_account_fixture(&whitenoise).await;
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let group_id = insert_projected_session_without_marmot(&whitenoise, &account, 0xAC).await;
+
+        let result = whitenoise
+            .group_capability_upgrade_status(&account, &group_id)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MarmotSessionUnavailable(pubkey)) if pubkey == account.pubkey
+        ));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn group_capability_upgrade_status_projected_group_without_session_does_not_create_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = insert_account_fixture(&whitenoise).await;
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let group_id = insert_projected_session_without_marmot(&whitenoise, &account, 0xAE).await;
+        whitenoise.account_manager.remove_session(&account.pubkey);
+        assert!(whitenoise.session(&account.pubkey).is_none());
+
+        let result = whitenoise
+            .group_capability_upgrade_status(&account, &group_id)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MarmotSessionUnavailable(pubkey)) if pubkey == account.pubkey
+        ));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[derive(Clone)]
+    struct RecordingMarmotPublisher {
+        published: Arc<AtomicUsize>,
+    }
+
+    impl RecordingMarmotPublisher {
+        fn new() -> Self {
+            Self {
+                published: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn published_count(&self) -> usize {
+            self.published.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MarmotMessagePublisher for RecordingMarmotPublisher {
+        async fn publish(&self, _message: TransportMessage) -> MarmotPublishOutcome {
+            self.published.fetch_add(1, Ordering::SeqCst);
+            MarmotPublishOutcome::Published { accepted_count: 1 }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_marmot_group_with_publisher_confirms_and_projects_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "created by marmot".to_string(),
+            "published and projected through GroupOps".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://group-create.example").unwrap()],
+            vec![creator_account.pubkey],
+            Some(60),
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            publisher.published_count() > 0,
+            "Darkmatter group creation should publish welcome transport messages"
+        );
+        assert_eq!(group.name, "created by marmot");
+        assert_eq!(
+            group.description,
+            "published and projected through GroupOps"
+        );
+        assert_eq!(group.disappearing_message_secs, Some(60));
+        assert_eq!(group.state, group_types::GroupState::Active);
+        assert!(group.admin_pubkeys.contains(&creator_account.pubkey));
+
+        let members = creator_session
+            .groups()
+            .members(&group.mls_group_id)
+            .unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&creator_account.pubkey));
+        assert!(members.contains(&member_account.pubkey));
+
+        let relays = creator_session
+            .groups()
+            .relays(&group.mls_group_id)
+            .unwrap();
+        assert_eq!(
+            relays,
+            BTreeSet::from([RelayUrl::parse("wss://group-create.example").unwrap()])
+        );
+
+        let visible_groups = creator_session.groups().visible().await.unwrap();
+        assert!(
+            visible_groups
+                .iter()
+                .any(|visible| visible.group.mls_group_id == group.mls_group_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marmot_group_member_mutations_update_group_reads() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let initial_member = whitenoise.create_identity().await.unwrap();
+        let added_member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&initial_member, &added_member]).await;
+
+        let config = GroupConfig::new(
+            "mutable marmot group".to_string(),
+            "membership changes stay in Darkmatter projection".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://group-members.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![initial_member.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        creator_session
+            .groups()
+            .add_marmot_members_with_publisher(
+                &group.mls_group_id,
+                vec![added_member.pubkey],
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let members_after_add = creator_session
+            .groups()
+            .members(&group.mls_group_id)
+            .unwrap();
+        assert_eq!(members_after_add.len(), 3);
+        assert!(members_after_add.contains(&creator_account.pubkey));
+        assert!(members_after_add.contains(&initial_member.pubkey));
+        assert!(members_after_add.contains(&added_member.pubkey));
+
+        creator_session
+            .groups()
+            .remove_marmot_members_with_publisher(
+                &group.mls_group_id,
+                vec![initial_member.pubkey],
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let members_after_remove = creator_session
+            .groups()
+            .members(&group.mls_group_id)
+            .unwrap();
+        assert_eq!(members_after_remove.len(), 2);
+        assert!(members_after_remove.contains(&creator_account.pubkey));
+        assert!(members_after_remove.contains(&added_member.pubkey));
+        assert!(!members_after_remove.contains(&initial_member.pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_marmot_group_data_update_refreshes_group_reads() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "original marmot group".to_string(),
+            "original description".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://old-group.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let update = GroupDataUpdate::new()
+            .name("updated marmot group")
+            .description("updated description")
+            .relays(vec![
+                RelayUrl::parse("wss://updated-b.example").unwrap(),
+                RelayUrl::parse("wss://updated-a.example").unwrap(),
+            ])
+            .admins(vec![creator_account.pubkey, member_account.pubkey])
+            .disappearing_message_secs(Some(600));
+
+        creator_session
+            .groups()
+            .update_marmot_group_data_with_publisher(&group.mls_group_id, update, &publisher)
+            .await
+            .unwrap();
+
+        let updated = creator_session.groups().get(&group.mls_group_id).unwrap();
+        assert_eq!(updated.name, "updated marmot group");
+        assert_eq!(updated.description, "updated description");
+        assert_eq!(updated.disappearing_message_secs, Some(600));
+        assert!(updated.admin_pubkeys.contains(&creator_account.pubkey));
+        assert!(updated.admin_pubkeys.contains(&member_account.pubkey));
+
+        let relays = creator_session
+            .groups()
+            .relays(&group.mls_group_id)
+            .unwrap();
+        assert_eq!(
+            relays,
+            BTreeSet::from([
+                RelayUrl::parse("wss://updated-a.example").unwrap(),
+                RelayUrl::parse("wss://updated-b.example").unwrap(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marmot_self_demote_refreshes_admin_projection() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "self demote marmot group".to_string(),
+            "admin policy changes stay in Darkmatter projection".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://self-demote.example").unwrap()],
+            vec![creator_account.pubkey, member_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        creator_session
+            .groups()
+            .self_demote_marmot_with_publisher(&group.mls_group_id, &publisher)
+            .await
+            .unwrap();
+
+        let updated = creator_session.groups().get(&group.mls_group_id).unwrap();
+        assert!(!updated.admin_pubkeys.contains(&creator_account.pubkey));
+        assert!(updated.admin_pubkeys.contains(&member_account.pubkey));
+        assert_eq!(updated.admin_pubkeys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_marmot_leave_marks_account_group_as_self_removed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "leave marmot group".to_string(),
+            "SelfRemove proposals update local membership projection".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://leave.example").unwrap()],
+            vec![creator_account.pubkey, member_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        creator_session
+            .groups()
+            .self_demote_marmot_with_publisher(&group.mls_group_id, &publisher)
+            .await
+            .unwrap();
+
+        creator_session
+            .groups()
+            .leave_marmot_group_with_publisher(&group.mls_group_id, &publisher)
+            .await
+            .unwrap();
+
+        let account_group = AccountGroup::find_by_account_and_group(
+            &creator_account.pubkey,
+            &group.mls_group_id,
+            &creator_session.account_db.inner.pool,
+        )
+        .await
+        .unwrap()
+        .expect("creator account group should still be visible after leaving");
+        assert!(account_group.is_removed());
+        assert!(account_group.self_removed);
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_returns_self_remove_for_marmot_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "required proposals marmot group".to_string(),
+            "required proposals read from Darkmatter state".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://required-proposals.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let required = whitenoise
+            .group_required_proposals(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(required, BTreeSet::from([RequiredProposal::SelfRemove]));
+    }
+
+    #[tokio::test]
+    async fn group_capability_upgrade_status_reports_self_remove_for_marmot_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "capability status marmot group".to_string(),
+            "capability status read from Darkmatter state".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://capability-status.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let status = whitenoise
+            .group_capability_upgrade_status(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status.per_proposal,
+            vec![RequiredProposalUpgradeStatus {
+                proposal: RequiredProposal::SelfRemove,
+                state: RequiredProposalUpgradability::AlreadyRequired,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_group_required_proposals_is_idempotent_for_marmot_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "capability upgrade marmot group".to_string(),
+            "capability upgrade reads from Darkmatter state".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://capability-upgrade.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        whitenoise
+            .upgrade_group_required_proposals(
+                &creator_account,
+                &group.mls_group_id,
+                BTreeSet::from([RequiredProposal::SelfRemove]),
+            )
+            .await
+            .unwrap();
+
+        let required = whitenoise
+            .group_required_proposals(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(required, BTreeSet::from([RequiredProposal::SelfRemove]));
+    }
+
+    #[tokio::test]
+    async fn upgrade_group_required_proposals_projected_group_without_marmot_does_not_create_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "projected group without runtime".to_string(),
+            "capability upgrade must not fall back to new obsolete MLS storage".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://capability-upgrade.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher::new(),
+            )
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&creator_account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let session_without_marmot = Arc::new(
+            crate::whitenoise::session::AccountSession::new(
+                creator_account.pubkey,
+                whitenoise.shared.clone(),
+                Arc::downgrade(&whitenoise),
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(session_without_marmot.marmot.is_none());
+        assert!(
+            session_without_marmot
+                .groups()
+                .get(&group.mls_group_id)
+                .is_ok()
+        );
+        whitenoise
+            .account_manager
+            .insert_session(session_without_marmot);
+
+        let err = whitenoise
+            .upgrade_group_required_proposals(
+                &creator_account,
+                &group.mls_group_id,
+                BTreeSet::from([RequiredProposal::SelfRemove]),
+            )
+            .await
+            .expect_err("projected group without Marmot runtime must not create legacy MLS");
+
+        assert!(matches!(
+            err,
+            WhitenoiseError::MarmotSessionUnavailable(pubkey)
+                if pubkey == creator_account.pubkey
+        ));
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_to_marmot_group_uses_darkmatter_projection() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = GroupConfig::new(
+            "message group".to_string(),
+            "darkmatter-backed outgoing message".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://group-message.example").unwrap()],
+            vec![creator_account.pubkey],
+            None,
+        );
+        let publisher = RecordingMarmotPublisher::new();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member_account.pubkey],
+                config,
+                None,
+                &publisher,
+            )
+            .await
+            .unwrap();
+
+        let sent = creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .send("hello through darkmatter".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        assert_eq!(sent.message.message.content, "hello through darkmatter");
+        assert_eq!(sent.message.message.mls_group_id, group.mls_group_id);
+        assert_eq!(sent.message.message.pubkey, creator_account.pubkey);
+        assert_eq!(sent.message.message.kind, Kind::from(9));
+        assert!(!sent.last_message_deleted);
+
+        let cached = creator_session
+            .messages()
+            .for_group(&group.mls_group_id)
+            .fetch_by_id(&sent.message.message.id.to_hex())
+            .await
+            .unwrap()
+            .expect("sent message should be cached optimistically");
+        assert_eq!(cached.content, "hello through darkmatter");
+        assert_eq!(cached.delivery_status, Some(DeliveryStatus::Sending));
     }
 
     #[tokio::test]
@@ -405,7 +1562,7 @@ mod tests {
         member_pubkeys: Vec<PublicKey>,
         admin_pubkeys: Vec<PublicKey>,
     ) {
-        let config = create_nostr_group_config_data(admin_pubkeys.clone());
+        let config = create_group_config(admin_pubkeys.clone());
         // Create the group
         let result = whitenoise
             .require_session(&creator_account.pubkey)
@@ -512,7 +1669,7 @@ mod tests {
         member_pubkeys: Vec<PublicKey>,
         admin_pubkeys: Vec<PublicKey>,
     ) {
-        let config = create_nostr_group_config_data(admin_pubkeys.clone());
+        let config = create_group_config(admin_pubkeys.clone());
         let result = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -520,14 +1677,14 @@ mod tests {
             .create_group(member_pubkeys, config.clone(), None)
             .await;
 
-        // Should fail because groups need at least one admin
+        // Should fail because creator must be included in the admin set.
         assert!(result.is_err());
         match result.unwrap_err() {
-            WhitenoiseError::MdkCoreError(_) => {
-                // Expected - invalid group configuration
+            WhitenoiseError::InvalidInput(message) => {
+                assert_eq!(message, "creator must be an admin");
             }
             other => panic!(
-                "Expected NostrMlsError due to empty admin list, got: {:?}",
+                "Expected InvalidInput for empty admin list, got: {:?}",
                 other
             ),
         }
@@ -540,7 +1697,7 @@ mod tests {
         member_pubkeys: Vec<PublicKey>,
         admin_pubkeys: Vec<PublicKey>,
     ) {
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let result = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -559,7 +1716,7 @@ mod tests {
         member_pubkeys: Vec<PublicKey>,
         admin_pubkeys: Vec<PublicKey>,
     ) {
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let result = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -570,14 +1727,13 @@ mod tests {
         // Should fail because admin must be a member
         assert!(result.is_err());
         match result.unwrap_err() {
-            WhitenoiseError::MdkCoreError(mdk_core::Error::Group(msg)) => {
-                assert!(
-                    msg.contains("Admin must be a member"),
-                    "Expected 'Admin must be a member' error, got: {}",
-                    msg
-                );
+            WhitenoiseError::InvalidInput(message) => {
+                assert_eq!(message, "admin must be a member");
             }
-            other => panic!("Expected NostrMlsError::Group, got: {:?}", other),
+            other => panic!(
+                "Expected InvalidInput for invalid admin pubkey, got: {:?}",
+                other
+            ),
         }
     }
 
@@ -599,7 +1755,7 @@ mod tests {
             "Direct message group should have 2 admins (both participants)"
         );
 
-        let mut config = create_nostr_group_config_data(admin_pubkeys.clone());
+        let mut config = create_group_config(admin_pubkeys.clone());
         config.name = "".to_string();
         let result = whitenoise
             .require_session(&creator_account.pubkey)
@@ -676,7 +1832,7 @@ mod tests {
 
         // Create group with initial members
         let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys.clone());
+        let config = create_group_config(admin_pubkeys.clone());
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -768,7 +1924,7 @@ mod tests {
 
         // Create group
         let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys.clone());
+        let config = create_group_config(admin_pubkeys.clone());
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -778,12 +1934,12 @@ mod tests {
             .unwrap();
 
         // Update group data
-        let new_group_data = NostrGroupDataUpdate {
+        let new_group_data = GroupDataUpdate {
             name: Some("Updated Group Name".to_string()),
             description: Some("Updated description".to_string()),
-            image_hash: Some(Some([3u8; 32])), // 32-byte hash for new image
-            image_key: Some(Some([4u8; 32])),  // 32-byte encryption key
-            image_nonce: Some(Some([5u8; 12])), // 12-byte nonce
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
             image_upload_key: None,
             admins: None,
             relays: None,
@@ -820,11 +1976,29 @@ mod tests {
             updated_group.description,
             new_group_data.description.unwrap()
         );
-        assert_eq!(updated_group.image_hash, new_group_data.image_hash.unwrap());
-        assert_eq!(
-            updated_group.image_key,
-            new_group_data.image_key.unwrap().map(Secret::new)
-        );
+        assert_eq!(updated_group.image_hash, None);
+        assert_eq!(updated_group.image_key, None);
+
+        let unsupported_image_update = GroupDataUpdate {
+            name: None,
+            description: None,
+            image_hash: Some(Some([3u8; 32])),
+            image_key: Some(Some([4u8; 32])),
+            image_nonce: Some(Some([5u8; 12])),
+            image_upload_key: None,
+            admins: None,
+            relays: None,
+            nostr_group_id: None,
+            disappearing_message_secs: None,
+        };
+        let err = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .update_group_data(&group.mls_group_id, unsupported_image_update)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WhitenoiseError::InvalidInput(_)));
     }
 
     #[tokio::test]
@@ -836,7 +2010,7 @@ mod tests {
         let new_admin_pubkey = members[0].0.pubkey;
         let other_member_pubkey = members[1].0.pubkey;
 
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let config = create_group_config(vec![creator_account.pubkey]);
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -845,7 +2019,7 @@ mod tests {
             .await
             .unwrap();
 
-        let transfer_admin_rights_update = NostrGroupDataUpdate {
+        let transfer_admin_rights_update = GroupDataUpdate {
             name: None,
             description: None,
             image_hash: None,
@@ -896,7 +2070,7 @@ mod tests {
             remove_members_result
         );
 
-        let update = NostrGroupDataUpdate {
+        let update = GroupDataUpdate {
             name: Some("Updated Name".to_string()),
             description: None,
             image_hash: None,
@@ -1170,7 +2344,7 @@ mod tests {
 
         // Create a group
         let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let _group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -1210,18 +2384,18 @@ mod tests {
         // All groups should be in a valid state (exact verification depends on state enum implementation)
     }
 
-    /// Helper to create an MDK group directly without auto-accepting the AccountGroup.
+    /// Helper to create a group without keeping the auto-accepted AccountGroup.
     /// This allows tests to manually control the AccountGroup state.
     ///
     /// Uses `whitenoise.create_group()` internally but deletes the auto-created
     /// AccountGroup record so tests can create it fresh with the desired state.
-    async fn create_mdk_group_without_auto_accept(
+    async fn create_group_without_auto_accept(
         whitenoise: &Whitenoise,
         account: &Account,
         member_pubkeys: Vec<PublicKey>,
     ) -> group_types::Group {
         // Create group normally (this auto-accepts)
-        let config = create_nostr_group_config_data(vec![account.pubkey]);
+        let config = create_group_config(vec![account.pubkey]);
         let group = whitenoise
             .require_session(&account.pubkey)
             .unwrap()
@@ -1248,15 +2422,13 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkeys = vec![members[0].0.pubkey];
 
-        // Create 3 MDK groups directly, deleting the auto-accepted AccountGroup
+        // Create 3 groups, deleting the auto-accepted AccountGroup
         let group_accepted =
-            create_mdk_group_without_auto_accept(&whitenoise, &account, member_pubkeys.clone())
-                .await;
+            create_group_without_auto_accept(&whitenoise, &account, member_pubkeys.clone()).await;
         let group_pending =
-            create_mdk_group_without_auto_accept(&whitenoise, &account, member_pubkeys.clone())
-                .await;
+            create_group_without_auto_accept(&whitenoise, &account, member_pubkeys.clone()).await;
         let group_declined =
-            create_mdk_group_without_auto_accept(&whitenoise, &account, member_pubkeys).await;
+            create_group_without_auto_accept(&whitenoise, &account, member_pubkeys).await;
 
         // Manually create AccountGroup records with different states:
         // - group_accepted: user_confirmation = Some(true)
@@ -1330,15 +2502,14 @@ mod tests {
             .groups()
             .create_group(
                 vec![members[0].0.pubkey],
-                create_nostr_group_config_data(vec![account.pubkey]),
+                create_group_config(vec![account.pubkey]),
                 None,
             )
             .await
             .unwrap();
 
         // DM group (empty name → GroupType::DirectMessage)
-        let mut dm_config =
-            create_nostr_group_config_data(vec![account.pubkey, members[1].0.pubkey]);
+        let mut dm_config = create_group_config(vec![account.pubkey, members[1].0.pubkey]);
         dm_config.name = "".to_string();
         let dm_group = whitenoise
             .require_session(&account.pubkey)
@@ -1374,16 +2545,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_visible_groups_with_info_repairs_darkmatter_group_information_without_obsolete_mls_storage()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+        let artifacts = remove_obsolete_mls_artifacts(&creator, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        let creator_session = whitenoise.require_session(&creator.pubkey).unwrap();
+        let config = GroupConfig::new(
+            "darkmatter visible with info".to_string(),
+            "visible_with_info projection repair".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("ws://localhost:7777").unwrap()],
+            vec![creator.pubkey],
+            None,
+        );
+        let group = creator_session
+            .groups()
+            .create_marmot_group_with_publisher(
+                vec![member.pubkey],
+                config,
+                None,
+                &RecordingMarmotPublisher::new(),
+            )
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
+            .bind(group.mls_group_id.as_slice())
+            .execute(&whitenoise.shared.database.pool)
+            .await
+            .unwrap();
+
+        let with_info = creator_session.groups().visible_with_info().await.unwrap();
+
+        assert_eq!(with_info.len(), 1);
+        assert_eq!(with_info[0].group.mls_group_id, group.mls_group_id);
+        assert_eq!(with_info[0].info.group_type, GroupType::Group);
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
     async fn test_visible_groups_with_info_excludes_declined() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 2).await;
 
         let group_accepted =
-            create_mdk_group_without_auto_accept(&whitenoise, &account, vec![members[0].0.pubkey])
+            create_group_without_auto_accept(&whitenoise, &account, vec![members[0].0.pubkey])
                 .await;
         let group_declined =
-            create_mdk_group_without_auto_accept(&whitenoise, &account, vec![members[1].0.pubkey])
+            create_group_without_auto_accept(&whitenoise, &account, vec![members[1].0.pubkey])
                 .await;
 
         let (ag_accepted, _) = whitenoise
@@ -1433,14 +2650,13 @@ mod tests {
             .groups()
             .create_group(
                 vec![members[0].0.pubkey],
-                create_nostr_group_config_data(vec![account.pubkey]),
+                create_group_config(vec![account.pubkey]),
                 None,
             )
             .await
             .unwrap();
 
-        let mut dm_config =
-            create_nostr_group_config_data(vec![account.pubkey, members[1].0.pubkey]);
+        let mut dm_config = create_group_config(vec![account.pubkey, members[1].0.pubkey]);
         dm_config.name = "".to_string();
         let _dm = whitenoise
             .require_session(&account.pubkey)
@@ -1478,7 +2694,7 @@ mod tests {
 
         // Create a group
         let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys.clone());
+        let config = create_group_config(admin_pubkeys.clone());
         let created_group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -1538,7 +2754,7 @@ mod tests {
 
         // Create group with creator and members as admins (so they can process the leave proposal)
         let admin_pubkeys = vec![creator_account.pubkey, member_pubkeys[0]];
-        let config = create_nostr_group_config_data(admin_pubkeys);
+        let config = create_group_config(admin_pubkeys);
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -1602,7 +2818,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upload_group_image() {
+    async fn test_upload_group_image_rejects_unprojected_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xE1);
+
+        let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .upload_group_image(&group_id, "/does/not/exist.png", None, None)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_get_group_image_path_rejects_unprojected_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xE2);
+
+        let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .get_group_image_path(&group_id)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_sync_group_image_cache_rejects_unprojected_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xE3);
+
+        let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .sync_group_image_cache_if_needed(&group_id)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_upload_chat_media_rejects_unprojected_group_before_file_io() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xE4);
+
+        let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .upload_chat_media(&group_id, "/does/not/exist.png", None, None)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_download_chat_media_rejects_unprojected_group_without_obsolete_mls_decrypt() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xE5);
+        let original_file_hash = [0x42; 32];
+
+        let result = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .download_chat_media(&group_id, &original_file_hash)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_darkmatter_group_media_boundary() {
         use tempfile::NamedTempFile;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -1623,110 +2925,88 @@ mod tests {
             })
             .create_async()
             .await;
+        let (creator_account, group) = create_darkmatter_group_for_testing(&whitenoise).await;
 
-        // Setup creator and member
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkeys = vec![members[0].0.pubkey];
-
-        // Create group with creator as admin
-        let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(member_pubkeys, config, None)
-            .await
-            .unwrap();
-
-        // Create a valid 100x100 PNG image using the image crate
-        // (must be large enough for blurhash generation)
         let img = ::image::RgbaImage::from_pixel(100, 100, ::image::Rgba([255u8, 0, 0, 255]));
         let temp_file = NamedTempFile::new().unwrap();
         img.save_with_format(temp_file.path(), ::image::ImageFormat::Png)
             .unwrap();
         let temp_path = temp_file.path().to_str().unwrap();
 
-        // Read the original image data for later comparison
-        let test_image_data = tokio::fs::read(temp_path).await.unwrap();
-
-        // Use test options to skip blurhash generation (which has issues with small test images)
-        let test_options = MediaProcessingOptions {
-            generate_blurhash: false,
-            ..Default::default()
-        };
-        let result = whitenoise
+        let group_image_error = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
             .groups()
             .media()
-            .upload_group_image(
+            .upload_group_image(&group.mls_group_id, temp_path, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            group_image_error,
+            WhitenoiseError::UnsupportedMarmotOperation(_)
+        ));
+
+        let chat_media = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .upload_chat_media(
                 &group.mls_group_id,
                 temp_path,
                 Some(blossom_url),
-                Some(test_options),
+                Some(MediaProcessingOptions {
+                    generate_blurhash: false,
+                    ..Default::default()
+                }),
             )
-            .await;
-
-        assert!(
-            result.is_ok(),
-            "Failed to upload group image: {:?}",
-            result.unwrap_err()
-        );
-
-        let (hash, key, nonce) = result.unwrap();
-
-        // Verify the returned values are valid
-        assert_ne!(hash, [0u8; 32], "Hash should not be all zeros");
-        assert_ne!(key, [0u8; 32], "Key should not be all zeros");
-        assert_ne!(nonce, [0u8; 12], "Nonce should not be all zeros");
-
-        // Update the group with the new image metadata
-        let update = NostrGroupDataUpdate {
-            name: None,
-            description: None,
-            image_hash: Some(Some(hash)),
-            image_key: Some(Some(key)),
-            image_nonce: Some(Some(nonce)),
-            image_upload_key: None,
-            admins: None,
-            relays: None,
-            nostr_group_id: None,
-            disappearing_message_secs: None,
-        };
-
-        let update_result = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .update_group_data(&group.mls_group_id, update)
-            .await;
-
-        assert!(
-            update_result.is_ok(),
-            "Failed to update group data: {:?}",
-            update_result.unwrap_err()
-        );
-
-        // Verify the group data was updated
-        let updated_groups = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .all(true)
+            .await
             .unwrap();
-        let updated_group = updated_groups
-            .iter()
-            .find(|g| g.mls_group_id == group.mls_group_id)
-            .expect("Updated group not found");
+        assert_eq!(chat_media.media_type, "chat_media");
+        assert_eq!(chat_media.scheme_version.as_deref(), Some("mip04-v2"));
+        assert!(chat_media.original_file_hash.is_some());
+        assert!(chat_media.nonce.is_some());
+        let cached_plaintext = tokio::fs::read(&chat_media.file_path).await.unwrap();
+        let cached_hash = Sha256Hash::hash(&cached_plaintext);
+        assert_eq!(
+            chat_media.original_file_hash.as_deref(),
+            Some(cached_hash.as_ref())
+        );
 
-        assert_eq!(updated_group.image_hash, Some(hash));
-        assert_eq!(updated_group.image_key, Some(Secret::new(key)));
-        assert_eq!(updated_group.image_nonce, Some(Secret::new(nonce)));
+        let image_path = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .get_group_image_path(&group.mls_group_id)
+            .await
+            .unwrap();
+        assert!(image_path.is_none());
+    }
 
-        // Verify the image was cached immediately after upload by retrieving it
-        // (should be instant since it's cached)
+    #[tokio::test]
+    async fn test_sync_group_image_cache_noops_for_darkmatter_group_until_component_exists() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let config = create_group_config(vec![creator_account.pubkey]);
+        let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![members[0].0.pubkey], config, None)
+            .await
+            .unwrap();
+
+        whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .media()
+            .sync_group_image_cache_if_needed(&group.mls_group_id)
+            .await
+            .unwrap();
+
         let cached_path = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -1735,188 +3015,7 @@ mod tests {
             .get_group_image_path(&group.mls_group_id)
             .await
             .unwrap();
-
-        assert!(
-            cached_path.is_some(),
-            "Uploaded image should be cached and retrievable"
-        );
-
-        let cached_path = cached_path.unwrap();
-        assert!(
-            cached_path.exists(),
-            "Cached image file should exist at: {}",
-            cached_path.display()
-        );
-
-        // Verify the cached content matches the original
-        let cached_content = tokio::fs::read(&cached_path).await.unwrap();
-        assert_eq!(
-            cached_content, test_image_data,
-            "Cached image content should match original"
-        );
-
-        // Verify the nostr_key (upload keypair) was stored in the database
-        let session = whitenoise
-            .account_manager
-            .get_session(&creator_account.pubkey)
-            .unwrap();
-        let media_file = crate::whitenoise::database::media_files::MediaFile::find_by_hash(
-            &session.account_db.inner.pool,
-            &whitenoise.shared.database,
-            &creator_account.pubkey,
-            &hash,
-        )
-        .await
-        .unwrap();
-        assert!(media_file.is_some(), "Media file should be in database");
-        assert!(
-            media_file.unwrap().nostr_key.is_some(),
-            "Nostr key should be stored for group images for cleanup"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sync_group_image_cache() {
-        use std::time::Duration;
-        use tempfile::NamedTempFile;
-
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let mut blossom_server = mockito::Server::new_async().await;
-        let blossom_url = mock_blossom_url(&blossom_server);
-        let blossom_url_for_response = blossom_url.clone();
-        let _upload_mock = blossom_server
-            .mock("PUT", "/upload")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body_from_request(move |request| {
-                let descriptor = mock_blob_descriptor(
-                    &blossom_url_for_response,
-                    request.body().unwrap(),
-                    "image/jpeg",
-                );
-                serde_json::to_vec(&descriptor).unwrap()
-            })
-            .create_async()
-            .await;
-
-        // Setup creator and member accounts
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = &members[0].0;
-        let member_pubkeys = vec![member_account.pubkey];
-
-        // Create group with creator as admin
-        let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(member_pubkeys, config, None)
-            .await
-            .unwrap();
-
-        // Create a valid 100x100 JPEG image using the image crate
-        // (must be large enough for blurhash generation)
-        // JPEG does not support an alpha channel, so use RgbImage (Rgb8) rather than RgbaImage.
-        let img = ::image::RgbImage::from_pixel(100, 100, ::image::Rgb([255u8, 0, 0]));
-        let temp_file = NamedTempFile::new().unwrap();
-        img.save_with_format(temp_file.path(), ::image::ImageFormat::Jpeg)
-            .unwrap();
-        let temp_path = temp_file.path().to_str().unwrap();
-
-        // Read the original image data for later comparison
-        let test_image_data = tokio::fs::read(temp_path).await.unwrap();
-
-        // Use test options to skip blurhash generation (which has issues with small test images)
-        let test_options = MediaProcessingOptions {
-            generate_blurhash: false,
-            ..Default::default()
-        };
-        let (hash, key, nonce) = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .media()
-            .upload_group_image(
-                &group.mls_group_id,
-                temp_path,
-                Some(blossom_url),
-                Some(test_options),
-            )
-            .await
-            .unwrap();
-
-        // Update the group data with the image metadata
-        let update = NostrGroupDataUpdate {
-            name: None,
-            description: None,
-            image_hash: Some(Some(hash)),
-            image_key: Some(Some(key)),
-            image_nonce: Some(Some(nonce)),
-            image_upload_key: None,
-            admins: None,
-            relays: None,
-            nostr_group_id: None,
-            disappearing_message_secs: None,
-        };
-
-        whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .update_group_data(&group.mls_group_id, update)
-            .await
-            .unwrap();
-
-        // Give time for the commit to propagate
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Verify the creator can retrieve the cached image
-        let cached_path_opt = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .media()
-            .get_group_image_path(&group.mls_group_id)
-            .await
-            .unwrap();
-
-        assert!(
-            cached_path_opt.is_some(),
-            "Creator should have cached image path"
-        );
-
-        let cached_path = cached_path_opt.unwrap();
-        assert!(
-            cached_path.exists(),
-            "Cached image should exist at: {}",
-            cached_path.display()
-        );
-
-        // Verify the cached content matches the original
-        let cached_content = tokio::fs::read(&cached_path).await.unwrap();
-        assert_eq!(
-            cached_content, test_image_data,
-            "Cached image content should match original"
-        );
-
-        // Verify subsequent access returns the same cached path (instant)
-        let cached_again = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .media()
-            .get_group_image_path(&group.mls_group_id)
-            .await
-            .unwrap();
-
-        assert!(cached_again.is_some());
-        assert_eq!(
-            cached_again.unwrap(),
-            cached_path,
-            "Second retrieval should return same cached path"
-        );
+        assert!(cached_path.is_none());
     }
 
     #[tokio::test]
@@ -1942,22 +3041,7 @@ mod tests {
             .create_async()
             .await;
 
-        // Setup creator and member
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = &members[0].0;
-        let member_pubkeys = vec![member_account.pubkey];
-
-        // Create group
-        let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(member_pubkeys, config, None)
-            .await
-            .unwrap();
+        let (creator_account, group) = create_darkmatter_group_for_testing(&whitenoise).await;
 
         // Create a valid 100x100 PNG image
         let img = ::image::RgbaImage::from_pixel(100, 100, ::image::Rgba([0u8, 255, 0, 255]));
@@ -1989,7 +3073,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Failed to upload chat image as non-admin: {:?}",
+            "Failed to upload chat image as creator: {:?}",
             result.unwrap_err()
         );
 
@@ -2056,20 +3140,7 @@ mod tests {
             .create_async()
             .await;
 
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = &members[0].0;
-        let member_pubkeys = vec![member_account.pubkey];
-
-        let admin_pubkeys = vec![creator_account.pubkey];
-        let config = create_nostr_group_config_data(admin_pubkeys);
-        let group = whitenoise
-            .require_session(&creator_account.pubkey)
-            .unwrap()
-            .groups()
-            .create_group(member_pubkeys, config, None)
-            .await
-            .unwrap();
+        let (creator_account, group) = create_darkmatter_group_for_testing(&whitenoise).await;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let expected_basename = "video_picker_ABC123.mp4";
@@ -2117,7 +3188,7 @@ mod tests {
         );
         assert!(
             metadata.dimensions.is_none(),
-            "minimal MP4 fixture has no parsed dimensions unless MDK adds video support"
+            "minimal MP4 fixture has no parsed dimensions"
         );
 
         let original_hash_bytes: [u8; 32] = media_file
@@ -2169,7 +3240,7 @@ mod tests {
     /// The group is created with real Docker relays (so welcome fan-out
     /// succeeds during `create_group`), then a successful `update_group_data`
     /// swaps the relays to unreachable URLs. After this, any subsequent
-    /// call to `ensure_group_relays` returns the unreachable relays.
+    /// legacy relay lookup returns the unreachable relays.
     async fn create_group_with_unreachable_relays(
         whitenoise: &Whitenoise,
     ) -> (group_types::Group, Account, Vec<(Account, Keys)>) {
@@ -2178,7 +3249,7 @@ mod tests {
         let member_pks = members.iter().map(|(a, _)| a.pubkey).collect::<Vec<_>>();
 
         // Create with real relays so welcome messages succeed
-        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let config = create_group_config(vec![creator.pubkey]);
         let group = whitenoise
             .require_session(&creator.pubkey)
             .unwrap()
@@ -2192,7 +3263,7 @@ mod tests {
             .iter()
             .map(|u| RelayUrl::parse(u).unwrap())
             .collect();
-        let relay_swap = NostrGroupDataUpdate {
+        let relay_swap = GroupDataUpdate {
             name: None,
             description: None,
             image_hash: None,
@@ -2325,7 +3396,7 @@ mod tests {
         // Pause time so backoff sleeps complete instantly; resume before DB reads.
         tokio::time::pause();
         // Call the actual production method — fails at publish
-        let new_data = NostrGroupDataUpdate {
+        let new_data = GroupDataUpdate {
             name: Some("Should Not Appear".to_string()),
             description: Some("This update should not be applied".to_string()),
             image_hash: None,
@@ -2369,7 +3440,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let member_account = whitenoise.create_identity().await.unwrap();
 
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let config = create_group_config(vec![creator_account.pubkey]);
         let group = whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -2401,22 +3472,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_capability_upgrade_status_reports_already_required_for_native_group() {
+    async fn group_capability_upgrade_status_unprojected_group_returns_group_not_found() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (creator_account, group) = create_native_mdk_group_for_testing(&whitenoise).await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xF0);
 
-        let status = whitenoise
-            .group_capability_upgrade_status(&creator_account, &group.mls_group_id)
-            .await
-            .unwrap();
+        let result = whitenoise
+            .group_capability_upgrade_status(&creator_account, &group_id)
+            .await;
 
-        assert_eq!(
-            status.per_proposal,
-            vec![RequiredProposalUpgradeStatus {
-                proposal: RequiredProposal::SelfRemove,
-                state: RequiredProposalUpgradability::AlreadyRequired,
-            }],
-        );
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn upgrade_group_required_proposals_unprojected_group_returns_group_not_found() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let group_id = unprojected_group_id(0xF1);
+
+        let result = whitenoise
+            .upgrade_group_required_proposals(
+                &creator_account,
+                &group_id,
+                BTreeSet::from([RequiredProposal::SelfRemove]),
+            )
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
     }
 
     #[tokio::test]
@@ -2436,7 +3518,17 @@ mod tests {
     #[tokio::test]
     async fn upgrade_group_required_proposals_rejects_unknown_target() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (creator_account, group) = create_native_mdk_group_for_testing(&whitenoise).await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+        let config = create_group_config(vec![creator_account.pubkey]);
+        let group = whitenoise
+            .require_session(&creator_account.pubkey)
+            .unwrap()
+            .groups()
+            .create_group(vec![member_account.pubkey], config, None)
+            .await
+            .unwrap();
 
         let err = whitenoise
             .upgrade_group_required_proposals(
@@ -2462,75 +3554,5 @@ mod tests {
             .expect_err("empty upgrade target must fail before group lookup");
 
         assert!(matches!(err, WhitenoiseError::InvalidInput(_)));
-    }
-
-    #[tokio::test]
-    async fn upgrade_group_required_proposals_is_idempotent_when_already_required() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (creator_account, group) = create_native_mdk_group_for_testing(&whitenoise).await;
-
-        whitenoise
-            .upgrade_group_required_proposals(
-                &creator_account,
-                &group.mls_group_id,
-                BTreeSet::from([RequiredProposal::SelfRemove]),
-            )
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn map_capability_upgrade_empty_set_yields_invalid_input() {
-        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::EmptyUpgradeSet);
-
-        assert!(matches!(mapped, WhitenoiseError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn map_capability_upgrade_unsupported_proposal_yields_invalid_input() {
-        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::ProposalNotInSupportedSet(
-            ProposalType::Add,
-        ));
-
-        assert!(matches!(mapped, WhitenoiseError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn map_capability_upgrade_group_not_found_yields_group_not_found() {
-        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::GroupNotFound);
-
-        assert!(matches!(mapped, WhitenoiseError::GroupNotFound));
-    }
-
-    #[test]
-    fn map_capability_upgrade_not_admin_yields_account_not_authorized() {
-        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::NotAdmin);
-
-        assert!(matches!(mapped, WhitenoiseError::AccountNotAuthorized));
-    }
-
-    #[test]
-    fn map_capability_upgrade_blocked_yields_named_blockers() {
-        let blocker = Keys::generate().public_key();
-        let mapped =
-            map_mdk_capability_upgrade_error(mdk_core::Error::ProposalNotAvailableForUpgrade {
-                proposal: ProposalType::SelfRemove,
-                blockers: vec![blocker],
-            });
-
-        match mapped {
-            WhitenoiseError::CapabilityUpgradeBlocked { proposal, blockers } => {
-                assert_eq!(proposal, RequiredProposal::SelfRemove);
-                assert_eq!(blockers, vec![blocker]);
-            }
-            other => panic!("expected CapabilityUpgradeBlocked, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn map_capability_upgrade_own_leaf_not_found_yields_internal() {
-        let mapped = map_mdk_capability_upgrade_error(mdk_core::Error::OwnLeafNotFound);
-
-        assert!(matches!(mapped, WhitenoiseError::Internal(_)));
     }
 }

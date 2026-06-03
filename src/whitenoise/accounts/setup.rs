@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use mdk_core::prelude::group_types::GroupState;
+use cgka_traits::TransportGroupSubscription;
 use nostr_sdk::prelude::*;
 use tokio::sync::watch;
 
@@ -711,17 +711,24 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Returns the number of active groups in MDK for an account.
+    /// Returns the number of confirmed Darkmatter groups for an account.
     ///
-    /// Cheaper than `extract_group_subscription_specs` — counts without
-    /// fetching per-group relay lists.
-    pub(crate) fn active_group_count(&self, account: &Account) -> Result<usize> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let groups = mdk.get_groups()?;
-        Ok(groups
-            .iter()
-            .filter(|g| g.state == GroupState::Active)
-            .count())
+    /// Cheaper than `extract_group_subscription_specs` because it counts
+    /// confirmed group records without decoding per-group relay components.
+    pub(crate) async fn active_group_count(&self, account: &Account) -> Result<usize> {
+        self.confirmed_marmot_group_count(account).await
+    }
+
+    async fn confirmed_marmot_group_count(&self, account: &Account) -> Result<usize> {
+        let Some(session) = self.account_manager.get_session(&account.pubkey) else {
+            return Ok(0);
+        };
+        let Some(marmot) = &session.marmot else {
+            return Ok(0);
+        };
+
+        let marmot = marmot.lock().await;
+        marmot.confirmed_group_count()
     }
 
     /// Extract per-group relay specs for subscription setup.
@@ -730,27 +737,48 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<Vec<GroupSubscriptionSpec>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let groups = mdk.get_groups()?;
-        let mut group_specs = Vec::with_capacity(groups.len());
+        self.extract_marmot_group_subscription_specs(account).await
+    }
 
-        for group in &groups {
-            if group.state != GroupState::Active {
-                continue;
-            }
-            let relays = mdk.get_relays(&group.mls_group_id)?;
-            group_specs.push(GroupSubscriptionSpec {
-                group_id: hex::encode(group.nostr_group_id),
-                relays: relays.into_iter().collect(),
-            });
-        }
+    async fn extract_marmot_group_subscription_specs(
+        &self,
+        account: &Account,
+    ) -> Result<Vec<GroupSubscriptionSpec>> {
+        let Some(session) = self.account_manager.get_session(&account.pubkey) else {
+            return Ok(Vec::new());
+        };
+        let Some(marmot) = &session.marmot else {
+            return Ok(Vec::new());
+        };
+        let subscriptions = {
+            let marmot = marmot.lock().await;
+            marmot.group_subscriptions()?
+        };
 
-        Ok(group_specs)
+        subscriptions
+            .into_iter()
+            .map(Self::marmot_group_subscription_spec)
+            .collect()
+    }
+
+    fn marmot_group_subscription_spec(
+        subscription: TransportGroupSubscription,
+    ) -> Result<GroupSubscriptionSpec> {
+        let relays = subscription
+            .endpoints
+            .into_iter()
+            .map(|endpoint| Ok(RelayUrl::parse(&endpoint.0)?))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(GroupSubscriptionSpec {
+            group_id: hex::encode(subscription.transport_group_id),
+            relays,
+        })
     }
 
     /// Syncs group plane subscriptions for an account without touching the inbox.
     ///
-    /// Reads active groups from MDK, ensures relay records exist, and updates
+    /// Reads active Darkmatter groups, ensures relay records exist, and updates
     /// the group plane. Unlike `refresh_account_subscriptions`, this does not
     /// tear down or rebuild inbox subscriptions.
     #[perf_instrument("accounts")]
@@ -1106,10 +1134,20 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
-    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
+    use cgka_traits::app_components::{
+        AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
+    };
+    use cgka_traits::engine::{CreateGroupRequest, KeyPackage};
+    use cgka_traits::types::MessageId;
+
+    use crate::marmot::GroupConfig;
+    use crate::marmot::session::PublishWork;
+    use crate::whitenoise::group_information::{GroupInformation, GroupType};
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
     use crate::whitenoise::test_utils::*;
-    use mdk_core::prelude::*;
 
     #[tokio::test]
     async fn test_load_default_relays_honours_with_default_account_relays() {
@@ -1133,7 +1171,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         assert_eq!(
-            whitenoise.active_group_count(&account).unwrap(),
+            whitenoise.active_group_count(&account).await.unwrap(),
             0,
             "New account should have 0 active groups"
         );
@@ -1146,7 +1184,7 @@ mod tests {
         let member_account = whitenoise.create_identity().await.unwrap();
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let config = create_group_config(vec![creator_account.pubkey]);
         whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -1156,9 +1194,205 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            whitenoise.active_group_count(&creator_account).unwrap(),
+            whitenoise
+                .active_group_count(&creator_account)
+                .await
+                .unwrap(),
             1,
             "Creator should have 1 active group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_group_count_includes_confirmed_marmot_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let routing = NostrRoutingV1::new(
+            [0x55; 32],
+            vec![
+                "ws://localhost:18080".to_string(),
+                "ws://localhost:17777".to_string(),
+            ],
+        )
+        .unwrap();
+        let member_key_package = {
+            let marmot = member_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            key_package_with_source_event_id(marmot.fresh_key_package().await.unwrap(), 0xC2)
+        };
+        {
+            let marmot = creator_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            let created = marmot
+                .create_group(CreateGroupRequest {
+                    name: "Darkmatter counted group".to_string(),
+                    description: String::new(),
+                    members: vec![member_key_package],
+                    required_features: Vec::new(),
+                    app_components: vec![AppComponentData {
+                        component_id: NOSTR_ROUTING_COMPONENT_ID,
+                        data: encode_nostr_routing_v1(&routing).unwrap(),
+                    }],
+                    initial_admins: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+                panic!("Darkmatter group creation must produce pending publish work");
+            };
+            marmot.confirm_published(*pending).await.unwrap();
+        }
+
+        assert_eq!(
+            whitenoise
+                .active_group_count(&creator_account)
+                .await
+                .unwrap(),
+            1,
+            "Confirmed Darkmatter groups should count as active groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_group_count_does_not_recreate_obsolete_mls_storage_for_marmot_group() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let routing = NostrRoutingV1::new(
+            [0x56; 32],
+            vec![
+                "ws://localhost:18080".to_string(),
+                "ws://localhost:17777".to_string(),
+            ],
+        )
+        .unwrap();
+        let member_key_package = {
+            let marmot = member_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            key_package_with_source_event_id(marmot.fresh_key_package().await.unwrap(), 0xC3)
+        };
+        {
+            let marmot = creator_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            let created = marmot
+                .create_group(CreateGroupRequest {
+                    name: "Darkmatter counted group without obsolete MLS storage".to_string(),
+                    description: String::new(),
+                    members: vec![member_key_package],
+                    required_features: Vec::new(),
+                    app_components: vec![AppComponentData {
+                        component_id: NOSTR_ROUTING_COMPONENT_ID,
+                        data: encode_nostr_routing_v1(&routing).unwrap(),
+                    }],
+                    initial_admins: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+                panic!("Darkmatter group creation must produce pending publish work");
+            };
+            marmot.confirm_published(*pending).await.unwrap();
+        }
+
+        let obsolete_mls_storage_path = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+            &creator_account.pubkey,
+            data_temp.path(),
+        );
+        if obsolete_mls_storage_path.is_dir() {
+            fs::remove_dir_all(&obsolete_mls_storage_path).unwrap();
+        } else if obsolete_mls_storage_path.exists() {
+            fs::remove_file(&obsolete_mls_storage_path).unwrap();
+        }
+        assert!(!obsolete_mls_storage_path.exists());
+
+        assert_eq!(
+            whitenoise
+                .active_group_count(&creator_account)
+                .await
+                .unwrap(),
+            1,
+            "Confirmed Darkmatter groups should count without opening obsolete MLS storage"
+        );
+        assert!(
+            !obsolete_mls_storage_path.exists(),
+            "active_group_count for projected Darkmatter groups must not recreate obsolete MLS storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_account_setup_skips_unprojected_rows_without_obsolete_mls_storage() {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let account = whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+        whitenoise.insert_account_session(&account).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let group_id = crate::marmot::GroupId::from_slice(&[0x58; 32]);
+
+        GroupInformation::create_for_group(&whitenoise, &group_id, Some(GroupType::Group), "")
+            .await
+            .unwrap();
+        session
+            .membership()
+            .for_group(&group_id)
+            .get_or_create(None)
+            .await
+            .unwrap();
+        let artifacts = remove_obsolete_mls_artifacts(&account, data_temp.path());
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+
+        assert_eq!(whitenoise.active_group_count(&account).await.unwrap(), 0);
+        assert!(
+            whitenoise
+                .extract_group_subscription_specs(&account)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_obsolete_mls_artifacts_absent(&artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_account_setup_ignores_unprojected_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        setup_unprojected_accepted_group(&whitenoise, &[&creator_account, &member_account]).await;
+
+        assert_eq!(
+            whitenoise
+                .active_group_count(&creator_account)
+                .await
+                .unwrap(),
+            0,
+            "unprojected groups should not count as active"
+        );
+        assert!(
+            whitenoise
+                .extract_group_subscription_specs(&creator_account)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unprojected groups should not produce subscription specs"
         );
     }
 
@@ -1193,7 +1427,7 @@ mod tests {
         let relay2 = RelayUrl::parse("ws://localhost:7777").unwrap();
 
         // Create a group with specific relays
-        let config = NostrGroupConfigData::new(
+        let config = GroupConfig::new(
             "Test Group".to_string(),
             "Test Description".to_string(),
             None,
@@ -1233,6 +1467,138 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_extract_group_subscription_specs_includes_confirmed_marmot_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let relay_b = RelayUrl::parse("ws://localhost:17777").unwrap();
+        let relay_a = RelayUrl::parse("ws://localhost:18080").unwrap();
+        let routing =
+            NostrRoutingV1::new([0x44; 32], vec![relay_b.to_string(), relay_a.to_string()])
+                .unwrap();
+        let member_key_package = {
+            let marmot = member_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            key_package_with_source_event_id(marmot.fresh_key_package().await.unwrap(), 0xC1)
+        };
+        {
+            let marmot = creator_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            let created = marmot
+                .create_group(CreateGroupRequest {
+                    name: "Darkmatter routed group".to_string(),
+                    description: String::new(),
+                    members: vec![member_key_package],
+                    required_features: Vec::new(),
+                    app_components: vec![AppComponentData {
+                        component_id: NOSTR_ROUTING_COMPONENT_ID,
+                        data: encode_nostr_routing_v1(&routing).unwrap(),
+                    }],
+                    initial_admins: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+                panic!("Darkmatter group creation must produce pending publish work");
+            };
+            marmot.confirm_published(*pending).await.unwrap();
+        }
+
+        let group_specs = whitenoise
+            .extract_group_subscription_specs(&creator_account)
+            .await
+            .unwrap();
+
+        assert_eq!(group_specs.len(), 1);
+        assert_eq!(group_specs[0].group_id, hex::encode(routing.nostr_group_id));
+        assert_eq!(group_specs[0].relays.len(), 2);
+        assert!(group_specs[0].relays.contains(&relay_a));
+        assert!(group_specs[0].relays.contains(&relay_b));
+    }
+
+    #[tokio::test]
+    async fn test_extract_group_subscription_specs_does_not_recreate_obsolete_mls_storage_for_marmot_group()
+     {
+        let (whitenoise, data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        let relay_a = RelayUrl::parse("ws://localhost:18080").unwrap();
+        let relay_b = RelayUrl::parse("ws://localhost:17777").unwrap();
+        let routing =
+            NostrRoutingV1::new([0x57; 32], vec![relay_a.to_string(), relay_b.to_string()])
+                .unwrap();
+        let member_key_package = {
+            let marmot = member_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            key_package_with_source_event_id(marmot.fresh_key_package().await.unwrap(), 0xC4)
+        };
+        {
+            let marmot = creator_session
+                .marmot
+                .as_ref()
+                .expect("local identity should initialize Marmot session");
+            let mut marmot = marmot.lock().await;
+            let created = marmot
+                .create_group(CreateGroupRequest {
+                    name: "Darkmatter routed group without obsolete MLS storage".to_string(),
+                    description: String::new(),
+                    members: vec![member_key_package],
+                    required_features: Vec::new(),
+                    app_components: vec![AppComponentData {
+                        component_id: NOSTR_ROUTING_COMPONENT_ID,
+                        data: encode_nostr_routing_v1(&routing).unwrap(),
+                    }],
+                    initial_admins: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+                panic!("Darkmatter group creation must produce pending publish work");
+            };
+            marmot.confirm_published(*pending).await.unwrap();
+        }
+
+        let obsolete_mls_storage_path = crate::whitenoise::test_utils::obsolete_mls_storage_path(
+            &creator_account.pubkey,
+            data_temp.path(),
+        );
+        if obsolete_mls_storage_path.is_dir() {
+            fs::remove_dir_all(&obsolete_mls_storage_path).unwrap();
+        } else if obsolete_mls_storage_path.exists() {
+            fs::remove_file(&obsolete_mls_storage_path).unwrap();
+        }
+        assert!(!obsolete_mls_storage_path.exists());
+
+        let group_specs = whitenoise
+            .extract_group_subscription_specs(&creator_account)
+            .await
+            .unwrap();
+
+        assert_eq!(group_specs.len(), 1);
+        assert_eq!(group_specs[0].group_id, hex::encode(routing.nostr_group_id));
+        assert_eq!(group_specs[0].relays.len(), 2);
+        assert!(group_specs[0].relays.contains(&relay_a));
+        assert!(group_specs[0].relays.contains(&relay_b));
+        assert!(
+            !obsolete_mls_storage_path.exists(),
+            "extract_group_subscription_specs for projected Darkmatter groups must not recreate obsolete MLS storage"
+        );
+    }
+
     /// Reproduces the startup-restore regression behind "new group replies only
     /// appear after restart":
     /// 1. runtime-only state is lost (as after app relaunch),
@@ -1267,7 +1633,7 @@ mod tests {
             "creator should start the restored session with no groups in the plane"
         );
 
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let config = create_group_config(vec![creator_account.pubkey]);
         whitenoise
             .require_session(&creator_account.pubkey)
             .unwrap()
@@ -1279,9 +1645,12 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
 
         assert_eq!(
-            whitenoise.active_group_count(&creator_account).unwrap(),
+            whitenoise
+                .active_group_count(&creator_account)
+                .await
+                .unwrap(),
             1,
-            "creator should have one active group in MDK after create_group"
+            "creator should have one active Darkmatter group after create_group"
         );
         assert_eq!(
             whitenoise
@@ -1418,7 +1787,7 @@ mod tests {
         let session = whitenoise.session(&account.pubkey).unwrap();
 
         // Use valid 64-char hex strings as event IDs.
-        let legacy_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let sibling_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let canonical_event_hex =
             "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
         let hash_ref = [1, 2, 3];
@@ -1427,9 +1796,9 @@ mod tests {
             .published_key_packages
             .create(
                 &hash_ref,
-                legacy_event_hex,
-                MLS_KEY_PACKAGE_KIND_LEGACY,
-                None,
+                sibling_event_hex,
+                MLS_KEY_PACKAGE_KIND,
+                Some("sibling-d-tag"),
             )
             .await
             .unwrap();
@@ -1445,7 +1814,7 @@ mod tests {
             .await
             .unwrap();
 
-        let event_id = EventId::parse(legacy_event_hex).unwrap();
+        let event_id = EventId::parse(sibling_event_hex).unwrap();
         assert!(
             whitenoise
                 .is_own_key_package(&account.pubkey, &event_id)
@@ -1467,7 +1836,7 @@ mod tests {
         let account = register_session_for_test(&whitenoise, account, &keys).await;
         let session = whitenoise.session(&account.pubkey).unwrap();
 
-        let legacy_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let sibling_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let canonical_event_hex =
             "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
         let hash_ref = [1, 2, 3];
@@ -1476,9 +1845,9 @@ mod tests {
             .published_key_packages
             .create(
                 &hash_ref,
-                legacy_event_hex,
-                MLS_KEY_PACKAGE_KIND_LEGACY,
-                None,
+                sibling_event_hex,
+                MLS_KEY_PACKAGE_KIND,
+                Some("sibling-d-tag"),
             )
             .await
             .unwrap();
@@ -1501,7 +1870,7 @@ mod tests {
             .await
             .unwrap();
 
-        let event_id = EventId::parse(legacy_event_hex).unwrap();
+        let event_id = EventId::parse(sibling_event_hex).unwrap();
         assert!(
             !whitenoise
                 .is_own_key_package(&account.pubkey, &event_id)
@@ -1528,7 +1897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_setup_key_package_republishes_when_only_legacy_twin_remains() {
+    async fn test_setup_key_package_republishes_when_canonical_package_is_missing() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1546,12 +1915,6 @@ mod tests {
                 .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
             "precondition: account should start with a canonical key package"
         );
-        assert!(
-            before
-                .iter()
-                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
-            "precondition: account should start with a legacy key package"
-        );
 
         let canonical = before
             .into_iter()
@@ -1567,18 +1930,12 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        let legacy_only = session.key_packages().fetch_all().await.unwrap();
+        let missing_canonical = session.key_packages().fetch_all().await.unwrap();
         assert!(
-            legacy_only
+            missing_canonical
                 .iter()
                 .all(|event| event.kind != MLS_KEY_PACKAGE_KIND),
             "precondition: canonical key package should be missing from relays"
-        );
-        assert!(
-            legacy_only
-                .iter()
-                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
-            "precondition: legacy key package should still be present on relays"
         );
 
         whitenoise
@@ -1590,13 +1947,7 @@ mod tests {
         let after = session.key_packages().fetch_all().await.unwrap();
         assert!(
             after.iter().any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
-            "setup must not treat legacy-only relay state as healthy"
-        );
-        assert!(
-            after
-                .iter()
-                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
-            "setup should preserve pair publishing semantics"
+            "setup must republish a missing canonical key package"
         );
     }
 
@@ -1657,7 +2008,7 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         let relay_url = RelayUrl::parse("ws://127.0.0.1:9").unwrap();
-        let config = NostrGroupConfigData::new(
+        let config = GroupConfig::new(
             "Test Group".to_string(),
             "Relay persistence test".to_string(),
             None,
@@ -1695,7 +2046,7 @@ mod tests {
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         let relay_url = RelayUrl::parse("ws://127.0.0.1:9").unwrap();
-        let config = NostrGroupConfigData::new(
+        let config = GroupConfig::new(
             "Setup Group".to_string(),
             "Setup relay persistence test".to_string(),
             None,
@@ -1737,5 +2088,12 @@ mod tests {
 
         whitenoise.background_refresh_account_group_subscriptions(&account);
         tokio::task::yield_now().await;
+    }
+
+    fn key_package_with_source_event_id(key_package: KeyPackage, marker: u8) -> KeyPackage {
+        KeyPackage::with_source_event_id(
+            key_package.bytes().to_vec(),
+            MessageId::new(vec![marker; 32]),
+        )
     }
 }
