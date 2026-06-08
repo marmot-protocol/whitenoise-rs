@@ -17,10 +17,9 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::ingest::IngestOutcome;
-use cgka_traits::storage::{CapabilityStorage, GroupStorage, StorageError};
+use cgka_traits::storage::{CapabilityStorage, GroupStorage, MessageStorage, StorageError};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
-use cgka_traits::types::{GroupId, MemberId};
-use marmot_forensics::ForensicsExportOptions;
+use cgka_traits::types::{EpochId, GroupId, MemberId};
 use nostr_sdk::secp256k1::Message;
 use nostr_sdk::{Keys, PublicKey, Timestamp};
 use transport_nostr_peeler::NostrMlsPeeler;
@@ -255,8 +254,15 @@ impl MarmotSession {
     }
 
     pub(crate) fn group_forensics(&self, group_id: &GroupId) -> Result<GroupForensics> {
-        let options = ForensicsExportOptions::public(self.forensics_redaction_salt(group_id));
-        Ok(self.engine.group_forensics(group_id, &options)?.into())
+        let group = self.storage.get_group(group_id)?;
+        let messages = self.storage.list_messages(group_id, EpochId(0))?;
+        let snapshots = self.storage.list_group_snapshots(group_id)?;
+        Ok(GroupForensics::from_storage(
+            &self.forensics_redaction_salt(group_id),
+            group,
+            messages,
+            snapshots,
+        ))
     }
 
     pub(crate) fn feature_status(

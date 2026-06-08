@@ -112,7 +112,8 @@ mod tests {
 
         assert_eq!(forensics.epoch, 1);
         assert_eq!(forensics.member_count, 2);
-        assert!(!forensics.group_id.is_empty());
+        assert!(forensics.group_id.starts_with("hash:"));
+        assert_ne!(forensics.group_id, hex::encode(created.group_id.as_slice()));
     }
 
     fn nostr_routing_component() -> AppComponentData {
