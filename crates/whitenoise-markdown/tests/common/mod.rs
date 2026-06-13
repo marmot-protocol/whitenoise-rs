@@ -26,6 +26,12 @@ pub fn strike(children: Vec<Inline>) -> Inline {
 pub fn code(s: &str) -> Inline {
     Inline::Code(s.to_string())
 }
+pub fn effect(name: &str, children: Vec<Inline>) -> Inline {
+    Inline::Effect {
+        name: name.to_string(),
+        children,
+    }
+}
 
 /// Convert a raw multi-line string into the inline-token form the inline
 /// pass would emit for a paragraph or heading whose only content is plain
