@@ -26,7 +26,7 @@ use crate::scanner;
 /// those letters.
 const INLINE_SPECIAL: [bool; 128] = {
     let mut t = [false; 128];
-    let chars = b"\\`$&[!*_~]<@nhmtw\n";
+    let chars = b"\\`$&[!*_~]<@nhmtw{\n";
     let mut k = 0;
     while k < chars.len() {
         t[chars[k] as usize] = true;
@@ -145,6 +145,17 @@ impl BracketDelim {
 
 /// Tokenize the raw paragraph/heading text. First-match-wins.
 pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline> {
+    tokenize_inner(raw, refs, &[])
+}
+
+/// Inner tokenizer. `suppressed` carries the names of the text effects that
+/// enclose this text (an effect cannot nest inside one of the same name), so
+/// a `{name}` whose name is in `suppressed` is treated as literal `{`.
+fn tokenize_inner(
+    raw: &str,
+    refs: &HashMap<String, LinkRef>,
+    suppressed: &[String],
+) -> Vec<Inline> {
     let bytes = raw.as_bytes();
     let mut out: Vec<Inline> = Vec::new();
     // Entity decoding only ever shrinks bytes (e.g. `&amp;` → `&`), so
@@ -280,6 +291,16 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     i += 1;
                 }
             }
+            b'{' => {
+                if let Some((name, children, end)) = try_effect(bytes, i, refs, suppressed) {
+                    flush_text(&mut out, &mut buf, &delims);
+                    out.push(Inline::Effect { name, children });
+                    i = end;
+                } else {
+                    buf.push('{');
+                    i += 1;
+                }
+            }
             b'@' => try_or_literal!('@', try_nostr_mention(bytes, i), Inline::NostrMention),
             b'n' => {
                 if let Some((entity, end)) = try_nostr_uri(bytes, i) {
@@ -365,6 +386,19 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                             // mid-word in prose.
                             if matches!(cc, b'h' | b'm' | b't' | b'w')
                                 && !looks_like_bare_url_start(bytes, i)
+                            {
+                                i += 1;
+                                continue;
+                            }
+                            // `{` is a tripwire for text effects (`{name}…`).
+                            // An effect name must start with an ASCII letter,
+                            // so a `{` not followed by one (set notation,
+                            // `${x}`, etc.) stays on the fast path.
+                            if cc == b'{'
+                                && !bytes
+                                    .get(i + 1)
+                                    .copied()
+                                    .is_some_and(|n| n.is_ascii_alphabetic())
                             {
                                 i += 1;
                                 continue;
@@ -1017,6 +1051,103 @@ fn try_nostr_uri(bytes: &[u8], i: usize) -> Option<(NostrEntity, usize)> {
     let (hrp, end) = nostr::classify_bech32(bytes, i + 6)?;
     let bech32 = std::str::from_utf8(&bytes[i + 6..end]).ok()?.to_string();
     Some((NostrEntity { hrp, bech32 }, end))
+}
+
+// ---------------------------------------------------------------------------
+// Text effects — `{name}…{/name}`
+// ---------------------------------------------------------------------------
+
+/// Max effect-name length. Bounds the open-tag scan and keeps a stray `{`
+/// followed by a long alnum run from being mistaken for a tag opener.
+const EFFECT_NAME_MAX: usize = 64;
+
+/// Characters allowed in an effect name after the leading letter.
+fn is_effect_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Try to consume a text effect `{name}…{/name}` starting at byte `i` (which
+/// must point at `{`). Returns the name, the tokenized children, and the byte
+/// index just past the closing `{/name}`.
+///
+/// The name is `[A-Za-z][A-Za-z0-9_-]*`. The matching close balances nested
+/// opens of the *same* name and skips over code spans and backslash escapes,
+/// so a literal `{/name}` inside `` `…` `` does not close the effect. Content
+/// is recursively tokenized, so markdown (and *differently*-named effects)
+/// inside an effect parse normally — but an effect cannot nest inside one of
+/// the same name: `{name}` is added to `suppressed` for the recursive pass, so
+/// an inner `{name}…{/name}` stays literal inline text. An effect with no
+/// matching close stays literal.
+fn try_effect(
+    bytes: &[u8],
+    i: usize,
+    refs: &HashMap<String, LinkRef>,
+    suppressed: &[String],
+) -> Option<(String, Vec<Inline>, usize)> {
+    debug_assert_eq!(bytes[i], b'{');
+    // Parse the opening `{name}`.
+    let name_start = i + 1;
+    if !bytes.get(name_start).copied()?.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut j = name_start + 1;
+    while j < bytes.len() && is_effect_name_char(bytes[j]) && (j - name_start) < EFFECT_NAME_MAX {
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'}') {
+        return None;
+    }
+    let name = &bytes[name_start..j];
+    // An effect of this name already encloses us — don't recognize a nested
+    // open of the same name; the caller emits a literal `{`.
+    if suppressed.iter().any(|s| s.as_bytes() == name) {
+        return None;
+    }
+    let content_start = j + 1;
+
+    // The close tag we're looking for: `{/name}`.
+    let close_len = name.len() + 3; // '{' '/' name '}'
+    let same_open_len = name.len() + 2; // '{' name '}'
+    let mut depth = 1usize;
+    let mut k = content_start;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => {
+                // Skip the escaped byte so an escaped brace can't open/close.
+                k += 2;
+            }
+            b'`' => {
+                // Skip over a code span so a `{/name}` inside it is inert.
+                match try_code_span(bytes, k) {
+                    Some((_, end)) => k = end,
+                    None => k += 1,
+                }
+            }
+            b'{' if bytes.get(k + 1) == Some(&b'/')
+                && bytes.get(k + 2..k + 2 + name.len()) == Some(name)
+                && bytes.get(k + 2 + name.len()) == Some(&b'}') =>
+            {
+                depth -= 1;
+                if depth == 0 {
+                    let content = std::str::from_utf8(&bytes[content_start..k]).ok()?;
+                    let name = std::str::from_utf8(name).ok()?.to_string();
+                    let mut child_suppressed = suppressed.to_vec();
+                    child_suppressed.push(name.clone());
+                    let children = tokenize_inner(content, refs, &child_suppressed);
+                    return Some((name, children, k + close_len));
+                }
+                k += close_len;
+            }
+            b'{' if bytes.get(k + 1..k + 1 + name.len()) == Some(name)
+                && bytes.get(k + 1 + name.len()) == Some(&b'}') =>
+            {
+                depth += 1;
+                k += same_open_len;
+            }
+            _ => k += 1,
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
