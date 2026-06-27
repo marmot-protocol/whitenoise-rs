@@ -193,6 +193,10 @@ CREATE TABLE IF NOT EXISTS aggregated_messages (
     reactions             JSONB NOT NULL,
     media_attachments     JSONB NOT NULL,
     content_normalized    TEXT NOT NULL DEFAULT '',
+    -- Frozen-at-ingest marker (m0048): the author was muted when this row
+    -- was first cached. The frontend hides rows where is_blocked = 1.
+    is_blocked            INTEGER NOT NULL DEFAULT 0
+        CHECK (is_blocked IN (0, 1)),
     UNIQUE(message_id, mls_group_id)
 );
 
@@ -221,12 +225,16 @@ CREATE INDEX IF NOT EXISTS idx_mds_group_account_status
 
 -- Local mute_list (NIP-51 block list). Moved from shared in m0042; the
 -- account_pubkey column is dropped because ownership is implicit in the file.
+-- `event_created_at` (m0047) carries the originating kind-10000 event's
+-- `created_at` — a cross-device-stable timestamp — distinct from
+-- `created_at`, which is per-device insert time.
 CREATE TABLE IF NOT EXISTS mute_list (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    muted_pubkey  TEXT NOT NULL UNIQUE
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    muted_pubkey      TEXT NOT NULL UNIQUE
         CHECK (length(muted_pubkey) = 64
                AND muted_pubkey GLOB '[0-9a-fA-F]*'),
-    is_private    INTEGER NOT NULL DEFAULT 1
+    is_private        INTEGER NOT NULL DEFAULT 1
         CHECK (is_private IN (0, 1)),
-    created_at    INTEGER NOT NULL
+    created_at        INTEGER NOT NULL,
+    event_created_at  INTEGER NOT NULL
 );

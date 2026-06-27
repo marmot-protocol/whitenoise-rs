@@ -16,6 +16,7 @@ use crate::{
         accounts_groups::AccountGroup,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
+        database::mute_list::MuteListEntry,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
         message_aggregator::processor::{extract_deletion_target_ids, extract_reaction_target_id},
@@ -217,9 +218,15 @@ impl Whitenoise {
                     .cache_chat_message(&account.pubkey, &group_id, &message)
                     .await?;
                 let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
-                self.spawn_new_message_notification_if_enabled(
-                    account, &group_id, &msg, group_name,
-                );
+                // Suppress the OS push for blocked authors — the frontend can
+                // never reach back to silence an already-delivered push. The
+                // stream emissions below still fire: the frontend needs to
+                // know a message arrived so it can refresh its filtered views.
+                if !msg.is_blocked {
+                    self.spawn_new_message_notification_if_enabled(
+                        account, &group_id, &msg, group_name,
+                    );
+                }
                 self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
                 self.emit_chat_list_update(
                     account,
@@ -544,6 +551,13 @@ impl Whitenoise {
             chat_message.delivery_status = existing_message.delivery_status;
         }
 
+        // Stamp the frozen-at-ingest block marker. Computed once from a
+        // single `MuteListEntry::exists` read; the value rides on the
+        // returned `ChatMessage` so the push-suppression decision reads the
+        // exact same value — no second lookup, no race.
+        chat_message.is_blocked =
+            MuteListEntry::exists(&chat_message.author, &session.account_db).await?;
+
         AggregatedMessage::insert_message(
             &chat_message,
             group_id,
@@ -603,7 +617,37 @@ impl Whitenoise {
             return Ok(None);
         }
 
-        AggregatedMessage::insert_reaction(message, group_id, &session.account_db.inner).await?;
+        // Compute the reactor's block stamp once, for the audit row.
+        let is_blocked = MuteListEntry::exists(&message.pubkey, &session.account_db).await?;
+
+        AggregatedMessage::insert_reaction(
+            message,
+            group_id,
+            is_blocked,
+            &session.account_db.inner,
+        )
+        .await?;
+
+        // A blocked author's reaction stays visible in a group chat but is
+        // suppressed in a DM. The DM lookup is one indexed read, and the
+        // short-circuit keeps it off the common (unblocked) path entirely.
+        if is_blocked
+            && AccountGroup::find_by_account_and_group(
+                account_pubkey,
+                group_id,
+                &session.account_db.inner.pool,
+            )
+            .await?
+            .is_some_and(|ag| ag.dm_peer_pubkey.is_some())
+        {
+            tracing::debug!(
+                target: "whitenoise::cache",
+                "Suppressing blocked-author reaction {} in DM group {}",
+                message.id,
+                hex::encode(group_id.as_slice())
+            );
+            return Ok(None);
+        }
 
         let result = self
             .apply_reaction_to_target(account_pubkey, message, group_id)
@@ -713,7 +757,16 @@ impl Whitenoise {
             return Ok(Vec::new());
         }
 
-        AggregatedMessage::insert_deletion(message, group_id, &session.account_db.inner).await?;
+        // Stamp the deleter's block state on the audit row for symmetry.
+        // The deletion-application logic itself is unaffected.
+        let is_blocked = MuteListEntry::exists(&message.pubkey, &session.account_db).await?;
+        AggregatedMessage::insert_deletion(
+            message,
+            group_id,
+            is_blocked,
+            &session.account_db.inner,
+        )
+        .await?;
 
         let updates = self
             .apply_deletions_to_targets(account_pubkey, message, group_id)

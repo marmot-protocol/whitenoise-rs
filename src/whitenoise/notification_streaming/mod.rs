@@ -294,6 +294,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
+            is_blocked: false,
             content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9, // MLS message kind
