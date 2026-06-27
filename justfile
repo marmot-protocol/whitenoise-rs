@@ -447,7 +447,7 @@ build-release:
 
 # Install wn and wnd CLI binaries to ~/.cargo/bin
 install-cli:
-    cargo install --path . --features cli
+    cargo install --path crates/whitenoise-cli
 
 ######################
 # Docker
