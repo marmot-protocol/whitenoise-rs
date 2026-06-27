@@ -28,13 +28,13 @@ Install both binaries to `~/.cargo/bin`:
 ```sh
 just install-cli
 # or, equivalently:
-cargo install --path . --features cli
+cargo install --path crates/whitenoise-cli
 ```
 
 Or build from source without installing:
 
 ```sh
-cargo build --release --features cli --bin wn --bin wnd
+cargo build --release -p whitenoise-cli --bin wn --bin wnd
 ```
 
 Quick tour:
