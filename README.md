@@ -1,3 +1,6 @@
+> [!WARNING]
+> This repository is obsolete and is no longer updated. Use the crates in [marmot-protocol/mdk](https://github.com/marmot-protocol/mdk) instead.
+
 # White Noise
 
 A secure, private, and decentralized chat app built on Nostr, using the MLS protocol under the hood.
