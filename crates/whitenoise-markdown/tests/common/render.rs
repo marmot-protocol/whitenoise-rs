@@ -165,6 +165,11 @@ fn render_inline(i: &Inline, out: &mut String) {
             render_inlines(c, out);
             out.push_str("</del>");
         }
+        Inline::Effect { name, children } => {
+            out.push_str(&format!("<span class=\"effect-{}\">", escape_attr(name)));
+            render_inlines(children, out);
+            out.push_str("</span>");
+        }
         Inline::Link {
             dest,
             title,
@@ -231,6 +236,7 @@ fn collect_text(inlines: &[Inline], out: &mut String) {
             Inline::Emph(c)
             | Inline::Strong(c)
             | Inline::Strikethrough(c)
+            | Inline::Effect { children: c, .. }
             | Inline::Link { children: c, .. } => collect_text(c, out),
             Inline::Image { alt: c, .. } => collect_text(c, out),
             Inline::SoftBreak | Inline::HardBreak => out.push(' '),

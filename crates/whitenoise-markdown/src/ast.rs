@@ -83,6 +83,14 @@ pub enum Inline {
     Emph(Vec<Inline>),
     Strong(Vec<Inline>),
     Strikethrough(Vec<Inline>),
+    /// Text effect: `{name}children{/name}`. `name` is an
+    /// arbitrary `[A-Za-z][A-Za-z0-9_-]*` token (e.g. `big`, `small`,
+    /// `shake`); `children` are the markdown-parsed contents. Rendering of
+    /// the effect itself is left to the consumer.
+    Effect {
+        name: String,
+        children: Vec<Inline>,
+    },
     Link {
         dest: String,
         title: Option<String>,

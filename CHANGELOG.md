@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Markdown text effects: `{name}…{/name}` inline syntax (e.g. `{big}`, `{small}`, `{shake}`) with arbitrary effect names and nested markdown content ([#849] [@dannym-arx])
 - Thumbhash support for media previews alongside existing blurhash, allowing clients to migrate over time ([#714] [@erskingardner])
 - Audio chat media metadata is now first-class in media records, including optional duration, waveform, and an imeta tag helper for app bindings ([#833] [@erskingardner])
 - CLI message reactions (react/unreact) ([#564] [@jgmontoya])
@@ -218,6 +219,7 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 [@F3r10]: <https://github.com/F3r10>
 [@mubarakcoded]: <https://github.com/mubarakcoded> (nostr:npub1mlyye6fpsqnkuxwv3nzzf3cmrau8x6z3fhh095246me87ya0aprsun609q)
 [@johnathanCorgan]: <https://github.com/jcorgan>
+[@dannym-arx]: <https://github.com/dannym-arx>
 
 
 <!-- PRs -->
@@ -291,6 +293,7 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 [#591]: https://github.com/marmot-protocol/whitenoise-rs/pull/591
 [#714]: https://github.com/marmot-protocol/whitenoise-rs/pull/714
 [#833]: https://github.com/marmot-protocol/whitenoise-rs/pull/833
+[#849]: https://github.com/marmot-protocol/whitenoise-rs/pull/849
 
 
 <!-- Tags -->

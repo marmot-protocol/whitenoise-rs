@@ -1,0 +1,221 @@
+{
+  "blocks": [
+    {
+      "Heading": {
+        "level": 1,
+        "inlines": [
+          {
+            "Text": "Text effects"
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Plain "
+          },
+          {
+            "Effect": {
+              "name": "big",
+              "children": [
+                {
+                  "Text": "large text"
+                }
+              ]
+            }
+          },
+          {
+            "Text": " and "
+          },
+          {
+            "Effect": {
+              "name": "small",
+              "children": [
+                {
+                  "Text": "tiny text"
+                }
+              ]
+            }
+          },
+          {
+            "Text": " inline."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "A "
+          },
+          {
+            "Effect": {
+              "name": "shake",
+              "children": [
+                {
+                  "Text": "shaky "
+                },
+                {
+                  "Strong": [
+                    {
+                      "Text": "bold"
+                    }
+                  ]
+                },
+                {
+                  "Text": " and "
+                },
+                {
+                  "Emph": [
+                    {
+                      "Text": "italic"
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Text": " run mixes markdown."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Arbitrary names work: "
+          },
+          {
+            "Effect": {
+              "name": "WHATEVER",
+              "children": [
+                {
+                  "Text": "anything goes"
+                }
+              ]
+            }
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Nesting different effects: "
+          },
+          {
+            "Effect": {
+              "name": "big",
+              "children": [
+                {
+                  "Text": "outer "
+                },
+                {
+                  "Effect": {
+                    "name": "shake",
+                    "children": [
+                      {
+                        "Text": "inner"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "Text": " tail"
+                }
+              ]
+            }
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Same-name nesting: "
+          },
+          {
+            "Effect": {
+              "name": "big",
+              "children": [
+                {
+                  "Text": "a {big}b{/big} c"
+                }
+              ]
+            }
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Effects do not fire inside code: "
+          },
+          {
+            "Code": "{big}literal{/big}"
+          },
+          {
+            "Text": " stays a code span,"
+          },
+          "SoftBreak",
+          {
+            "Text": "and "
+          },
+          {
+            "Effect": {
+              "name": "big",
+              "children": [
+                {
+                  "Text": "an effect wrapping a "
+                },
+                {
+                  "Code": "{/big}"
+                },
+                {
+                  "Text": " code span"
+                }
+              ]
+            }
+          },
+          {
+            "Text": " closes correctly."
+          }
+        ]
+      }
+    },
+    {
+      "CodeBlock": {
+        "kind": "Fenced",
+        "info": "",
+        "content": "{big}fenced code is untouched{/big}\n"
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Non-effects stay literal: {1, 2, 3}, {not closed, and {big}escaped{/big}."
+          }
+        ]
+      }
+    }
+  ]
+}
