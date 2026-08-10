@@ -247,12 +247,27 @@ impl<'a> ChatListOps<'a> {
                 (gid.clone(), ag.last_read_message_id, cleared_ms)
             })
             .collect();
-        let unread_counts = AggregatedMessage::count_visible_unread_for_groups(
-            &group_markers,
-            &self.session.account_pubkey,
+
+        // DM unread counts strip blocked-author messages; group-chat counts
+        // include them. Partition by DM-ness (`dm_other_users` already holds
+        // every DM group for this account) and call the matching variant.
+        // The two result maps have disjoint keys — a group is either a DM or
+        // not — so merging them is a plain `extend`.
+        let (dm_markers, group_chat_markers): (Vec<_>, Vec<_>) = group_markers
+            .into_iter()
+            .partition(|(gid, _, _)| dm_other_users.contains_key(gid));
+        let mut unread_counts = AggregatedMessage::count_visible_unread_for_groups(
+            &dm_markers,
             &self.session.account_db.inner,
         )
         .await?;
+        unread_counts.extend(
+            AggregatedMessage::count_unread_for_groups(
+                &group_chat_markers,
+                &self.session.account_db.inner,
+            )
+            .await?,
+        );
 
         let mut items = assemble_chat_list_items(
             &groups,

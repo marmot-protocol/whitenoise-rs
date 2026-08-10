@@ -56,6 +56,7 @@ struct AggregatedMessageRow {
     pub content_tokens: whitenoise_markdown::Document,
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
+    pub is_blocked: bool,
     pub delivery_status: Option<DeliveryStatus>,
     /// Position of this message within the group (0 = newest).
     /// Only populated by search queries that include a ROW_NUMBER window.
@@ -152,6 +153,8 @@ where
             }
         })?;
 
+        let is_blocked: i64 = row.try_get("is_blocked")?;
+
         // Deserialize optional delivery_status from JSON string.
         // Uses lenient ColumnNotFound handling because delivery_status lives in a
         // separate table and is only present when the query includes a LEFT JOIN alias.
@@ -190,6 +193,7 @@ where
             content_tokens,
             reactions,
             media_attachments,
+            is_blocked: is_blocked != 0,
             delivery_status,
             position,
         })
@@ -596,6 +600,7 @@ impl AggregatedMessage {
                WHERE am.kind = 9
                  AND am.mls_group_id = ?2
                  AND am.created_at > COALESCE(?3, 0)
+                 AND am.is_blocked = 0
                  AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              )
              SELECT * FROM ranked
@@ -715,7 +720,10 @@ impl AggregatedMessage {
              AND mds.account_pubkey = ",
         );
         qb.push_bind(&pubkey_hex);
-        qb.push(" WHERE am.kind = 9 AND am.mls_group_id IN (");
+        // `am.is_blocked = 0` lives inside the `ranked` CTE so blocked rows are
+        // excluded from the ROW_NUMBER() position computation too: the
+        // position handed to Flutter must index into the *visible* list.
+        qb.push(" WHERE am.kind = 9 AND am.is_blocked = 0 AND am.mls_group_id IN (");
         let mut sep = qb.separated(", ");
         for gid in group_ids {
             sep.push_bind(gid.clone());
@@ -776,9 +784,14 @@ impl AggregatedMessage {
     /// All events inserted in one batch - kind 9 gets full data, kind 7/5 get empty defaults
     /// Single pass - no UPDATE needed. This ensures atomicity: either all events are saved or none are
     #[perf_instrument("db::aggregated_messages")]
+    /// `muted_pubkeys` is the set of authors currently on this account's mute
+    /// list. Every inserted row's `is_blocked` is stamped against this set —
+    /// the same frozen-at-ingest pattern as `insert_message` /
+    /// `insert_reaction` / `insert_deletion`, batched for cache hydration.
     pub async fn save_events(
         events: Vec<Message>,                 // All events (kind 9, 7, 5)
         processed_messages: Vec<ChatMessage>, // Processed kind 9 with aggregated data
+        muted_pubkeys: &HashSet<PublicKey>,
         group_id: &GroupId,
         database: &Database,
     ) -> Result<()> {
@@ -806,6 +819,7 @@ impl AggregatedMessage {
                     timestamp: message.created_at.as_secs() as i64,
                 }
             })?;
+            let is_blocked = i64::from(muted_pubkeys.contains(&message.pubkey));
 
             match message.kind {
                 Kind::Custom(9) => {
@@ -818,8 +832,8 @@ impl AggregatedMessage {
                         "INSERT OR IGNORE INTO aggregated_messages
                          (message_id, mls_group_id, author, created_at, kind, content,
                           content_normalized, tags, reply_to_id, content_tokens, reactions,
-                          media_attachments)
-                         VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)",
+                          media_attachments, is_blocked)
+                         VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .bind(message.id.to_string())
                     .bind(group_id.as_slice())
@@ -834,6 +848,7 @@ impl AggregatedMessage {
                     .bind(serde_json::to_string(&chat_msg.content_tokens)?)
                     .bind(serde_json::to_string(&chat_msg.reactions)?)
                     .bind(serde_json::to_string(&chat_msg.media_attachments)?)
+                    .bind(is_blocked)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -842,8 +857,8 @@ impl AggregatedMessage {
                     sqlx::query(
                         "INSERT OR IGNORE INTO aggregated_messages
                          (message_id, mls_group_id, author, created_at, kind, content, tags,
-                          reply_to_id, content_tokens, reactions, media_attachments)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                          reply_to_id, content_tokens, reactions, media_attachments, is_blocked)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
                     )
                     .bind(message.id.to_string())
                     .bind(group_id.as_slice())
@@ -855,6 +870,7 @@ impl AggregatedMessage {
                     .bind(serde_json::to_string(&empty_tokens)?)
                     .bind(serde_json::to_string(&empty_reactions)?)
                     .bind(serde_json::to_string(&empty_media)?)
+                    .bind(is_blocked)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -882,11 +898,15 @@ impl AggregatedMessage {
 
         let mut tx = database.pool.begin().await?;
 
+        // `is_blocked` is deliberately absent from the `DO UPDATE SET` list:
+        // re-ingesting the same event must never overwrite the original
+        // frozen-at-ingest stamp. The only legitimate post-hoc mutation is
+        // the unstamp sweep (`unstamp_recent_messages`).
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, content_normalized,
-              tags, reply_to_id, content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)
+              tags, reply_to_id, content_tokens, reactions, media_attachments, is_blocked)
+             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO UPDATE SET
                content = excluded.content,
                content_normalized = excluded.content_normalized,
@@ -909,6 +929,7 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&message.content_tokens)?)
         .bind(serde_json::to_string(&message.reactions)?)
         .bind(serde_json::to_string(&message.media_attachments)?)
+        .bind(i64::from(message.is_blocked))
         .execute(&mut *tx)
         .await?;
 
@@ -931,11 +952,16 @@ impl AggregatedMessage {
         Ok(())
     }
 
-    /// Insert a kind 7 reaction event (audit trail)
+    /// Insert a kind 7 reaction event (audit trail).
+    ///
+    /// `is_blocked` is the caller-computed mute-list stamp for the reaction's
+    /// author. `ON CONFLICT DO NOTHING` already preserves it on re-ingest, so
+    /// no `SET`-list exclusion is needed.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_reaction(
         reaction: &Message,
         group_id: &GroupId,
+        is_blocked: bool,
         database: &Database,
     ) -> Result<()> {
         let created_at = timestamp_to_datetime(reaction.created_at).map_err(|_| {
@@ -951,8 +977,8 @@ impl AggregatedMessage {
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, tags,
-              content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 7, ?, ?, ?, ?, ?)
+              content_tokens, reactions, media_attachments, is_blocked)
+             VALUES (?, ?, ?, ?, 7, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO NOTHING",
         )
         .bind(reaction.id.to_string())
@@ -964,17 +990,23 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&empty_tokens)?)
         .bind(serde_json::to_string(&empty_reactions)?)
         .bind(serde_json::to_string(&empty_media)?)
+        .bind(i64::from(is_blocked))
         .execute(&database.pool)
         .await?;
 
         Ok(())
     }
 
-    /// Insert a kind 5 deletion event (audit trail)
+    /// Insert a kind 5 deletion event (audit trail).
+    ///
+    /// `is_blocked` is the caller-computed mute-list stamp for the deletion's
+    /// author. `ON CONFLICT DO NOTHING` already preserves it on re-ingest, so
+    /// no `SET`-list exclusion is needed.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_deletion(
         deletion: &Message,
         group_id: &GroupId,
+        is_blocked: bool,
         database: &Database,
     ) -> Result<()> {
         let created_at = timestamp_to_datetime(deletion.created_at).map_err(|_| {
@@ -990,8 +1022,8 @@ impl AggregatedMessage {
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, tags,
-              content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 5, '', ?, ?, ?, ?)
+              content_tokens, reactions, media_attachments, is_blocked)
+             VALUES (?, ?, ?, ?, 5, '', ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO NOTHING",
         )
         .bind(deletion.id.to_string())
@@ -1002,9 +1034,88 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&empty_tokens)?)
         .bind(serde_json::to_string(&empty_reactions)?)
         .bind(serde_json::to_string(&empty_media)?)
+        .bind(i64::from(is_blocked))
         .execute(&database.pool)
         .await?;
 
+        Ok(())
+    }
+
+    /// Post-sync stamp sweep.
+    ///
+    /// Stamps `is_blocked = 1` on cached messages authored by a newly-blocked
+    /// pubkey whose `created_at` is at or after that block's
+    /// `event_created_at`. Catches messages that landed in the cold-start gap
+    /// between the inbox drain and the mute-list sync.
+    ///
+    /// Idempotent: rows already stamped fail the `is_blocked = 0` guard, so a
+    /// repeat call touches nothing. No-op when `authors` is empty.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn stamp_recent_messages(
+        authors: &HashSet<PublicKey>,
+        database: &Database,
+    ) -> Result<()> {
+        if authors.is_empty() {
+            return Ok(());
+        }
+
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "UPDATE aggregated_messages AS am \
+             SET is_blocked = 1 \
+             WHERE am.is_blocked = 0 \
+               AND am.created_at >= ( \
+                   SELECT ml.event_created_at FROM mute_list ml \
+                   WHERE ml.muted_pubkey = am.author \
+               ) \
+               AND am.author IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for author in authors {
+            sep.push_bind(author.to_hex());
+        }
+        sep.push_unseparated(")");
+
+        qb.build().execute(&database.pool).await?;
+        Ok(())
+    }
+
+    /// Post-sync unstamp sweep — the symmetric counterpart to
+    /// [`stamp_recent_messages`](Self::stamp_recent_messages).
+    ///
+    /// Clears `is_blocked` on cached messages from a newly-unblocked pubkey
+    /// whose `created_at` is at or after the unblock event's
+    /// `event_created_at` — messages this device stamped only because it had
+    /// not yet synced the unblock. Messages sent *during* the block (strictly
+    /// before `event_created_at`) keep their stamp, preserving the
+    /// forward-looking rule.
+    ///
+    /// Idempotent: cleared rows fail the `is_blocked = 1` guard. No-op when
+    /// `authors` is empty.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn unstamp_recent_messages(
+        authors: &HashSet<PublicKey>,
+        event_created_at: DateTime<Utc>,
+        database: &Database,
+    ) -> Result<()> {
+        if authors.is_empty() {
+            return Ok(());
+        }
+
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "UPDATE aggregated_messages \
+             SET is_blocked = 0 \
+             WHERE is_blocked = 1 \
+               AND created_at >= ",
+        );
+        qb.push_bind(event_created_at.timestamp_millis());
+        qb.push(" AND author IN (");
+        let mut sep = qb.separated(", ");
+        for author in authors {
+            sep.push_bind(author.to_hex());
+        }
+        sep.push_unseparated(")");
+
+        qb.build().execute(&database.pool).await?;
         Ok(())
     }
 
@@ -1314,20 +1425,20 @@ impl AggregatedMessage {
             read_marker,
             database,
             chat_cleared_at_ms,
-            None,
+            false,
         )
         .await
     }
 
     /// Count chat-list-visible unread messages for a group.
     ///
-    /// This is the same unread projection as `count_unread_for_group`, except it
-    /// excludes messages authored by users blocked by `account_pubkey`.
+    /// This is the same unread projection as `count_unread_for_group`, except
+    /// it excludes messages stamped `is_blocked` at ingest time. Used for DM
+    /// groups; group chats use `count_unread_for_group`.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn count_visible_unread_for_group(
         group_id: &GroupId,
         read_marker: Option<&EventId>,
-        account_pubkey: &PublicKey,
         database: &Database,
         chat_cleared_at_ms: Option<i64>,
     ) -> Result<usize> {
@@ -1336,17 +1447,19 @@ impl AggregatedMessage {
             read_marker,
             database,
             chat_cleared_at_ms,
-            Some(account_pubkey),
+            true,
         )
         .await
     }
 
+    /// `exclude_blocked` toggles the `is_blocked = 0` filter: `true` for the
+    /// chat-list-visible (DM) projection, `false` for the plain count.
     async fn count_unread_for_group_filtered(
         group_id: &GroupId,
         read_marker: Option<&EventId>,
         database: &Database,
         chat_cleared_at_ms: Option<i64>,
-        account_pubkey: Option<&PublicKey>,
+        exclude_blocked: bool,
     ) -> Result<usize> {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
             "SELECT COUNT(*) FROM aggregated_messages am
@@ -1374,16 +1487,10 @@ impl AggregatedMessage {
         qb.push_bind(chat_cleared_at_ms);
         qb.push(", 0)");
 
-        if account_pubkey.is_some() {
-            // mute_list is per-account so account scoping is implicit.
-            // The Option<&PublicKey> parameter acts as a feature toggle:
-            // Some = filter blocked authors, None = no filter.
-            qb.push(
-                " AND NOT EXISTS (
-                    SELECT 1 FROM mute_list ml
-                    WHERE ml.muted_pubkey = am.author
-                )",
-            );
+        if exclude_blocked {
+            // Frozen-at-ingest stamp, not a live mute_list join: a message
+            // received while blocked stays excluded even after an unblock.
+            qb.push(" AND am.is_blocked = 0");
         }
 
         let count: i64 = qb.build_query_scalar().fetch_one(&database.pool).await?;
@@ -1402,25 +1509,27 @@ impl AggregatedMessage {
         group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
         database: &Database,
     ) -> Result<HashMap<GroupId, usize>> {
-        Self::count_unread_for_groups_filtered(group_markers, database, None).await
+        Self::count_unread_for_groups_filtered(group_markers, database, false).await
     }
 
     /// Count chat-list-visible unread messages for multiple groups.
     ///
-    /// Excludes messages authored by users blocked by `account_pubkey`.
+    /// Excludes messages stamped `is_blocked` at ingest time. Used for DM
+    /// groups; group chats use `count_unread_for_groups`.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn count_visible_unread_for_groups(
         group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
-        account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<HashMap<GroupId, usize>> {
-        Self::count_unread_for_groups_filtered(group_markers, database, Some(account_pubkey)).await
+        Self::count_unread_for_groups_filtered(group_markers, database, true).await
     }
 
+    /// `exclude_blocked` toggles the `is_blocked = 0` filter — see
+    /// `count_unread_for_group_filtered`.
     async fn count_unread_for_groups_filtered(
         group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
         database: &Database,
-        account_pubkey: Option<&PublicKey>,
+        exclude_blocked: bool,
     ) -> Result<HashMap<GroupId, usize>> {
         if group_markers.is_empty() {
             return Ok(HashMap::new());
@@ -1504,16 +1613,9 @@ impl AggregatedMessage {
              AND am.created_at > COALESCE(ct.cleared_at, 0)",
         );
 
-        if account_pubkey.is_some() {
-            // mute_list is per-account so account scoping is implicit.
-            // The Option<&PublicKey> parameter acts as a feature toggle:
-            // Some = filter blocked authors, None = no filter.
-            qb.push(
-                " AND NOT EXISTS ( \
-                    SELECT 1 FROM mute_list ml \
-                    WHERE ml.muted_pubkey = am.author \
-                )",
-            );
+        if exclude_blocked {
+            // Frozen-at-ingest stamp, not a live mute_list join.
+            qb.push(" AND am.is_blocked = 0");
         }
 
         qb.push(" GROUP BY am.mls_group_id");
@@ -1647,26 +1749,37 @@ impl AggregatedMessage {
 
         let group_id_bytes: Vec<Vec<u8>> = group_ids.iter().map(|id| id.to_vec()).collect();
 
-        // Correlated subquery to get the last message per group
-        // Uses id matching with ORDER BY LIMIT 1 for deterministic results on timestamp ties
+        // Correlated subquery to get the last message per group, with the
+        // DM/group asymmetry: for a DM (`accounts_groups.dm_peer_pubkey
+        // IS NOT NULL`) the preview picks the newest *non-blocked* row; for a
+        // group chat it picks the newest row regardless of `is_blocked` and
+        // surfaces the stamp. `accounts_groups.mls_group_id` is UNIQUE, so the
+        // LEFT JOIN yields exactly one row per message. Every column is
+        // qualified because the join puts two `mls_group_id` columns in scope.
+        // Uses id matching with ORDER BY LIMIT 1 for deterministic results on
+        // timestamp ties.
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            "SELECT message_id, mls_group_id, author, content, created_at, \
-             json_array_length(media_attachments) as media_count \
+            "SELECT am1.message_id, am1.mls_group_id, am1.author, am1.content, \
+             am1.created_at, am1.is_blocked, \
+             json_array_length(am1.media_attachments) as media_count \
              FROM aggregated_messages am1 \
-             WHERE kind = 9 AND mls_group_id IN (",
+             LEFT JOIN accounts_groups ag ON ag.mls_group_id = am1.mls_group_id \
+             WHERE am1.kind = 9 AND am1.mls_group_id IN (",
         );
         let mut sep = qb.separated(", ");
         for id in &group_id_bytes {
             sep.push_bind(id);
         }
         sep.push_unseparated(
-            ") AND deletion_event_id IS NULL \
-             AND id = ( \
-                 SELECT id FROM aggregated_messages am2 \
+            ") AND am1.deletion_event_id IS NULL \
+             AND (ag.dm_peer_pubkey IS NULL OR am1.is_blocked = 0) \
+             AND am1.message_id = ( \
+                 SELECT am2.message_id FROM aggregated_messages am2 \
                  WHERE am2.mls_group_id = am1.mls_group_id \
                    AND am2.kind = 9 \
                    AND am2.deletion_event_id IS NULL \
-                 ORDER BY created_at DESC, id DESC \
+                   AND (ag.dm_peer_pubkey IS NULL OR am2.is_blocked = 0) \
+                 ORDER BY am2.created_at DESC, am2.message_id DESC \
                  LIMIT 1 \
              )",
         );
@@ -1694,6 +1807,7 @@ impl AggregatedMessage {
             let content: String = row.try_get("content")?;
             let created_at = parse_timestamp(&row, "created_at")?;
             let media_count: i64 = row.try_get("media_count")?;
+            let is_blocked: i64 = row.try_get("is_blocked")?;
 
             let summary = ChatMessageSummary {
                 message_id,
@@ -1703,6 +1817,7 @@ impl AggregatedMessage {
                 content,
                 created_at,
                 media_attachment_count: media_count as usize,
+                is_blocked: is_blocked != 0,
             };
 
             results.push(summary);
@@ -1725,6 +1840,7 @@ impl AggregatedMessage {
             is_reply: row.reply_to_id.is_some(),
             reply_to_id: row.reply_to_id.map(|id| id.to_string()),
             is_deleted: row.deletion_event_id.is_some(),
+            is_blocked: row.is_blocked,
             content_tokens: row.content_tokens,
             reactions: row.reactions,
             kind: row.kind.as_u16(),
@@ -1787,6 +1903,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
+            is_blocked: false,
             content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
@@ -1868,6 +1985,407 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, message.id);
         assert_eq!(messages[0].content, message.content);
+    }
+
+    #[tokio::test]
+    async fn insert_message_persists_is_blocked_verbatim() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[1; 32]);
+        let author = Keys::generate().public_key();
+
+        // Storage is pure persistence: it writes whatever `is_blocked` the
+        // caller put on the `ChatMessage`, with no mute-list awareness.
+        let mut blocked = create_test_chat_message(1, author);
+        blocked.is_blocked = true;
+        let unblocked = create_test_chat_message(2, author);
+
+        AggregatedMessage::insert_message(&blocked, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+        AggregatedMessage::insert_message(&unblocked, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+
+        let blocked_back =
+            AggregatedMessage::find_by_id(&blocked.id, &group_id, &account.pubkey, db)
+                .await
+                .unwrap()
+                .expect("blocked message should be retrievable");
+        let unblocked_back =
+            AggregatedMessage::find_by_id(&unblocked.id, &group_id, &account.pubkey, db)
+                .await
+                .unwrap()
+                .expect("unblocked message should be retrievable");
+
+        assert!(blocked_back.is_blocked, "is_blocked = true must round-trip");
+        assert!(
+            !unblocked_back.is_blocked,
+            "is_blocked = false must round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn reinsert_never_clobbers_frozen_is_blocked() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[1; 32]);
+        let author = Keys::generate().public_key();
+
+        // Originally cached while blocked, then re-ingested (relay echo)
+        // carrying the now-unblocked state. The frozen stamp must survive.
+        let mut msg = create_test_chat_message(1, author);
+        msg.is_blocked = true;
+        AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+
+        msg.is_blocked = false;
+        msg.content = "edited on re-ingest".to_string();
+        AggregatedMessage::insert_message(&msg, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+
+        let back = AggregatedMessage::find_by_id(&msg.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap()
+            .expect("message should be retrievable");
+        assert!(
+            back.is_blocked,
+            "ON CONFLICT DO UPDATE must not clear the frozen is_blocked stamp"
+        );
+        assert_eq!(
+            back.content, "edited on re-ingest",
+            "other columns still update on re-ingest — only is_blocked is frozen"
+        );
+
+        // Symmetric direction: originally unblocked, re-ingested after a block.
+        let mut msg2 = create_test_chat_message(2, author);
+        AggregatedMessage::insert_message(&msg2, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+        msg2.is_blocked = true;
+        AggregatedMessage::insert_message(&msg2, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+        let back2 = AggregatedMessage::find_by_id(&msg2.id, &group_id, &account.pubkey, db)
+            .await
+            .unwrap()
+            .expect("message should be retrievable");
+        assert!(
+            !back2.is_blocked,
+            "re-ingest must not raise the frozen stamp either"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_unread_includes_blocked_only_for_the_plain_variant() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[42; 32]);
+        let author = Keys::generate().public_key();
+
+        let m1 = create_test_chat_message(1, author);
+        let m2 = create_test_chat_message(2, author);
+        let mut blocked = create_test_chat_message(3, author);
+        blocked.is_blocked = true;
+        for m in [&m1, &m2, &blocked] {
+            AggregatedMessage::insert_message(m, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
+        }
+
+        // Group-chat projection: every non-deleted kind-9 row counts.
+        let total = AggregatedMessage::count_unread_for_group(&group_id, None, db, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 3, "plain count includes blocked-author messages");
+
+        // DM projection: excludes `is_blocked` rows. This reads the frozen
+        // stamp, not a live mute_list join — so a later unblock would not
+        // resurrect this message into the count.
+        let visible = AggregatedMessage::count_visible_unread_for_group(&group_id, None, db, None)
+            .await
+            .unwrap();
+        assert_eq!(visible, 2, "visible count drops the blocked-author message");
+    }
+
+    #[tokio::test]
+    async fn search_excludes_blocked_rows_and_shifts_visible_positions() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[43; 32]);
+        let author = Keys::generate().public_key();
+
+        let mut older = create_test_chat_message_with_content(1, author, "marmot one");
+        older.created_at = Timestamp::from(1000);
+        let mut blocked = create_test_chat_message_with_content(2, author, "marmot two");
+        blocked.created_at = Timestamp::from(2000);
+        blocked.is_blocked = true;
+        let mut newer = create_test_chat_message_with_content(3, author, "marmot three");
+        newer.created_at = Timestamp::from(3000);
+
+        for m in [&older, &blocked, &newer] {
+            AggregatedMessage::insert_message(m, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
+        }
+
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            &account.pubkey,
+            "marmot",
+            50,
+            db,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            results.len(),
+            2,
+            "the blocked row must not appear in search"
+        );
+        assert!(
+            !results.iter().any(|r| r.message.id == blocked.id),
+            "blocked message must be excluded from search hits"
+        );
+
+        // Positions are computed over the visible (is_blocked = 0) partition,
+        // so the older match sits at index 1 — the blocked row between them
+        // does not consume a position slot.
+        let older_hit = results
+            .iter()
+            .find(|r| r.message.id == older.id)
+            .expect("older message should be a search hit");
+        assert_eq!(
+            older_hit.position, 1,
+            "position must index into the visible list, skipping blocked rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_last_dm_skips_blocked_while_group_surfaces_it() {
+        use crate::whitenoise::accounts_groups::AccountGroup;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let author = Keys::generate().public_key();
+
+        let dm_group = GroupId::from_slice(&[50; 32]);
+        let chat_group = GroupId::from_slice(&[51; 32]);
+        let dm_all_blocked = GroupId::from_slice(&[52; 32]);
+
+        // `dm_peer_pubkey` set ⇒ DM; a group with no accounts_groups row is
+        // treated as a group chat by the LEFT JOIN.
+        let now = Utc::now();
+        for gid in [&dm_group, &dm_all_blocked] {
+            let ag = AccountGroup {
+                id: None,
+                account_pubkey: account.pubkey,
+                mls_group_id: gid.clone(),
+                user_confirmation: Some(true),
+                welcomer_pubkey: None,
+                last_read_message_id: None,
+                pin_order: None,
+                dm_peer_pubkey: Some(author),
+                archived_at: None,
+                removed_at: None,
+                self_removed: false,
+                muted_until: None,
+                chat_cleared_at: None,
+                created_at: now,
+                updated_at: now,
+            };
+            ag.save(&db.pool).await.unwrap();
+        }
+
+        // Each group: an older visible message and a newer blocked one.
+        for (i, gid) in [&dm_group, &chat_group, &dm_all_blocked]
+            .into_iter()
+            .enumerate()
+        {
+            let seed = i as u8 * 2 + 10;
+            let mut older = create_test_chat_message(seed, author);
+            older.created_at = Timestamp::from(1000);
+            // dm_all_blocked: even the older message is blocked.
+            older.is_blocked = gid == &dm_all_blocked;
+            let mut newer = create_test_chat_message(seed + 1, author);
+            newer.created_at = Timestamp::from(2000);
+            newer.is_blocked = true;
+            AggregatedMessage::insert_message(&older, gid, &account.pubkey, db)
+                .await
+                .unwrap();
+            AggregatedMessage::insert_message(&newer, gid, &account.pubkey, db)
+                .await
+                .unwrap();
+        }
+
+        let previews = AggregatedMessage::find_last_by_group_ids(
+            &[dm_group.clone(), chat_group.clone(), dm_all_blocked.clone()],
+            db,
+        )
+        .await
+        .unwrap();
+        let by_group: HashMap<GroupId, ChatMessageSummary> = previews
+            .into_iter()
+            .map(|s| (s.mls_group_id.clone(), s))
+            .collect();
+
+        // DM: the newer message is blocked, so the preview falls back to the
+        // older visible one (`created_at` is seconds-granularity nostr time).
+        let dm_preview = by_group.get(&dm_group).expect("DM should have a preview");
+        assert_eq!(dm_preview.created_at.timestamp(), 1000);
+        assert!(!dm_preview.is_blocked);
+
+        // Group chat: the preview is the newest row, blocked stamp surfaced.
+        let chat_preview = by_group
+            .get(&chat_group)
+            .expect("group chat should have a preview");
+        assert_eq!(chat_preview.created_at.timestamp(), 2000);
+        assert!(chat_preview.is_blocked);
+
+        // DM whose every message is blocked: no preview at all.
+        assert!(
+            !by_group.contains_key(&dm_all_blocked),
+            "a DM with only blocked messages has no chat-list preview"
+        );
+    }
+
+    #[tokio::test]
+    async fn stamp_recent_messages_stamps_only_post_block_rows() {
+        use crate::whitenoise::database::mute_list::MuteListEntry;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[60; 32]);
+        let muted = Keys::generate().public_key();
+
+        // Block recorded at event_created_at = 5_000_000 ms.
+        let block_at = DateTime::from_timestamp_millis(5_000_000).unwrap();
+        MuteListEntry::insert(&muted, true, block_at, &session.account_db)
+            .await
+            .unwrap();
+
+        // Two pre-block + two post-block messages, all currently unblocked.
+        // `created_at` is seconds; the column stores millis — 4000s = 4_000_000ms.
+        for (i, created_secs) in [4000u64, 4500, 6000, 7000].into_iter().enumerate() {
+            let mut m = create_test_chat_message(i as u8 + 1, muted);
+            m.created_at = Timestamp::from(created_secs);
+            AggregatedMessage::insert_message(&m, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
+        }
+
+        let added: HashSet<PublicKey> = [muted].into_iter().collect();
+        AggregatedMessage::stamp_recent_messages(&added, db)
+            .await
+            .unwrap();
+
+        let msgs = AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+            .await
+            .unwrap();
+        for m in &msgs {
+            let secs = m.created_at.as_secs();
+            if secs >= 5000 {
+                assert!(
+                    m.is_blocked,
+                    "post-block message at {secs}s must be stamped"
+                );
+            } else {
+                assert!(
+                    !m.is_blocked,
+                    "pre-block message at {secs}s must stay visible"
+                );
+            }
+        }
+
+        // Idempotency: a second sweep is a no-op.
+        AggregatedMessage::stamp_recent_messages(&added, db)
+            .await
+            .unwrap();
+        let after = AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.iter().filter(|m| m.is_blocked).count(),
+            2,
+            "second sweep must change nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn unstamp_recent_messages_clears_only_post_unblock_rows() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        let db = &session.account_db.inner;
+        let group_id = GroupId::from_slice(&[61; 32]);
+        let formerly_blocked = Keys::generate().public_key();
+        let other_blocked = Keys::generate().public_key();
+
+        let unblock_at = DateTime::from_timestamp_millis(5_000_000).unwrap();
+
+        // formerly_blocked: 2 during-block + 2 post-unblock rows, all stamped.
+        for (i, created_secs) in [4000u64, 4500, 6000, 7000].into_iter().enumerate() {
+            let mut m = create_test_chat_message(i as u8 + 1, formerly_blocked);
+            m.created_at = Timestamp::from(created_secs);
+            m.is_blocked = true;
+            AggregatedMessage::insert_message(&m, &group_id, &account.pubkey, db)
+                .await
+                .unwrap();
+        }
+        // A different, still-blocked author — must be untouched regardless of time.
+        let mut other = create_test_chat_message(5, other_blocked);
+        other.created_at = Timestamp::from(9000);
+        other.is_blocked = true;
+        AggregatedMessage::insert_message(&other, &group_id, &account.pubkey, db)
+            .await
+            .unwrap();
+
+        let removed: HashSet<PublicKey> = [formerly_blocked].into_iter().collect();
+        AggregatedMessage::unstamp_recent_messages(&removed, unblock_at, db)
+            .await
+            .unwrap();
+
+        let msgs = AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+            .await
+            .unwrap();
+        for m in &msgs {
+            if m.author == other_blocked {
+                assert!(m.is_blocked, "a different author's stamp must be untouched");
+            } else if m.created_at.as_secs() >= 5000 {
+                assert!(!m.is_blocked, "post-unblock message must be cleared");
+            } else {
+                assert!(m.is_blocked, "during-block message must keep its stamp");
+            }
+        }
+
+        // Idempotency: 2 during-block + 1 other-author row stay blocked.
+        AggregatedMessage::unstamp_recent_messages(&removed, unblock_at, db)
+            .await
+            .unwrap();
+        let after = AggregatedMessage::find_messages_by_group(&group_id, &account.pubkey, None, db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.iter().filter(|m| m.is_blocked).count(),
+            3,
+            "second sweep must change nothing"
+        );
     }
 
     #[tokio::test]
@@ -3167,6 +3685,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
+            is_blocked: false,
             content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
@@ -4516,6 +5035,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
+            is_blocked: false,
             content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
@@ -4564,6 +5084,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
+            is_blocked: false,
             content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,
@@ -4778,6 +5299,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: ReactionSummary::default(),
                 kind: 9,
@@ -5105,6 +5627,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: ReactionSummary::default(),
                 kind: 9,

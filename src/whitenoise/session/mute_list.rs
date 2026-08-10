@@ -7,16 +7,21 @@
 
 use std::collections::HashSet;
 
-use nostr_sdk::{Event, EventBuilder, Filter, Kind, NostrSigner, PublicKey, Tag, TagStandard};
+use chrono::{DateTime, Utc};
+use nostr_sdk::{
+    Event, EventBuilder, Filter, Kind, NostrSigner, PublicKey, Tag, TagStandard, Timestamp,
+};
 
 use super::AccountSession;
 use crate::perf_instrument;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
+use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
 use crate::whitenoise::database::mute_list::MuteListEntry;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::relays::{Relay, RelayType};
+use crate::whitenoise::utils::timestamp_to_datetime;
 
 /// Account-scoped mute list operations.
 pub struct MuteListOps<'a> {
@@ -64,9 +69,21 @@ impl<'a> MuteListOps<'a> {
             return Ok(());
         }
 
-        MuteListEntry::insert(target_pubkey, true, self.db()).await?;
+        // Decide the block's event timestamp once. The local row and the
+        // kind-10000 event we publish must carry the *same* `created_at` so
+        // every device that later syncs the event agrees on the block
+        // boundary (`publish_mute_list` pins the event to this value).
+        let event_created_at = Timestamp::now();
 
-        if let Err(e) = self.publish_mute_list().await {
+        MuteListEntry::insert(
+            target_pubkey,
+            true,
+            timestamp_to_datetime(event_created_at)?,
+            self.db(),
+        )
+        .await?;
+
+        if let Err(e) = self.publish_mute_list(event_created_at).await {
             // Roll back the local insert so a retry runs the full flow from scratch.
             if let Err(rb_err) = MuteListEntry::delete(target_pubkey, self.db()).await {
                 tracing::warn!(
@@ -79,7 +96,7 @@ impl<'a> MuteListOps<'a> {
             return Err(e);
         }
 
-        self.emit_block_changed(target_pubkey).await;
+        self.emit_block_changed_all_groups().await;
 
         Ok(())
     }
@@ -110,16 +127,16 @@ impl<'a> MuteListOps<'a> {
             return Ok(());
         }
 
-        // Capture is_private before deleting so the rollback re-inserts the
-        // entry exactly as it was. If the entry vanished between the
-        // exists-check above and now (concurrent sync from another flow
-        // removed it), the user is already not blocked locally and any
-        // republish is the responsibility of the operation that wiped the
-        // entry. Treat this as a no-op: skip delete + publish entirely so
-        // the rollback path can't re-insert the row we just observed gone.
-        let is_private = match MuteListEntry::find_by_muted_pubkey(target_pubkey, self.db()).await?
-        {
-            Some(e) => e.is_private,
+        // Capture the entry before deleting so the rollback re-inserts it
+        // exactly as it was (same `is_private`, same `event_created_at`). If
+        // the entry vanished between the exists-check above and now
+        // (concurrent sync from another flow removed it), the user is
+        // already not blocked locally and any republish is the
+        // responsibility of the operation that wiped the entry. Treat this
+        // as a no-op: skip delete + publish entirely so the rollback path
+        // can't re-insert the row we just observed gone.
+        let entry = match MuteListEntry::find_by_muted_pubkey(target_pubkey, self.db()).await? {
+            Some(e) => e,
             None => {
                 tracing::warn!(
                     target: "whitenoise::mute_list",
@@ -133,9 +150,20 @@ impl<'a> MuteListOps<'a> {
 
         MuteListEntry::delete(target_pubkey, self.db()).await?;
 
-        if let Err(e) = self.publish_mute_list().await {
+        // The unblock publishes a fresh kind-10000 event; its `created_at`
+        // is the cross-device reference for the post-sync unstamp sweep.
+        let event_created_at = Timestamp::now();
+
+        if let Err(e) = self.publish_mute_list(event_created_at).await {
             // Roll back the local delete so a retry runs the full flow from scratch.
-            if let Err(rb_err) = MuteListEntry::insert(target_pubkey, is_private, self.db()).await {
+            if let Err(rb_err) = MuteListEntry::insert(
+                target_pubkey,
+                entry.is_private,
+                entry.event_created_at,
+                self.db(),
+            )
+            .await
+            {
                 tracing::warn!(
                     target: "whitenoise::mute_list",
                     "Failed to roll back local unblock delete for {}: {}",
@@ -146,7 +174,7 @@ impl<'a> MuteListOps<'a> {
             return Err(e);
         }
 
-        self.emit_block_changed(target_pubkey).await;
+        self.emit_block_changed_all_groups().await;
 
         Ok(())
     }
@@ -165,18 +193,42 @@ impl<'a> MuteListOps<'a> {
         Ok(blocked)
     }
 
-    /// Replaces the mute list cache and emits `UserBlockChanged` for every
-    /// pubkey that was added or removed compared to the previous state.
-    pub(crate) async fn sync_and_emit(&self, entries: &[(PublicKey, bool)]) -> Result<()> {
+    /// Replaces the mute list cache from a synced kind-10000 event, runs the
+    /// post-sync stamp/unstamp sweeps, and fans out `UserBlockChanged`.
+    ///
+    /// `event_created_at` is the synced event's `created_at`. The sweeps
+    /// reconcile messages that this device cached under an obsolete mute-list
+    /// state (the cold-start window); they no-op when their pubkey set is
+    /// empty. The emit fan-out runs once per group, not once per changed
+    /// pubkey.
+    pub(crate) async fn sync_and_emit(
+        &self,
+        entries: &[(PublicKey, bool)],
+        event_created_at: DateTime<Utc>,
+    ) -> Result<()> {
         let old = MuteListEntry::find_all(self.db()).await?;
         let old_pubkeys: HashSet<PublicKey> = old.iter().map(|e| e.muted_pubkey).collect();
 
-        MuteListEntry::sync_from_event(entries, self.db()).await?;
+        MuteListEntry::sync_from_event(entries, event_created_at, self.db()).await?;
 
         let new_pubkeys: HashSet<PublicKey> = entries.iter().map(|(pk, _)| *pk).collect();
+        let added: HashSet<PublicKey> = new_pubkeys.difference(&old_pubkeys).copied().collect();
+        let removed: HashSet<PublicKey> = old_pubkeys.difference(&new_pubkeys).copied().collect();
 
-        for pubkey in old_pubkeys.symmetric_difference(&new_pubkeys) {
-            self.emit_block_changed(pubkey).await;
+        // Stamp sweep — newly-blocked pubkeys, post-block messages.
+        // Unstamp sweep — newly-unblocked pubkeys, post-unblock messages.
+        // Both no-op internally on an empty set.
+        AggregatedMessage::stamp_recent_messages(&added, &self.session.account_db.inner).await?;
+        AggregatedMessage::unstamp_recent_messages(
+            &removed,
+            event_created_at,
+            &self.session.account_db.inner,
+        )
+        .await?;
+
+        // One emit per group regardless of how many pubkeys changed.
+        if !added.is_empty() || !removed.is_empty() {
+            self.emit_block_changed_all_groups().await;
         }
 
         Ok(())
@@ -186,8 +238,12 @@ impl<'a> MuteListOps<'a> {
 
     /// Fetches the latest kind 10000 mute list from relays, decrypts the
     /// private section, and replaces the local cache.
+    ///
+    /// `pub(crate)` so the cold-start gate
+    /// ([`Whitenoise::wait_for_mute_list_sync_or_timeout`](crate::Whitenoise::wait_for_mute_list_sync_or_timeout))
+    /// can populate the mute list before inbox events are processed.
     #[perf_instrument("mute_list")]
-    async fn sync_mute_list(&self) -> Result<()> {
+    pub(crate) async fn sync_mute_list(&self) -> Result<()> {
         let signer = self.require_signer().await?;
         let relay_urls = self.account_relay_urls().await;
 
@@ -223,7 +279,12 @@ impl<'a> MuteListOps<'a> {
             return Ok(());
         };
 
-        MuteListEntry::sync_from_event(&entries, self.db()).await?;
+        MuteListEntry::sync_from_event(
+            &entries,
+            timestamp_to_datetime(event.created_at)?,
+            self.db(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -301,8 +362,13 @@ impl<'a> MuteListOps<'a> {
     ///
     /// Private entries are NIP-44 encrypted in the event content.
     /// Public entries are in the event tags.
+    ///
+    /// `created_at` pins the event's timestamp via `custom_created_at`, so it
+    /// equals the `event_created_at` the caller stored on the affected
+    /// `mute_list` row. Other devices read this same value when they sync,
+    /// keeping the block boundary deterministic across devices.
     #[perf_instrument("mute_list")]
-    async fn publish_mute_list(&self) -> Result<()> {
+    async fn publish_mute_list(&self, created_at: Timestamp) -> Result<()> {
         let signer = self.require_signer().await?;
         let relay_urls = self.account_relay_urls().await;
 
@@ -331,7 +397,9 @@ impl<'a> MuteListOps<'a> {
                 .map_err(|e| WhitenoiseError::InvalidInput(e.to_string()))?
         };
 
-        let event_builder = EventBuilder::new(Kind::MuteList, content).tags(public_tags);
+        let event_builder = EventBuilder::new(Kind::MuteList, content)
+            .tags(public_tags)
+            .custom_created_at(created_at);
         let event = event_builder
             .sign(&signer)
             .await
@@ -346,29 +414,35 @@ impl<'a> MuteListOps<'a> {
         Ok(())
     }
 
-    /// Emits a `UserBlockChanged` chat list update for the DM group with the
-    /// target user, if one exists.
-    async fn emit_block_changed(&self, target_pubkey: &PublicKey) {
-        match AccountGroup::find_dm_group_id_by_peer(
-            target_pubkey,
+    /// Fans out a `UserBlockChanged` chat-list update to every group this
+    /// account is in.
+    ///
+    /// A block/unblock now stamps `is_blocked` on individual rows going
+    /// forward, so per-row rendering must refresh across *every* group the
+    /// changed pubkey participates in — not just the DM. `UserBlockChanged`
+    /// is idempotent on the frontend, so emitting to groups that don't
+    /// contain the pubkey is a harmless no-op refresh, and "groups containing
+    /// pubkey X" is not a query the codebase exposes.
+    async fn emit_block_changed_all_groups(&self) {
+        let groups = AccountGroup::find_all_for_account(
+            &self.session.account_pubkey,
             &self.session.account_db.inner.pool,
         )
         .await
-        {
-            Ok(Some(group_id)) => {
-                self.session
-                    .chat_list()
-                    .emit_update(&group_id, ChatListUpdateTrigger::UserBlockChanged)
-                    .await;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::mute_list",
-                    "Failed to look up DM group for block change emission: {}",
-                    e,
-                );
-            }
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "whitenoise::mute_list",
+                "Failed to enumerate groups for block-change fan-out: {}",
+                e,
+            );
+            Vec::new()
+        });
+
+        for group in &groups {
+            self.session
+                .chat_list()
+                .emit_update(&group.mls_group_id, ChatListUpdateTrigger::UserBlockChanged)
+                .await;
         }
     }
 

@@ -985,6 +985,14 @@ impl Whitenoise {
 
         init_timing::record("session_restore");
 
+        // Sync each account's mute list before any code path can write
+        // `aggregated_messages` rows. `sync_message_cache_on_startup` below
+        // hydrates the cache with whatever's in the local mute list at the
+        // time, so a stale list would mass-stamp blocked authors as visible.
+        // Bounded; the post-sync stamp/unstamp sweeps reconcile any residual.
+        whitenoise.wait_for_mute_list_sync_or_timeout().await;
+        init_timing::record("mute_list_cold_start_sync");
+
         tracing::info!(
             target: "whitenoise::new",
             "Synchronizing message cache with MDK..."
@@ -1096,6 +1104,57 @@ impl Whitenoise {
         init_timing::report();
 
         Ok(whitenoise)
+    }
+
+    /// Deadline for the cold-start mute-list sync gate. A slow or unreachable
+    /// relay must never stall startup past this; the post-sync stamp/unstamp
+    /// sweeps reconcile anything that slips past.
+    const COLD_START_MUTE_LIST_SYNC_DEADLINE: std::time::Duration =
+        std::time::Duration::from_secs(2);
+
+    /// Cold-start gate: best-effort sync of every active account's mute list,
+    /// bounded by [`Self::COLD_START_MUTE_LIST_SYNC_DEADLINE`].
+    ///
+    /// On a cold start the device can process inbox events before it has
+    /// learned of a recent block; without this gate those messages would be
+    /// cached unstamped. Syncing the mute list first closes most of that
+    /// window.
+    ///
+    /// This is an optimization, not a correctness guarantee: a relay that
+    /// misses the deadline leaves the residual gap to the post-sync sweeps,
+    /// which run from `sync_and_emit` once the kind-10000 event eventually
+    /// arrives.
+    pub(crate) async fn wait_for_mute_list_sync_or_timeout(&self) {
+        let sessions: Vec<_> = self.account_manager.sessions_iter().collect();
+        if sessions.is_empty() {
+            return;
+        }
+
+        // Drive every account's sync concurrently and apply the deadline to
+        // the aggregate, so a single slow relay can't starve other accounts
+        // out of their share of the budget.
+        let sync_all = futures::future::join_all(sessions.iter().map(|session| async move {
+            if let Err(e) = session.mute_list().sync_mute_list().await {
+                tracing::warn!(
+                    target: "whitenoise::mute_list",
+                    "Cold-start mute-list sync failed for {}: {}",
+                    session.account_pubkey,
+                    e,
+                );
+            }
+        }));
+
+        if tokio::time::timeout(Self::COLD_START_MUTE_LIST_SYNC_DEADLINE, sync_all)
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                target: "whitenoise::mute_list",
+                "Cold-start mute-list sync hit the {}ms deadline; \
+                 post-sync sweeps will reconcile any gap",
+                Self::COLD_START_MUTE_LIST_SYNC_DEADLINE.as_millis(),
+            );
+        }
     }
 
     /// Buffer (in seconds) used when resubscribing after a teardown/rebuild
@@ -3155,6 +3214,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -3170,6 +3230,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -3236,6 +3297,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -3291,6 +3353,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -3696,6 +3759,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -3787,6 +3851,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -3846,6 +3911,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -3901,6 +3967,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -4105,6 +4172,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -4120,6 +4188,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -4337,6 +4406,7 @@ mod tests {
                 is_reply: false,
                 reply_to_id: None,
                 is_deleted: false,
+                is_blocked: false,
                 content_tokens: whitenoise_markdown::Document::default(),
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
@@ -5130,6 +5200,7 @@ mod tests {
                     is_reply: false,
                     reply_to_id: None,
                     is_deleted: false,
+                    is_blocked: false,
                     content_tokens: whitenoise_markdown::Document::default(),
                     reactions: message_aggregator::ReactionSummary::default(),
                     kind: 9,

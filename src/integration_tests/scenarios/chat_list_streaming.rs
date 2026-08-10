@@ -103,6 +103,13 @@ impl ChatListStreamingScenario {
     async fn phase5_test_last_message_deleted(&mut self) -> Result<(), WhitenoiseError> {
         tracing::info!("=== Phase 5: Test LastMessageDeleted update ===");
 
+        // Nostr timestamps are seconds-granularity. Phase 4 sent its message
+        // less than a second ago, so without this pause `msg_stream_2` could
+        // share `created_at` with it — and "newest" would then come down to
+        // the same-timestamp tie-break, which is not what this phase aims to
+        // exercise.
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
         // First send another message that will become the new "last message" after deletion
         SendMessageTestCase::basic()
             .with_sender("stream_creator")

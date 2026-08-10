@@ -5,6 +5,7 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::session::MuteListOps;
+use crate::whitenoise::utils::timestamp_to_datetime;
 
 impl Whitenoise {
     /// Handles an incoming kind 10000 mute list event (our own, from another
@@ -31,7 +32,10 @@ impl Whitenoise {
             return Ok(());
         };
 
-        session.mute_list().sync_and_emit(&entries).await?;
+        session
+            .mute_list()
+            .sync_and_emit(&entries, timestamp_to_datetime(event.created_at)?)
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::event_processor::handle_mute_list",
@@ -121,7 +125,7 @@ mod tests {
         let session = whitenoise.require_session(&account.pubkey).unwrap();
 
         // Pre-populate the cache
-        MuteListEntry::insert(&pre_existing, true, &session.account_db)
+        MuteListEntry::insert(&pre_existing, true, chrono::Utc::now(), &session.account_db)
             .await
             .unwrap();
 

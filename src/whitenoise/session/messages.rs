@@ -408,7 +408,10 @@ impl<'a> MessageOpsForGroup<'a> {
         &self,
         mdk_message: &mdk_core::prelude::message_types::Message,
     ) -> Result<()> {
-        AggregatedMessage::insert_reaction(mdk_message, self.group_id, self.db()).await?;
+        // Outgoing: the author is this account, which cannot be on its own
+        // mute list (the `block_user` self-guard prevents it), so `is_blocked`
+        // is unconditionally `false`.
+        AggregatedMessage::insert_reaction(mdk_message, self.group_id, false, self.db()).await?;
         AggregatedMessage::insert_delivery_status(
             &mdk_message.id.to_string(),
             self.group_id,
@@ -456,7 +459,9 @@ impl<'a> MessageOpsForGroup<'a> {
         &self,
         mdk_message: &mdk_core::prelude::message_types::Message,
     ) -> Result<bool> {
-        AggregatedMessage::insert_deletion(mdk_message, self.group_id, self.db()).await?;
+        // Outgoing: the author is this account — see the note in
+        // `cache_and_apply_outgoing_reaction` — so `is_blocked` is `false`.
+        AggregatedMessage::insert_deletion(mdk_message, self.group_id, false, self.db()).await?;
         AggregatedMessage::insert_delivery_status(
             &mdk_message.id.to_string(),
             self.group_id,

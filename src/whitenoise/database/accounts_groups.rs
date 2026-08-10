@@ -134,12 +134,7 @@ impl AccountGroup {
         pool: &SqlitePool,
     ) -> Result<Option<Self>, sqlx::Error> {
         let row = sqlx::query_as::<_, LocalAccountGroupRow>(
-            "SELECT id, mls_group_id, user_confirmation, welcomer_pubkey,
-                    last_read_message_id, pin_order, dm_peer_pubkey,
-                    archived_at, removed_at, self_removed, muted_until,
-                    chat_cleared_at, created_at, updated_at
-             FROM accounts_groups
-             WHERE mls_group_id = ?",
+            "SELECT * FROM accounts_groups WHERE mls_group_id = ?",
         )
         .bind(mls_group_id.as_slice())
         .fetch_optional(pool)
@@ -188,11 +183,7 @@ impl AccountGroup {
         pool: &SqlitePool,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let rows = sqlx::query_as::<_, LocalAccountGroupRow>(
-            "SELECT id, mls_group_id, user_confirmation, welcomer_pubkey,
-                    last_read_message_id, pin_order, dm_peer_pubkey,
-                    archived_at, removed_at, self_removed, muted_until,
-                    chat_cleared_at, created_at, updated_at
-             FROM accounts_groups
+            "SELECT * FROM accounts_groups
              WHERE user_confirmation IS NULL OR user_confirmation = 1",
         )
         .fetch_all(pool)
@@ -211,11 +202,7 @@ impl AccountGroup {
         pool: &SqlitePool,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let rows = sqlx::query_as::<_, LocalAccountGroupRow>(
-            "SELECT id, mls_group_id, user_confirmation, welcomer_pubkey,
-                    last_read_message_id, pin_order, dm_peer_pubkey,
-                    archived_at, removed_at, self_removed, muted_until,
-                    chat_cleared_at, created_at, updated_at
-             FROM accounts_groups
+            "SELECT * FROM accounts_groups
              WHERE user_confirmation IS NULL
                AND removed_at IS NULL",
         )
@@ -658,6 +645,27 @@ impl AccountGroup {
         Ok(results)
     }
 
+    /// Returns every `AccountGroup` for this account, with no filtering.
+    ///
+    /// Distinct from `find_visible_for_account` / `find_pending_for_account`:
+    /// archived, declined, and removed rows are all returned. This is
+    /// load-bearing — the `UserBlockChanged` chat-list fan-out needs to reach
+    /// every group the account has ever joined; tightening the filter here
+    /// would silently break that.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn find_all_for_account(
+        account_pubkey: &PublicKey,
+        pool: &SqlitePool,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, LocalAccountGroupRow>("SELECT * FROM accounts_groups")
+            .fetch_all(pool)
+            .await?;
+
+        rows.into_iter()
+            .map(|r| r.into_account_group(*account_pubkey))
+            .collect()
+    }
+
     /// Finds visible groups that are missing `dm_peer_pubkey`.
     ///
     /// Used by the startup backfill to identify records that need population.
@@ -1096,5 +1104,67 @@ mod tests {
         let removed = removed.unwrap();
         assert!(removed.removed_at.is_some());
         assert!(!removed.self_removed);
+    }
+
+    #[tokio::test]
+    async fn test_find_all_for_account_empty() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
+        let groups = AccountGroup::find_all_for_account(&pubkey, &pool)
+            .await
+            .unwrap();
+        assert!(groups.is_empty());
+    }
+
+    /// `find_all_for_account` deliberately returns *every* row regardless of
+    /// visibility / archive / removed state — the contract its caller
+    /// (the `UserBlockChanged` fan-out) depends on. This pins that contract
+    /// against a future "tighter filter" refactor.
+    #[tokio::test]
+    async fn test_find_all_for_account_returns_every_group_regardless_of_state() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
+
+        let visible = GroupId::from_slice(&[10; 32]);
+        let archived = GroupId::from_slice(&[11; 32]);
+        let declined = GroupId::from_slice(&[12; 32]);
+        let removed = GroupId::from_slice(&[13; 32]);
+
+        AccountGroup::find_or_create(&pubkey, &visible, None, &pool)
+            .await
+            .unwrap();
+        let (ag_archived, _) = AccountGroup::find_or_create(&pubkey, &archived, None, &pool)
+            .await
+            .unwrap();
+        let (ag_declined, _) = AccountGroup::find_or_create(&pubkey, &declined, None, &pool)
+            .await
+            .unwrap();
+        let (ag_removed, _) = AccountGroup::find_or_create(&pubkey, &removed, None, &pool)
+            .await
+            .unwrap();
+
+        ag_archived
+            .update_archived_at(Some(Utc::now()), &pool)
+            .await
+            .unwrap();
+        ag_declined
+            .update_user_confirmation(false, &pool)
+            .await
+            .unwrap();
+        ag_removed.mark_removed_atomic(&pool).await.unwrap();
+
+        let ids: std::collections::HashSet<GroupId> =
+            AccountGroup::find_all_for_account(&pubkey, &pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|ag| ag.mls_group_id)
+                .collect();
+
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains(&visible));
+        assert!(ids.contains(&archived));
+        assert!(ids.contains(&declined));
+        assert!(ids.contains(&removed));
     }
 }

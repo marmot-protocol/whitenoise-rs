@@ -78,6 +78,7 @@ scenario_registry! {
     "metadata-management" => MetadataManagementScenario,
     "mute-list" => MuteListScenario,
     "basic-messaging" => BasicMessagingScenario,
+    "block-filters-messages" => BlockFiltersMessagesScenario,
     "follow-management" => FollowManagementScenario,
     "subscription-processing" => SubscriptionProcessingScenario,
     "advanced-messaging" => AdvancedMessagingScenario,
@@ -210,6 +211,7 @@ mod tests {
         assert!(parse_scenario_name("drafts").is_ok());
         assert!(parse_scenario_name("metadata-management").is_ok());
         assert!(parse_scenario_name("basic-messaging").is_ok());
+        assert!(parse_scenario_name("block-filters-messages").is_ok());
         assert!(parse_scenario_name("follow-management").is_ok());
         assert!(parse_scenario_name("subscription-processing").is_ok());
         assert!(parse_scenario_name("advanced-messaging").is_ok());
@@ -261,6 +263,7 @@ mod tests {
             "advanced-messaging",
             "app-settings",
             "basic-messaging",
+            "block-filters-messages",
             "chat-list",
             "chat-list-streaming",
             "chat-media-upload",

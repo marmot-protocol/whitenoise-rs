@@ -8,6 +8,7 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
+        database::mute_list::MuteListEntry,
         error::Result,
         media_files::MediaFile,
         message_aggregator::{ChatMessage, SearchResult},
@@ -298,9 +299,20 @@ impl Whitenoise {
             .aggregate_messages_for_group(pubkey, group_id, new_events.clone(), media_files)
             .await?;
 
+        // Snapshot the muted authors once and let `save_events` stamp
+        // `is_blocked` per row — same frozen-at-ingest pattern as the
+        // single-message insert path, batched for hydration.
+        let muted_pubkeys: std::collections::HashSet<PublicKey> =
+            MuteListEntry::find_all(&session.account_db)
+                .await?
+                .into_iter()
+                .map(|entry| entry.muted_pubkey)
+                .collect();
+
         AggregatedMessage::save_events(
             new_events,
             processed_messages,
+            &muted_pubkeys,
             group_id,
             &session.account_db.inner,
         )
@@ -340,6 +352,7 @@ mod tests {
             is_reply: false,
             reply_to_id: None,
             is_deleted: false,
+            is_blocked: false,
             content_tokens: whitenoise_markdown::Document::default(),
             reactions: ReactionSummary::default(),
             kind: 9,

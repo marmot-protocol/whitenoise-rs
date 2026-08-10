@@ -17,6 +17,7 @@ struct LocalRow {
     muted_pubkey: PublicKey,
     is_private: bool,
     created_at: DateTime<Utc>,
+    event_created_at: DateTime<Utc>,
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for LocalRow
@@ -36,11 +37,13 @@ where
 
         let is_private: i64 = row.try_get("is_private")?;
         let created_at = parse_timestamp(row, "created_at")?;
+        let event_created_at = parse_timestamp(row, "event_created_at")?;
 
         Ok(Self {
             muted_pubkey,
             is_private: is_private != 0,
             created_at,
+            event_created_at,
         })
     }
 }
@@ -53,7 +56,13 @@ where
 pub struct MuteListEntry {
     pub muted_pubkey: PublicKey,
     pub is_private: bool,
+    /// Per-device insert time — when this row was written on *this* device.
     pub created_at: DateTime<Utc>,
+    /// The originating kind-10000 mute-list event's `created_at`. Identical
+    /// across devices for the same logical block, so the block/unblock
+    /// backfill and sweeps use it (not `created_at`) as the boundary between
+    /// pre- and post-block messages.
+    pub event_created_at: DateTime<Utc>,
 }
 
 impl From<LocalRow> for MuteListEntry {
@@ -62,25 +71,33 @@ impl From<LocalRow> for MuteListEntry {
             muted_pubkey: row.muted_pubkey,
             is_private: row.is_private,
             created_at: row.created_at,
+            event_created_at: row.event_created_at,
         }
     }
 }
 
 impl MuteListEntry {
     /// Inserts a new mute list entry. Ignores duplicates (UNIQUE constraint).
+    ///
+    /// `event_created_at` is the originating kind-10000 event's `created_at`
+    /// — see [`MuteListEntry::event_created_at`]. `created_at` (per-device
+    /// insert time) is stamped here as `Utc::now()`.
     #[perf_instrument("mute_list")]
     pub async fn insert(
         muted_pubkey: &PublicKey,
         is_private: bool,
+        event_created_at: DateTime<Utc>,
         db: &AccountDatabase,
     ) -> std::result::Result<(), DatabaseError> {
         sqlx::query(
-            "INSERT OR IGNORE INTO mute_list (muted_pubkey, is_private, created_at)
-             VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO mute_list
+                (muted_pubkey, is_private, created_at, event_created_at)
+             VALUES (?, ?, ?, ?)",
         )
         .bind(muted_pubkey.to_hex())
         .bind(i64::from(is_private))
         .bind(Utc::now().timestamp_millis())
+        .bind(event_created_at.timestamp_millis())
         .execute(&db.inner.pool)
         .await?;
         Ok(())
@@ -103,7 +120,7 @@ impl MuteListEntry {
     #[perf_instrument("mute_list")]
     pub async fn find_all(db: &AccountDatabase) -> std::result::Result<Vec<Self>, DatabaseError> {
         let rows: Vec<LocalRow> = sqlx::query_as(
-            "SELECT muted_pubkey, is_private, created_at
+            "SELECT muted_pubkey, is_private, created_at, event_created_at
              FROM mute_list
              ORDER BY created_at DESC",
         )
@@ -120,7 +137,7 @@ impl MuteListEntry {
         db: &AccountDatabase,
     ) -> std::result::Result<Option<Self>, DatabaseError> {
         let row: Option<LocalRow> = sqlx::query_as(
-            "SELECT muted_pubkey, is_private, created_at
+            "SELECT muted_pubkey, is_private, created_at, event_created_at
              FROM mute_list
              WHERE muted_pubkey = ?",
         )
@@ -148,9 +165,14 @@ impl MuteListEntry {
 
     /// Replaces all mute list entries with the provided list. Used when
     /// syncing from a kind 10000 event received from relays.
+    ///
+    /// `event_created_at` is the synced event's `created_at` — every row
+    /// written by this call shares it, because they all originate from the
+    /// same kind-10000 event.
     #[perf_instrument("mute_list")]
     pub async fn sync_from_event(
         entries: &[(PublicKey, bool)],
+        event_created_at: DateTime<Utc>,
         db: &AccountDatabase,
     ) -> std::result::Result<(), DatabaseError> {
         let mut txn = db.inner.pool.begin().await?;
@@ -158,6 +180,8 @@ impl MuteListEntry {
         sqlx::query("DELETE FROM mute_list")
             .execute(&mut *txn)
             .await?;
+
+        let event_created_at_ms = event_created_at.timestamp_millis();
 
         // INSERT OR IGNORE: if the same pubkey appears more than once in the
         // event (e.g. in both the public tags and the encrypted private section)
@@ -167,12 +191,14 @@ impl MuteListEntry {
         // before private-section entries in `parse_mute_list_entries`.
         for (muted_pubkey, is_private) in entries {
             sqlx::query(
-                "INSERT OR IGNORE INTO mute_list (muted_pubkey, is_private, created_at)
-                 VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO mute_list
+                    (muted_pubkey, is_private, created_at, event_created_at)
+                 VALUES (?, ?, ?, ?)",
             )
             .bind(muted_pubkey.to_hex())
             .bind(i64::from(*is_private))
             .bind(Utc::now().timestamp_millis())
+            .bind(event_created_at_ms)
             .execute(&mut *txn)
             .await?;
         }
@@ -209,13 +235,14 @@ mod tests {
             .unwrap();
         sqlx::query(
             "CREATE TABLE mute_list (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                muted_pubkey  TEXT NOT NULL UNIQUE
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                muted_pubkey      TEXT NOT NULL UNIQUE
                     CHECK (length(muted_pubkey) = 64
                            AND muted_pubkey GLOB '[0-9a-fA-F]*'),
-                is_private    INTEGER NOT NULL DEFAULT 1
+                is_private        INTEGER NOT NULL DEFAULT 1
                     CHECK (is_private IN (0, 1)),
-                created_at    INTEGER NOT NULL
+                created_at        INTEGER NOT NULL,
+                event_created_at  INTEGER NOT NULL
             )",
         )
         .execute(&db.inner.pool)
@@ -225,6 +252,12 @@ mod tests {
         (db, temp_dir)
     }
 
+    /// A fixed, recognisable `event_created_at` for tests that don't care
+    /// about the specific value.
+    fn sample_event_created_at() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()
+    }
+
     #[tokio::test]
     async fn insert_and_exists() {
         let (db, _tmp) = create_test_db().await;
@@ -232,7 +265,9 @@ mod tests {
 
         assert!(!MuteListEntry::exists(&target, &db).await.unwrap());
 
-        MuteListEntry::insert(&target, true, &db).await.unwrap();
+        MuteListEntry::insert(&target, true, sample_event_created_at(), &db)
+            .await
+            .unwrap();
 
         assert!(MuteListEntry::exists(&target, &db).await.unwrap());
     }
@@ -242,8 +277,12 @@ mod tests {
         let (db, _tmp) = create_test_db().await;
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&target, true, &db).await.unwrap();
-        MuteListEntry::insert(&target, true, &db).await.unwrap();
+        MuteListEntry::insert(&target, true, sample_event_created_at(), &db)
+            .await
+            .unwrap();
+        MuteListEntry::insert(&target, true, sample_event_created_at(), &db)
+            .await
+            .unwrap();
 
         let entries = MuteListEntry::find_all(&db).await.unwrap();
         assert_eq!(entries.len(), 1);
@@ -254,7 +293,9 @@ mod tests {
         let (db, _tmp) = create_test_db().await;
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&target, true, &db).await.unwrap();
+        MuteListEntry::insert(&target, true, sample_event_created_at(), &db)
+            .await
+            .unwrap();
         MuteListEntry::delete(&target, &db).await.unwrap();
 
         assert!(!MuteListEntry::exists(&target, &db).await.unwrap());
@@ -266,8 +307,12 @@ mod tests {
         let (db2, _tmp2) = create_test_db().await;
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&target, true, &db1).await.unwrap();
-        MuteListEntry::insert(&target, false, &db2).await.unwrap();
+        MuteListEntry::insert(&target, true, sample_event_created_at(), &db1)
+            .await
+            .unwrap();
+        MuteListEntry::insert(&target, false, sample_event_created_at(), &db2)
+            .await
+            .unwrap();
 
         let entries = MuteListEntry::find_all(&db1).await.unwrap();
         assert_eq!(entries.len(), 1);
@@ -285,10 +330,12 @@ mod tests {
         let new_target1 = Keys::generate().public_key();
         let new_target2 = Keys::generate().public_key();
 
-        MuteListEntry::insert(&old_target, true, &db).await.unwrap();
+        MuteListEntry::insert(&old_target, true, sample_event_created_at(), &db)
+            .await
+            .unwrap();
 
         let new_entries = vec![(new_target1, true), (new_target2, false)];
-        MuteListEntry::sync_from_event(&new_entries, &db)
+        MuteListEntry::sync_from_event(&new_entries, sample_event_created_at(), &db)
             .await
             .unwrap();
 
@@ -307,7 +354,9 @@ mod tests {
 
         // Same pubkey appears twice (e.g. in both public and private sections of one event)
         let entries = vec![(target, false), (target, true)];
-        MuteListEntry::sync_from_event(&entries, &db).await.unwrap();
+        MuteListEntry::sync_from_event(&entries, sample_event_created_at(), &db)
+            .await
+            .unwrap();
 
         let result = MuteListEntry::find_all(&db).await.unwrap();
         assert_eq!(result.len(), 1);
@@ -319,12 +368,57 @@ mod tests {
         let (db, _tmp) = create_test_db().await;
         let target = Keys::generate().public_key();
 
-        MuteListEntry::insert(&target, true, &db).await.unwrap();
+        MuteListEntry::insert(&target, true, sample_event_created_at(), &db)
+            .await
+            .unwrap();
 
-        MuteListEntry::sync_from_event(&[], &db).await.unwrap();
+        MuteListEntry::sync_from_event(&[], sample_event_created_at(), &db)
+            .await
+            .unwrap();
 
         assert!(!MuteListEntry::exists(&target, &db).await.unwrap());
         let entries = MuteListEntry::find_all(&db).await.unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_persists_event_created_at() {
+        let (db, _tmp) = create_test_db().await;
+        let target = Keys::generate().public_key();
+        let event_created_at = DateTime::from_timestamp_millis(1_711_111_111_000).unwrap();
+
+        MuteListEntry::insert(&target, true, event_created_at, &db)
+            .await
+            .unwrap();
+
+        let entry = MuteListEntry::find_by_muted_pubkey(&target, &db)
+            .await
+            .unwrap()
+            .expect("entry should exist");
+        assert_eq!(
+            entry.event_created_at, event_created_at,
+            "event_created_at must round-trip through storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_from_event_stamps_event_created_at_on_every_row() {
+        let (db, _tmp) = create_test_db().await;
+        let t1 = Keys::generate().public_key();
+        let t2 = Keys::generate().public_key();
+        let event_created_at = DateTime::from_timestamp_millis(1_722_222_222_000).unwrap();
+
+        MuteListEntry::sync_from_event(&[(t1, true), (t2, false)], event_created_at, &db)
+            .await
+            .unwrap();
+
+        let entries = MuteListEntry::find_all(&db).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert_eq!(
+                entry.event_created_at, event_created_at,
+                "every row from one sync shares the event's created_at"
+            );
+        }
     }
 }
